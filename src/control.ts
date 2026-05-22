@@ -3,20 +3,22 @@
 // agent-fleet kit + launchctl, and writes a control_audit row. Reinstall-type
 // actions are guarded against a currently-firing run.
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync, readdirSync, mkdirSync, cpSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import type { DB } from "./db.ts";
 
 const UID = process.getuid?.() ?? 0;
-const KIT_INSTALL = join(homedir(), "Desktop", "projects", "agent-fleet", "lib", "install.sh");
+const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
+const KIT_INSTALL = join(KIT, "lib", "install.sh");
 const PHASES = ["ship", "groom", "review", "eng"];
 
-interface Proj { id: number; slug: string; namespace: string; manifest_path: string; }
+interface Proj { id: number; slug: string; namespace: string; manifest_path: string; repo_owner: string; repo_name: string; repo_url: string; }
 const VALID = (s: string, re: RegExp) => typeof s === "string" && re.test(s);
+const repoOf = (p: Proj) => `${p.repo_owner}/${p.repo_name}`;
 
 function project(db: DB, slug: string): Proj {
-  const p = db.prepare("SELECT id,slug,namespace,manifest_path FROM project WHERE slug=?").get(slug) as Proj | undefined;
+  const p = db.prepare("SELECT id,slug,namespace,manifest_path,repo_owner,repo_name,repo_url FROM project WHERE slug=?").get(slug) as Proj | undefined;
   if (!p) throw new Error(`unknown project '${slug}'`);
   return p;
 }
@@ -41,6 +43,7 @@ function audit(db: DB, actor: string, action: string, target: string, args: unkn
 export interface ActionResult { ok: boolean; message: string; output?: string; }
 
 export function doAction(db: DB, actor: string, action: string, body: any): ActionResult {
+  if (action === "register") return registerProject(db, body); // no existing project
   const slug = body?.slug;
   if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
   const p = project(db, slug);
@@ -79,6 +82,25 @@ export function doAction(db: DB, actor: string, action: string, body: any): Acti
         out = run("bash", [KIT_INSTALL, dirname(p.manifest_path)]);
         message = `Code-tidying ${on === "1" ? "enabled" : "disabled"} for ${slug}.`; break;
       }
+      case "pr-merge": {              // "Approve & publish" — arm auto-merge (lands when CI green)
+        const n = Number(body.number); if (!n) throw new Error("bad PR number");
+        out = run("gh", ["pr", "merge", String(n), "--repo", repoOf(p), "--squash", "--auto"]);
+        message = `PR #${n} approved — it will publish when checks pass.`; break;
+      }
+      case "pr-changes": {            // "Send back with a note"
+        const n = Number(body.number); if (!n) throw new Error("bad PR number");
+        out = run("gh", ["pr", "review", String(n), "--repo", repoOf(p), "--request-changes", "--body", String(body.note || "Changes requested via fleet-control.")]);
+        message = `Sent PR #${n} back with your note.`; break;
+      }
+      case "pr-close": {              // "Discard this work"
+        const n = Number(body.number); if (!n) throw new Error("bad PR number");
+        out = run("gh", ["pr", "close", String(n), "--repo", repoOf(p)]);
+        message = `Discarded PR #${n}.`; break;
+      }
+      case "create-ticket": {         // "Tell it what to build"
+        const url = createTicket(p, body);
+        message = `Added to ${slug}'s build list — opened as ${url.trim()}`; out = url; break;
+      }
       default: throw new Error(`unknown action '${action}'`);
     }
   } catch (e: any) {
@@ -86,6 +108,124 @@ export function doAction(db: DB, actor: string, action: string, body: any): Acti
   }
   audit(db, actor, action, `${slug}/${body?.phase ?? "*"}`, body, ok ? 0 : 1, out);
   return { ok, message, output: out.slice(-400) || undefined };
+}
+
+const today = () => new Date().toISOString().slice(0, 10);
+const kebab = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+
+/** "Tell it what to build" — write a ticket + index row in a temp clone, PR it. */
+function createTicket(p: Proj, body: any): string {
+  const title = String(body.title || "").trim();
+  if (!title) throw new Error("a title is required");
+  const tmp = mkdtempSync(join(tmpdir(), "fleet-tkt-"));
+  try {
+    run("git", ["clone", "--depth=1", p.repo_url, tmp]);
+    const bdir = join(tmp, "docs", "backlog");
+    if (!existsSync(bdir)) throw new Error("this project has no docs/backlog/ yet");
+    const ids = readdirSync(bdir).filter((f) => /^\d{4}-.*\.md$/.test(f)).map((f) => +f.slice(0, 4));
+    const id = String(Math.max(0, ...ids) + 1).padStart(4, "0");
+    const status = body.idea ? "proposed" : "groomed";
+    const pri = /^P[0-3]$/.test(body.priority) ? body.priority : "P2";
+    const area = VALID(body.area, /^[\w-]{1,30}$/) ? body.area : "growth";
+    const crit: string[] = Array.isArray(body.criteria) ? body.criteria.filter((c: string) => c && c.trim()) : [];
+    const file = `---
+id: ${id}
+title: ${title}
+status: ${status}
+priority: ${pri}
+area: ${area}
+created: ${today()}
+owner: gtm-innovation
+---
+
+## User story
+
+${body.story?.trim() || title}
+
+## Why now (four lenses)
+
+(Added via the control plane. The groom agent will enrich the Product Owner /
+Stakeholder / User / Growth lenses on its next pass.)
+
+## Acceptance criteria
+
+${crit.length ? crit.map((c) => `- [ ] ${c.trim()}`).join("\n") : "- [ ] TODO"}
+
+## Out of scope
+
+- ${body.outOfScope?.trim() || "..."}
+
+## Engineering notes
+
+- (to be detailed by the dev agent)
+
+## Implementation log
+`;
+    writeFileSync(join(bdir, `${id}-${kebab(title)}.md`), file);
+
+    // append a row to the README index table (validator requires file<->index sync)
+    const rpath = join(bdir, "README.md");
+    let r = readFileSync(rpath, "utf8");
+    const row = `| ${id} | ${title} | ${pri} | ${status} | ${area} |`;
+    const lines = r.split("\n");
+    let at = -1;
+    for (let i = lines.length - 1; i >= 0; i--) if (/^\|\s*\d{4}\s*\|/.test(lines[i])) { at = i; break; }
+    if (at < 0) for (let i = 0; i < lines.length; i++) if (/^\|\s*-+\s*\|/.test(lines[i])) { at = i; break; }
+    if (at < 0) throw new Error("couldn't find the backlog index table");
+    lines.splice(at + 1, 0, row);
+    writeFileSync(rpath, lines.join("\n"));
+
+    // validate locally before pushing (don't open a broken PR)
+    const validator = join(tmp, "scripts", "check-backlog.mjs");
+    if (existsSync(validator)) run("node", ["--disable-warning=ExperimentalWarning", validator]);
+
+    const branch = `chore/gtm-tkt-${id}`;
+    run("git", ["-C", tmp, "checkout", "-b", branch]);
+    run("git", ["-C", tmp, "add", "-A"]);
+    run("git", ["-C", tmp, "-c", "user.name=Fleet Control", "-c", "user.email=noreply@anthropic.com", "commit", "-m", `GTM: add ticket ${id} — ${title}`]);
+    run("git", ["-C", tmp, "push", "-u", "origin", branch]);
+    return run("gh", ["pr", "create", "--repo", repoOf(p), "--base", "main", "--head", branch,
+      "--title", `GTM: ${title}`, "--body", `Ticket ${id} added via fleet-control.\n\nStatus: ${status} · ${pri} · ${area}`]);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** "Add a project" (Path A: connect a folder) — set up fleet files + install. */
+function registerProject(db: DB, body: any): ActionResult {
+  const path = String(body.path || "");
+  if (!path.startsWith("/") || !existsSync(path)) return { ok: false, message: "give an absolute path to an existing folder" };
+  if (!existsSync(join(path, ".git"))) return { ok: false, message: "that folder isn't a git repo" };
+  const remote = (readFileSync(join(path, ".git", "config"), "utf8").match(/^\s*url\s*=\s*(.+)$/m) || [])[1]?.trim();
+  if (!remote) return { ok: false, message: "couldn't find a git remote (push it to GitHub first)" };
+  const slug = kebab(body.slug || basename(path));
+  const name = String(body.name || basename(path));
+  const days = Math.max(1, Math.min(365, Number(body.days) || 30));
+  const d = new Date(Date.now() + days * 86_400_000);
+  const sc = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
+
+  // 1) manifest
+  const manifest = join(path, "agents.config.sh");
+  if (!existsSync(manifest))
+    writeFileSync(manifest, `PROJECT_NAME="${name}"\nSLUG="${slug}"\nNAMESPACE="com.${slug}"\nREPO_URL="${remote.replace(/\.git$/, "")}"\nMODEL="claude-opus-4-7"\nGIT_AUTHOR_NAME="${name} Agent"\nGIT_AUTHOR_EMAIL="noreply@anthropic.com"\nSELF_CANCEL="${sc}"\nSHIP_MINUTE=41\nGROOM_HOURS="0 6 12 18"\nGROOM_MINUTE=17\nREVIEW_INTERVAL=300\nENG_ENABLED=${body.eng ? 1 : 0}\n`);
+  // 2) backlog scaffold + validator
+  const bdir = join(path, "docs", "backlog");
+  if (!existsSync(bdir)) {
+    mkdirSync(bdir, { recursive: true });
+    cpSync(join(KIT, "templates", "backlog", "_template.md"), join(bdir, "_template.md"));
+    writeFileSync(join(bdir, "README.md"), `# Backlog\n\n| id | title | priority | status | area |\n|----|-------|----------|--------|------|\n`);
+  }
+  const sdir = join(path, "scripts");
+  if (!existsSync(join(sdir, "check-backlog.mjs"))) { mkdirSync(sdir, { recursive: true }); cpSync(join(KIT, "templates", "scripts", "check-backlog.mjs"), join(sdir, "check-backlog.mjs")); }
+  // 3) AGENTS.md § Agent parameters
+  const agents = join(path, "AGENTS.md");
+  const section = existsSync(join(KIT, "templates", "AGENTS.section.md")) ? readFileSync(join(KIT, "templates", "AGENTS.section.md"), "utf8") : "## Agent parameters\n";
+  if (!existsSync(agents)) writeFileSync(agents, `# AGENTS.md\n\n${section}`);
+  else if (!/##\s*Agent parameters/.test(readFileSync(agents, "utf8"))) writeFileSync(agents, readFileSync(agents, "utf8") + "\n\n" + section);
+  // 4) install launchd
+  const out = run("bash", [KIT_INSTALL, path]);
+  audit(db, "register", "register", slug, { path }, 0, out);
+  return { ok: true, message: `Connected ${name}. It will start working on its schedule. Review its AGENTS.md § Agent parameters before its first run.`, output: out.slice(-300) };
 }
 
 /** Key-targeted line rewrite of a shell manifest (preserves comments/order). */

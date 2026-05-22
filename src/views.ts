@@ -4,6 +4,7 @@ import type { FleetConfig } from "./config.ts";
 import { jobLive, selfCancelDays } from "./live.ts";
 import { openAlerts } from "./alerts.ts";
 import { daemonStatus } from "./daemon.ts";
+import { ingestProjectPRs, projectPRs } from "./ingest/prs.ts";
 
 const PHASES = ["ship", "groom", "review", "eng"];
 
@@ -76,11 +77,13 @@ export function projectView(db: DB, cfg: FleetConfig, slug: string) {
        (input_tokens+output_tokens+cache_creation_tokens+cache_read_tokens) toks
      FROM run WHERE project_id=? AND outcome IS NOT 'smoke' ORDER BY started_at DESC LIMIT 40`).all(p.id);
   const byPhase = db.prepare("SELECT phase, COUNT(*) runs, SUM(COALESCE(cost_usd,cost_usd_computed,0)) cost FROM run WHERE project_id=? GROUP BY phase").all(p.id);
+  const repo = `${p.repo_owner}/${p.repo_name}`;
+  try { ingestProjectPRs(db, p.id, repo); } catch { /* keep serving */ }
   return {
-    slug: p.slug, name: p.name, repo: `${p.repo_owner}/${p.repo_name}`,
+    slug: p.slug, name: p.name, repo,
     selfCancelDays: selfCancelDays(p.self_cancel), engEnabled: !!p.eng_enabled,
     displayState: displayState(jobs, selfCancelDays(p.self_cancel)),
-    jobs, recent, costByPhase: byPhase,
+    jobs, recent, costByPhase: byPhase, prs: projectPRs(db, p.id),
   };
 }
 

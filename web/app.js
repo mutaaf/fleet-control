@@ -60,11 +60,69 @@ async function act(action, body) {
   if (d.ok) setTimeout(route, 700);
 }
 document.addEventListener("click", (e) => {
+  const m = e.target.closest("[data-modal]");
+  if (m) { e.preventDefault(); openModal(m.dataset.modal, m.dataset.slug); return; }
   const b = e.target.closest("[data-act]");
   if (!b) return;
   e.preventDefault();
   if (b.dataset.confirm && !confirm(b.dataset.confirm)) return;
-  act(b.dataset.act, { slug: b.dataset.slug, phase: b.dataset.phase || undefined, days: b.dataset.days ? +b.dataset.days : undefined, enabled: b.dataset.enabled === "1" });
+  const body = { slug: b.dataset.slug, phase: b.dataset.phase || undefined, days: b.dataset.days ? +b.dataset.days : undefined, enabled: b.dataset.enabled === "1", number: b.dataset.number ? +b.dataset.number : undefined };
+  if (b.dataset.act === "pr-changes") { const note = prompt("What should it change? (sent back to the agent)"); if (note == null) return; body.note = note; }
+  act(b.dataset.act, body);
+});
+
+// ---- modal forms ("tell it what to build", "add a project") ---------------
+function openModal(kind, slug) {
+  const wrap = document.createElement("div"); wrap.className = "modal-bg"; wrap.id = "modal";
+  wrap.innerHTML = `<div class="modal">${kind === "ticket" ? ticketForm(slug) : addForm()}</div>`;
+  wrap.addEventListener("click", (e) => { if (e.target === wrap) wrap.remove(); });
+  document.body.appendChild(wrap);
+}
+const closeModal = () => document.getElementById("modal")?.remove();
+function field(id, label, ph, tag = "input") {
+  return `<label class="fld"><span>${label}</span>${tag === "textarea" ? `<textarea id="${id}" rows="3" placeholder="${ph}"></textarea>` : `<input id="${id}" placeholder="${ph}">`}</label>`;
+}
+function ticketForm(slug) {
+  return `<h2>Tell ${esc(slug)} what to build</h2>
+    <p class="dim">Describe it like you'd tell a teammate. The agent turns each "done when" line into a test.</p>
+    ${field("t-title", "What should it build?", "Share weekly recap as an image")}
+    ${field("t-story", "Who is it for / why? (optional)", "someone tracking a streak, so they can post it", "textarea")}
+    ${field("t-crit", "Done when… (one per line)", "A Share button appears\nTapping it makes a story-sized image", "textarea")}
+    <div class="frow">
+      <label class="fld"><span>How important</span><select id="t-pri"><option value="P1">Should do</option><option value="P0">Must do soon</option><option value="P2" selected>Maybe someday</option></select></label>
+      <label class="fld"><span>Area</span><input id="t-area" placeholder="growth" value="growth"></label>
+    </div>
+    <label class="chk"><input type="checkbox" id="t-idea"> Save as an idea (review later) instead of adding to the build list</label>
+    <div class="frow end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" data-submit="ticket" data-slug="${esc(slug)}">Add to build list</button></div>`;
+}
+function addForm() {
+  return `<h2>Add a project</h2>
+    <p class="dim">Connect a folder you already have. It must be a git repo pushed to GitHub.</p>
+    ${field("a-path", "Folder path", "/Users/you/Desktop/projects/myapp")}
+    ${field("a-name", "Name (optional)", "My App")}
+    <div class="frow">
+      <label class="fld"><span>Keep running for</span><select id="a-days"><option value="30">30 days</option><option value="90">90 days</option><option value="14">14 days</option></select></label>
+      <label class="chk"><input type="checkbox" id="a-eng"> Also let it tidy the code</label>
+    </div>
+    <div class="frow end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" data-submit="add">Connect & start</button></div>`;
+}
+document.addEventListener("click", (e) => {
+  const s = e.target.closest("[data-submit]");
+  if (!s) return;
+  e.preventDefault();
+  if (s.dataset.submit === "ticket") {
+    const v = (id) => document.getElementById(id).value.trim();
+    if (!v("t-title")) return toast("a title is required", false);
+    act("create-ticket", { slug: s.dataset.slug, title: v("t-title"), story: v("t-story"),
+      criteria: v("t-crit").split("\n").map((x) => x.trim()).filter(Boolean),
+      priority: document.getElementById("t-pri").value, area: v("t-area") || "growth",
+      idea: document.getElementById("t-idea").checked });
+  } else {
+    const v = (id) => document.getElementById(id).value.trim();
+    if (!v("a-path")) return toast("a folder path is required", false);
+    act("register", { path: v("a-path"), name: v("a-name"), days: +document.getElementById("a-days").value, eng: document.getElementById("a-eng").checked });
+  }
+  closeModal();
 });
 
 let timer = null;
@@ -82,7 +140,7 @@ async function home() {
   summary.innerHTML = `${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort`;
   app.innerHTML =
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
-    `<div class="eyebrow">Your projects</div>` + data.projects.map(card).join("") +
+    `<div class="eyebrow rowflex">Your projects <button class="btn sm" data-modal="add">+ Add a project</button></div>` + data.projects.map(card).join("") +
     `<div class="eyebrow" style="margin-top:28px">Across the fleet</div>
      <div class="card"><div class="metarow">
        <span>total runs <b class="cost">${data.totals.runs}</b></span>
@@ -141,13 +199,32 @@ async function project(slug) {
       <button class="btn" data-act="resume" data-slug="${p.slug}">Resume all jobs</button>
       <button class="btn" data-act="pause" data-slug="${p.slug}" data-confirm="Pause all of ${esc(p.name)}’s jobs? It will stop working autonomously until resumed.">Pause project</button>
       <button class="btn" data-act="eng-toggle" data-slug="${p.slug}" data-enabled="${p.engEnabled ? "0" : "1"}">${p.engEnabled ? "Turn off code-tidying" : "Also tidy the code"}</button>
+      <button class="btn primary" data-modal="ticket" data-slug="${p.slug}">Tell it what to build</button>
     </div>
+    ${prSection(p)}
     <div class="eyebrow">The jobs</div>
     ${p.jobs.map((j) => jobCard(j, p.slug)).join("")}
     <div class="eyebrow">Recent activity</div>
     <table><thead><tr><th>when</th><th>job</th><th>did</th><th>PR</th><th>tokens</th><th>cost</th></tr></thead>
     <tbody>${p.recent.map(runRow).join("")}</tbody></table>`;
   foot.textContent = "live · " + new Date().toLocaleTimeString();
+}
+function prSection(p) {
+  const prs = (p.prs || []).filter((x) => x.is_agent);
+  if (!prs.length) return "";
+  const ci = { green: "✓ checks pass", red: "✗ checks failing", pending: "checks running…", none: "" };
+  return `<div class="eyebrow">Finished work waiting for you</div>` + prs.map((pr) => `
+    <div class="card" style="padding:12px 16px">
+      <div class="card-head"><span class="pname" style="font-size:15px">${esc(pr.title)}</span>
+        <span class="state dim mono">#${pr.number} · ${ci[pr.ci_state] || ""}</span></div>
+      <div class="metarow" style="margin-top:8px">
+        <span class="faint mono">+${pr.additions} −${pr.deletions}</span>
+        <button class="btn sm primary" data-act="pr-merge" data-slug="${p.slug}" data-number="${pr.number}" data-confirm="Approve and publish #${pr.number}? It merges to main when checks pass.">Approve &amp; publish</button>
+        <button class="btn sm" data-act="pr-changes" data-slug="${p.slug}" data-number="${pr.number}">Send back…</button>
+        <button class="btn sm" data-act="pr-close" data-slug="${p.slug}" data-number="${pr.number}" data-confirm="Discard #${pr.number}? This closes the work.">Discard</button>
+        ${pr.url ? `<a class="btn sm" href="${esc(pr.url)}" target="_blank">View on GitHub</a>` : ""}
+      </div>
+    </div>`).join("");
 }
 function jobCard(j, slug) {
   const next = j.paused ? "paused" : j.loaded ? until(j.next) : "not set up";

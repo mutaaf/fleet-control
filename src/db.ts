@@ -93,6 +93,13 @@ CREATE TABLE IF NOT EXISTS watermark (
   source TEXT PRIMARY KEY, cursor TEXT, updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS pr (
+  project_id INTEGER, number INTEGER, title TEXT, branch TEXT,
+  state TEXT, ci_state TEXT, merge_state TEXT, is_agent INTEGER,
+  additions INTEGER, deletions INTEGER, author TEXT, url TEXT, fetched_at TEXT,
+  PRIMARY KEY(project_id, number)
+);
+
 CREATE TABLE IF NOT EXISTS control_audit (
   id INTEGER PRIMARY KEY, ts TEXT,
   actor TEXT, action TEXT, target TEXT, args_json TEXT,
