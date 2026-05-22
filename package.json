@@ -1,0 +1,18 @@
+{
+  "name": "fleet-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local control plane for the autonomous agent fleet — see, manage, and expand it from any device.",
+  "bin": {
+    "fleetctl": "bin/fleetctl.ts"
+  },
+  "scripts": {
+    "fleetctl": "node --disable-warning=ExperimentalWarning bin/fleetctl.ts",
+    "backfill": "node --disable-warning=ExperimentalWarning bin/fleetctl.ts backfill",
+    "status": "node --disable-warning=ExperimentalWarning bin/fleetctl.ts status"
+  },
+  "engines": {
+    "node": ">=23"
+  }
+}
