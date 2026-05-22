@@ -34,6 +34,39 @@ function until(iso) {
 }
 async function get(p) { const r = await fetch(p); if (!r.ok) throw new Error(p); return r.json(); }
 
+// ---- control actions ------------------------------------------------------
+function toast(msg, ok = true) {
+  let t = document.getElementById("toast");
+  if (!t) { t = document.createElement("div"); t.id = "toast"; document.body.appendChild(t); }
+  t.textContent = msg; t.className = ok ? "ok" : "bad"; t.style.opacity = "1";
+  clearTimeout(toast._t); toast._t = setTimeout(() => (t.style.opacity = "0"), 3200);
+}
+async function act(action, body) {
+  const tok = localStorage.getItem("fleetToken") || "";
+  let r, d;
+  try {
+    r = await fetch("/api/control/" + action, {
+      method: "POST", headers: { "content-type": "application/json", ...(tok ? { "x-fleet-token": tok } : {}) },
+      body: JSON.stringify(body),
+    });
+    d = await r.json();
+  } catch { return toast("couldn’t reach the server", false); }
+  if (r.status === 401) {
+    const t = prompt("This device isn’t paired. Paste the admin token from the server’s terminal:");
+    if (t) { localStorage.setItem("fleetToken", t.trim()); return act(action, body); }
+    return;
+  }
+  toast(d.message || (d.ok ? "done" : "failed"), d.ok);
+  if (d.ok) setTimeout(route, 700);
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-act]");
+  if (!b) return;
+  e.preventDefault();
+  if (b.dataset.confirm && !confirm(b.dataset.confirm)) return;
+  act(b.dataset.act, { slug: b.dataset.slug, phase: b.dataset.phase || undefined, days: b.dataset.days ? +b.dataset.days : undefined, enabled: b.dataset.enabled === "1" });
+});
+
 let timer = null;
 const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
 
@@ -90,17 +123,27 @@ async function project(slug) {
       <span class="state"><span class="dot ${cls}"></span>${label}</span></div>
     <div class="metarow"><span class="dim mono">${esc(p.repo)}</span>
       ${p.selfCancelDays != null ? `<span>${p.selfCancelDays < 0 ? "stopped" : "keeps running " + p.selfCancelDays + "d"}</span>` : ""}</div>
+    <div class="actions">
+      ${p.selfCancelDays != null && p.selfCancelDays <= 7 ? `<button class="btn primary" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>` : `<button class="btn" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>`}
+      <button class="btn" data-act="resume" data-slug="${p.slug}">Resume all jobs</button>
+      <button class="btn" data-act="pause" data-slug="${p.slug}" data-confirm="Pause all of ${esc(p.name)}’s jobs? It will stop working autonomously until resumed.">Pause project</button>
+      <button class="btn" data-act="eng-toggle" data-slug="${p.slug}" data-enabled="${p.engEnabled ? "0" : "1"}">${p.engEnabled ? "Turn off code-tidying" : "Also tidy the code"}</button>
+    </div>
     <div class="eyebrow">The jobs</div>
-    ${p.jobs.map(jobCard).join("")}
+    ${p.jobs.map((j) => jobCard(j, p.slug)).join("")}
     <div class="eyebrow">Recent activity</div>
     <table><thead><tr><th>when</th><th>job</th><th>did</th><th>PR</th><th>tokens</th><th>cost</th></tr></thead>
     <tbody>${p.recent.map(runRow).join("")}</tbody></table>`;
   foot.textContent = "live · " + new Date().toLocaleTimeString();
 }
-function jobCard(j) {
-  const next = j.loaded ? until(j.next) : "paused";
+function jobCard(j, slug) {
+  const next = j.paused ? "paused" : j.loaded ? until(j.next) : "not set up";
+  const toggle = j.paused
+    ? `<button class="btn sm" data-act="resume" data-slug="${slug}" data-phase="${j.phase}">Resume</button>`
+    : `<button class="btn sm" data-act="pause" data-slug="${slug}" data-phase="${j.phase}">Pause</button>`;
   return `<div class="jobcard">
-    <h3>${j.running ? `<span class="dot working"></span>` : ""}${PHASE[j.phase]}</h3>
+    <h3>${j.running ? `<span class="dot working"></span>` : ""}${PHASE[j.phase]}
+      <span class="jobactions"><button class="btn sm" data-act="kickstart" data-slug="${slug}" data-phase="${j.phase}">Run now</button>${toggle}</span></h3>
     ${j.running
       ? `<div class="kv now">● working now${j.currentAction ? ` — <span class="faint">${esc(j.currentAction)}</span>` : ""}</div>`
       : `<div class="kv"><span class="lbl">next</span>${esc(next)}</div>`}

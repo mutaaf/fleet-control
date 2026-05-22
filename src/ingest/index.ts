@@ -4,6 +4,7 @@ import type { DB } from "../db.ts";
 import { syncProjects } from "../discovery.ts";
 import { seedPricing } from "../pricing.ts";
 import { ingestProjectTranscripts } from "./transcripts.ts";
+import { ingestProjectRuns } from "./runs.ts";
 
 export function recomputeRollups(db: DB): void {
   db.exec("DELETE FROM cost_rollup_day");
@@ -29,6 +30,7 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
       const aliases = (aliasesOf.all(p.id) as Array<{ alias_slug: string }>).map((r) => r.alias_slug);
       if (!aliases.includes(p.slug)) aliases.push(p.slug);
       total += ingestProjectTranscripts(db, cfg, p.id, aliases);
+      ingestProjectRuns(db, cfg, p.id, p.slug); // measured cost overlay (live > computed)
     }
     recomputeRollups(db);
     db.exec("COMMIT");

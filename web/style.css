@@ -89,6 +89,24 @@ tr.run:hover td { background: var(--panel); color: var(--ink); cursor: pointer; 
 .summary-box { background: var(--panel2); border-left: 2px solid var(--accent); padding: 12px 14px; border-radius: var(--r);
   margin: 10px 0; white-space: pre-wrap; font-size: 13.5px; line-height: 1.5; }
 
+/* controls */
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px; }
+.btn { font-family: var(--mono); font-size: 12px; color: var(--ink); background: var(--panel2);
+  border: 1px solid var(--line); border-radius: var(--r); padding: 7px 12px; cursor: pointer; transition: all .12s; }
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn:active { transform: translateY(1px); }
+.btn.primary { background: rgba(200,132,30,.14); border-color: rgba(200,132,30,.5); color: var(--accent); }
+.btn.sm { font-size: 11px; padding: 4px 9px; }
+.jobactions { margin-left: auto; display: inline-flex; gap: 6px; }
+.jobcard h3 { display: flex; align-items: center; }
+
+#toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 50;
+  font-family: var(--mono); font-size: 13px; padding: 10px 16px; border-radius: var(--r);
+  background: #1c1d19; border: 1px solid var(--line); color: var(--ink); opacity: 0; transition: opacity .25s;
+  max-width: 90vw; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+#toast.ok { border-left: 2px solid var(--good); }
+#toast.bad { border-left: 2px solid var(--bad); }
+
 #foot { max-width: 1040px; margin: 26px auto 0; padding: 0 20px; font-family: var(--mono); font-size: 11px; color: var(--faint); }
 
 @media (max-width: 560px) {

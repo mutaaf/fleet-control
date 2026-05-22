@@ -12,9 +12,23 @@ const SUBS = ["checkout", "review-checkout", "eng-checkout", "groom-checkout"];
 export interface JobLive {
   running: boolean;
   loaded: boolean;
+  paused: boolean;
   lastExit: number | null;
   currentAction: string | null;
   next: string | null; // ISO, or null if won't fire
+}
+
+// launchctl disabled-state (paused) set, cached briefly (one call covers all jobs).
+let _disabled: { at: number; set: Set<string> } | null = null;
+function disabledSet(): Set<string> {
+  if (_disabled && Date.now() - _disabled.at < 4000) return _disabled.set;
+  const set = new Set<string>();
+  try {
+    const out = execFileSync("launchctl", ["print-disabled", `gui/${UID}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    for (const m of out.matchAll(/"([^"]+)"\s*=>\s*(?:true|disabled)/g)) set.add(m[1]);
+  } catch { /* none */ }
+  _disabled = { at: Date.now(), set };
+  return set;
 }
 
 function launchctlState(label: string): { running: boolean; loaded: boolean; lastExit: number | null } {
@@ -91,12 +105,14 @@ export function nextFire(cadence: Record<string, string>, phase: string, selfCan
 
 export function jobLive(cfg: FleetConfig, label: string, cadence: Record<string, string>, phase: string, selfCancel: string, aliasSlugs: string[]): JobLive {
   const s = launchctlState(label);
+  const paused = disabledSet().has(label);
   return {
     running: s.running,
     loaded: s.loaded,
+    paused,
     lastExit: s.lastExit,
     currentAction: s.running ? currentAction(cfg, aliasSlugs, phase) : null,
-    next: s.loaded ? nextFire(cadence, phase, selfCancel) : null,
+    next: paused ? null : (s.loaded ? nextFire(cadence, phase, selfCancel) : null),
   };
 }
 

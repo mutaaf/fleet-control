@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS ingested_file (
 CREATE TABLE IF NOT EXISTS watermark (
   source TEXT PRIMARY KEY, cursor TEXT, updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS control_audit (
+  id INTEGER PRIMARY KEY, ts TEXT,
+  actor TEXT, action TEXT, target TEXT, args_json TEXT,
+  exit_code INTEGER, stdout_tail TEXT
+);
+
+CREATE TABLE IF NOT EXISTS alert (
+  id INTEGER PRIMARY KEY, project_id INTEGER, phase TEXT,
+  type TEXT, severity TEXT, title TEXT, detail TEXT,
+  dedup_key TEXT UNIQUE, created_at TEXT, notified_at TEXT, resolved_at TEXT
+);
 `;
 
 export type DB = DatabaseSync;

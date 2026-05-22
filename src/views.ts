@@ -20,8 +20,9 @@ function lastRun(db: DB, projectId: number, phase: string) {
 }
 
 function displayState(jobs: any[], scDays: number | null): string {
-  if (scDays != null && scDays < 0) return "expired";
   if (jobs.some((j) => j.running)) return "working";
+  if (jobs.length && jobs.every((j) => j.paused)) return "off";
+  if (scDays != null && scDays < 0) return "expired";
   if (scDays != null && scDays <= 3) return "attention";
   if (jobs.some((j) => j.loaded)) return "idle";
   return "off";
