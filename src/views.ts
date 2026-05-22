@@ -2,6 +2,8 @@
 import type { DB } from "./db.ts";
 import type { FleetConfig } from "./config.ts";
 import { jobLive, selfCancelDays } from "./live.ts";
+import { openAlerts } from "./alerts.ts";
+import { daemonStatus } from "./daemon.ts";
 
 const PHASES = ["ship", "groom", "review", "eng"];
 
@@ -52,7 +54,11 @@ export function fleetView(db: DB, cfg: FleetConfig) {
       jobs, telemetry,
     });
   }
-  return { projects: out, totals: { cost: totalCost, runs: totalRuns }, generatedAt: new Date().toISOString() };
+  return {
+    projects: out, totals: { cost: totalCost, runs: totalRuns },
+    alerts: openAlerts(db), daemonOn: daemonStatus(),
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 export function projectView(db: DB, cfg: FleetConfig, slug: string) {

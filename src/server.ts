@@ -11,6 +11,8 @@ import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { fleetView, projectView, runView } from "./views.ts";
 import { doAction } from "./control.ts";
+import { evalAlerts } from "./alerts.ts";
+import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
 
 const CONFIG_FILE = join(process.cwd(), "fleet-control.config.json");
 
@@ -48,7 +50,12 @@ const MIME: Record<string, string> = { ".html": "text/html", ".js": "text/javasc
 // Refresh history at most every 10s on read (cheap; live state is always fresh).
 let lastIngest = 0;
 function maybeIngest(db: DB, cfg: FleetConfig) {
-  if (Date.now() - lastIngest > 10_000) { try { runIngestPass(db, cfg); } catch { /* keep serving */ } lastIngest = Date.now(); }
+  // Skip if the daemon owns ingest (single writer); just serve the cache.
+  if (daemonStatus()) return;
+  if (Date.now() - lastIngest > 10_000) {
+    try { runIngestPass(db, cfg); evalAlerts(db, cfg, false); } catch { /* keep serving */ }
+    lastIngest = Date.now();
+  }
 }
 
 const json = (res: any, body: unknown, code = 200) => {
@@ -71,8 +78,16 @@ export function startServer(host = "127.0.0.1", port = 7070) {
       if (cm && req.method === "POST") {
         if (!controlAuthed(req)) return json(res, { ok: false, message: "not authorized — pair this device first" }, 401);
         return readBody(req).then((body) => {
-          const actor = isLoopback(req) ? "local" : "lan";
-          let r; try { r = doAction(db, actor, cm[1], body); } catch (e: any) { r = { ok: false, message: String(e?.message ?? e) }; }
+          let r;
+          try {
+            if (cm[1] === "daemon") { // always-on toggle (off by default)
+              const on = body.enabled ?? body.on;
+              if (on) installDaemon(Number(body.interval) || 60); else uninstallDaemon();
+              r = { ok: true, message: on ? "Always-on monitoring enabled." : "Always-on monitoring disabled." };
+            } else {
+              r = doAction(db, isLoopback(req) ? "local" : "lan", cm[1], body);
+            }
+          } catch (e: any) { r = { ok: false, message: String(e?.message ?? e) }; }
           lastIngest = 0; // force fresh state next read
           json(res, r, r.ok ? 200 : 400);
         });

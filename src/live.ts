@@ -42,10 +42,9 @@ function launchctlState(label: string): { running: boolean; loaded: boolean; las
   }
 }
 
-/** Tail the active transcript for this phase to summarize the current action. */
-function currentAction(cfg: FleetConfig, aliasSlugs: string[], phase: string): string | null {
-  const wantSub =
-    phase === "review" ? "review-checkout" : phase === "eng" ? "eng-checkout" : "checkout";
+/** Find the live transcript for a running phase + summarize its current action + elapsed. */
+export function activeRun(cfg: FleetConfig, aliasSlugs: string[], phase: string): { action: string | null; elapsedMs: number | null } {
+  const wantSub = phase === "review" ? "review-checkout" : phase === "eng" ? "eng-checkout" : "checkout";
   for (const slug of aliasSlugs) {
     const dir = join(cfg.claudeProjects, transcriptDirFor(join(cfg.cacheBase, `${slug}-agent`, wantSub)));
     if (!existsSync(dir)) continue;
@@ -56,23 +55,29 @@ function currentAction(cfg: FleetConfig, aliasSlugs: string[], phase: string): s
       if (!newest || st.mtimeMs > newest.mtime) newest = { path: join(dir, f), mtime: st.mtimeMs };
     }
     if (!newest || Date.now() - newest.mtime > 3 * 60_000) continue; // stale → not the live run
-    const tail = readFileSync(newest.path, "utf8").trimEnd().split("\n").slice(-40);
-    for (let i = tail.length - 1; i >= 0; i--) {
+    const lines = readFileSync(newest.path, "utf8").trimEnd().split("\n");
+    let startMs: number | null = null;
+    for (const ln of lines) { try { const o = JSON.parse(ln); if (o.timestamp) { startMs = new Date(o.timestamp).getTime(); break; } } catch { /* */ } }
+    let action: string | null = null;
+    for (let i = lines.length - 1; i >= 0 && !action; i--) {
       try {
-        const o = JSON.parse(tail[i]);
-        const content = o.message?.content;
+        const content = JSON.parse(lines[i]).message?.content;
         if (Array.isArray(content))
           for (let j = content.length - 1; j >= 0; j--) {
             const c = content[j];
             if (c.type === "tool_use") {
               const d = typeof c.input === "object" ? (c.input.description ?? c.input.command ?? c.input.file_path ?? "") : "";
-              return `${c.name}${d ? ": " + String(d).slice(0, 80) : ""}`;
+              action = `${c.name}${d ? ": " + String(d).slice(0, 80) : ""}`; break;
             }
           }
-      } catch { /* skip */ }
+      } catch { /* */ }
     }
+    return { action, elapsedMs: startMs ? Date.now() - startMs : null };
   }
-  return null;
+  return { action: null, elapsedMs: null };
+}
+function currentAction(cfg: FleetConfig, aliasSlugs: string[], phase: string): string | null {
+  return activeRun(cfg, aliasSlugs, phase).action;
 }
 
 /** Next scheduled fire (local time), or null if self-cancelled. */

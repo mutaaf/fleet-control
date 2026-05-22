@@ -5,6 +5,8 @@ import { loadConfig } from "../src/config.ts";
 import { openDb } from "../src/db.ts";
 import { runIngestPass } from "../src/ingest/index.ts";
 import { startServer } from "../src/server.ts";
+import { runDaemon, installDaemon, uninstallDaemon, daemonStatus } from "../src/daemon.ts";
+import { evalAlerts, openAlerts } from "../src/alerts.ts";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -101,6 +103,19 @@ switch (cmd) {
     startServer(host, Number(process.env.FLEET_PORT ?? 7070));
     break; // keep process alive (http server is listening)
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve]");
+  case "daemon-run": { db.close(); runDaemon(Number(arg) || 60); break; } // launchd entry (long-running)
+  case "daemon": {
+    if (arg === "on") { installDaemon(); console.log(`${c.grn}always-on monitoring enabled${c.rst} (com.fleet.control.fleetd). Logs: ~/.local/state/fleet-control/logs/`); }
+    else if (arg === "off") { uninstallDaemon(); console.log("always-on monitoring disabled."); }
+    else console.log("daemon is " + (daemonStatus() ? c.grn + "ON" + c.rst : c.dim + "off (default)" + c.rst) + " — use: fleetctl daemon on|off");
+    break;
+  }
+  case "alerts": {
+    const a = openAlerts(db) as any[];
+    if (!a.length) console.log("no open alerts.");
+    for (const x of a) console.log(`  ${x.severity === "critical" ? c.red : c.ylw}●${c.rst} ${x.title} ${c.dim}— ${x.detail}${c.rst}`);
+    break;
+  }
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts]");
 }
-if (cmd !== "serve") db.close();
+if (cmd !== "serve" && cmd !== "daemon-run") db.close();

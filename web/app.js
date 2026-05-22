@@ -78,15 +78,28 @@ function telemetry(arr) {
 // ---- Home -----------------------------------------------------------------
 async function home() {
   const data = await get("/api/fleet");
-  summary.innerHTML = `<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort`;
-  app.innerHTML = `<div class="eyebrow">Your projects</div>` + data.projects.map(card).join("") +
+  const alerts = data.alerts || [];
+  summary.innerHTML = `${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort`;
+  app.innerHTML =
+    (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
+    `<div class="eyebrow">Your projects</div>` + data.projects.map(card).join("") +
     `<div class="eyebrow" style="margin-top:28px">Across the fleet</div>
      <div class="card"><div class="metarow">
        <span>total runs <b class="cost">${data.totals.runs}</b></span>
        <span>this week <b class="cost">${usd(data.projects.reduce((s, p) => s + (p.cost7d || 0), 0))}</b></span>
        <span class="dim">estimated effort · agents run on your Max plan (no real bill)</span>
+     </div></div>
+     <div class="eyebrow" style="margin-top:28px">Monitoring</div>
+     <div class="card"><div class="metarow" style="align-items:center">
+       <span>Always-on background monitoring is <b class="${data.daemonOn ? "now" : "dim"}">${data.daemonOn ? "ON" : "OFF"}</b></span>
+       <button class="btn" data-act="daemon" data-enabled="${data.daemonOn ? "0" : "1"}">${data.daemonOn ? "Turn off" : "Turn on"}</button>
+       <span class="dim">When on, the fleet is watched and you get alerts even with this closed (a little background CPU). Off: updates only while open.</span>
      </div></div>`;
-  foot.textContent = "updated " + new Date(data.generatedAt).toLocaleTimeString();
+  foot.textContent = "updated " + new Date(data.generatedAt).toLocaleTimeString() + (data.daemonOn ? " · always-on" : "");
+}
+function alertRow(a) {
+  return `<div class="banner ${a.severity === "critical" ? "bad" : ""}" style="margin:0 0 8px">
+    <b>${esc(a.title)}</b> — ${esc(a.detail)}</div>`;
 }
 function card(p) {
   const [cls, label] = STATE[p.displayState] || STATE.off;
