@@ -16,6 +16,10 @@ export interface FleetConfig {
   cacheBase: string;
   /** Base of Claude Code session transcripts. */
   claudeProjects: string;
+  /** Server bind host. 127.0.0.1 (default) = local only; 0.0.0.0 = LAN. */
+  host?: string;
+  /** Server port. */
+  port?: number;
 }
 
 const DEFAULTS: FleetConfig = {
@@ -24,6 +28,8 @@ const DEFAULTS: FleetConfig = {
   dbPath: join(HOME, ".local", "state", "fleet-control", "fleet.db"),
   cacheBase: join(HOME, ".cache"),
   claudeProjects: join(HOME, ".claude", "projects"),
+  host: "127.0.0.1",
+  port: 7070,
 };
 
 /** Load config, merging an optional fleet-control.config.json next to the repo. */

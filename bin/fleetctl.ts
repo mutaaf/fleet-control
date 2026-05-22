@@ -4,6 +4,7 @@
 import { loadConfig } from "../src/config.ts";
 import { openDb } from "../src/db.ts";
 import { runIngestPass } from "../src/ingest/index.ts";
+import { startServer } from "../src/server.ts";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -94,6 +95,12 @@ switch (cmd) {
   case "status": case undefined: status(); break;
   case "runs": runsFor(arg ?? ""); break;
   case "show": show(arg ?? ""); break;
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>]");
+  case "serve": {
+    db.close(); // server opens its own handle
+    const host = process.env.FLEET_HOST ?? loadConfig().host ?? "127.0.0.1";
+    startServer(host, Number(process.env.FLEET_PORT ?? 7070));
+    break; // keep process alive (http server is listening)
+  }
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve]");
 }
-db.close();
+if (cmd !== "serve") db.close();
