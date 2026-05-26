@@ -1,7 +1,7 @@
 ---
 id: 0019
 title: prs_merged count reads from runs not control_audit
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-05-26
@@ -80,4 +80,5 @@ control_audit row → never get counted.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: flipped status to `in-progress`; opened
+  branch `feat/0019-prs-merged-from-runs` off origin/main.
