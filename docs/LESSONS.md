@@ -100,3 +100,18 @@ the marginal cost of pulling in `node:crypto` is invisible. General rule
 for this repo: there is exactly one module system (ESM via `.ts`); reach
 for `import`, never `require`, never `await import()` unless you
 genuinely need the laziness.
+
+## 2026-05-26 — route regex for "owner/name" slugs needs an embedded slash
+
+Symptom: when wiring `GET /api/prs/:repo/:number/diff` (ticket 0007) I
+reached for the same `[\w-]+` capture every other route in `src/server.ts`
+uses for slugs, then realised `:repo` is `owner/name` and carries a literal
+slash. The naive `[\w-]+` won't match `mutaaf/fleet-control`. Cause: every
+other slug we capture (project slug, run id) is a single path segment by
+design; GitHub repo identifiers are two. Fix: capture the pair explicitly
+with `([^/]+\/[^/]+)`, and rely on a separate `validatePrParams()` for the
+character-set / `..` / shell-meta checks. General rule: the route regex
+is just "did this URL shape want this handler?" — keep it permissive on
+contents and defer real validation to a typed helper so error messages
+stay precise (400 "bad repo" vs a confusing 404). Same pattern will help
+when adding any future route that takes a GitHub identifier.
