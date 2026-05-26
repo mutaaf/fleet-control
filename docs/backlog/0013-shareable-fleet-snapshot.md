@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: Shareable read-only fleet snapshot with anonymized slugs
-status: proposed
+status: in-progress
 priority: P2
 area: portal
 created: 2026-05-26
@@ -161,4 +161,24 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — `implementation-dev` started on branch
+  `feat/0013-shareable-fleet-snapshot`. Frontmatter and README index moved
+  to `in-progress`. Test-first work begins with `tests/snapshot.test.ts`.
+- 2026-05-26 — Landed the slice. New `snapshot` table (idempotent CREATE in
+  `src/db.ts`), `src/snapshot.ts` with `createSnapshot` / `getSnapshot` /
+  `revokeSnapshot` / `anonymize` / `listSnapshots` / `serveShare` / pure
+  HTML renderer (no DOM, no template engine, no `<button>`, no
+  `/api/control/`, no `github.com` anchors). New control verbs
+  `snapshot-create` and `snapshot-revoke` wired through `doAction`;
+  `/api/control/snapshot-*` gated on `admin` scope in `src/server.ts`.
+  New `GET /share/<token>` route emits the self-contained HTML page;
+  expired/revoked snapshots return 410 Gone with a friendly message,
+  unknown tokens return 404. CLI surface: `fleetctl snapshot
+  create|list|revoke`. Audit rows carry the 8-char `id_prefix` only —
+  the plaintext token is shown ONCE and never persisted. `tsc --noEmit`
+  clean, `node scripts/check-backlog.mjs` green, 17 new tests + 118
+  pre-existing tests pass. Zero new runtime dependencies. Added
+  `FLEET_DB_PATH` env override in `src/config.ts` so the subprocess CLI
+  tests can target a tmpdir DB without touching the operator's real
+  state tree.
+

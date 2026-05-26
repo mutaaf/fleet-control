@@ -19,6 +19,7 @@ import { tailTranscript, type TailEvent } from "./live.ts";
 import { pricingRows, lastSyncedAt, syncPricing } from "./pricing.ts";
 import { fetchPrDiff } from "./diff.ts";
 import { weeklyDigest } from "./digest.ts";
+import { serveShare } from "./snapshot.ts";
 import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
   type Scope, type TokenRecord,
@@ -112,9 +113,12 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         // Token management lives inside doAction("tokens-*") and requires
         // admin; one-click GitHub-URL import (ticket 0010) also requires
         // admin — it spawns a clone + install on disk on the operator's
-        // behalf. Every other control verb requires control. Daemon toggle
+        // behalf. Snapshot-create / snapshot-revoke (ticket 0013) mint a
+        // long-lived share URL whose surface is read-only but whose
+        // existence is itself a privacy decision — only admin can take
+        // it. Every other control verb requires control. Daemon toggle
         // is local-only infrastructure → control is sufficient.
-        const required: Scope = (cm[1].startsWith("tokens-") || cm[1] === "register-url") ? "admin" : "control";
+        const required: Scope = (cm[1].startsWith("tokens-") || cm[1] === "register-url" || cm[1].startsWith("snapshot-")) ? "admin" : "control";
         const auth = requireAuth(db, req, required);
         if (!auth.ok) return json(res, { ok: false, message: auth.message }, auth.status);
         return readBody(req).then(async (body) => {
@@ -126,6 +130,18 @@ export function startServer(host = "127.0.0.1", port = 7070) {
               if (on) installDaemon(Number(body.interval) || 60); else uninstallDaemon();
               r = { ok: true, message: on ? "Always-on monitoring enabled." : "Always-on monitoring disabled." };
             } else {
+              // Ticket 0013: for snapshot-create the server freezes a
+              // fresh fleet view server-side so the snapshot reflects
+              // the same numbers the operator just saw on the home page
+              // — and so a malicious caller can't smuggle a hand-rolled
+              // payload through the API. base_url is derived from the
+              // incoming Host header so the returned share_url is one
+              // the recipient's network can actually resolve.
+              if (cm[1] === "snapshot-create") {
+                body.fleet_view = fleetView(db, cfg);
+                const host = String(req.headers["host"] ?? "127.0.0.1:7070");
+                body.base_url = `http://${host}`;
+              }
               // doAction is now async (ticket 0006 introduced an action that
               // does node:fs/promises rm() — every action funnels through the
               // same await so the call site stays one path).
@@ -262,6 +278,19 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         const rm = path.match(/^\/api\/run\/(\d+)$/);
         if (rm) { const v = runView(db, Number(rm[1])); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
         return json(res, { error: "unknown endpoint" }, 404);
+      }
+      // Ticket 0013: read-only shareable fleet snapshot.
+      // GET /share/<token> renders an HTML page directly from the
+      // snapshot row keyed by SHA-256(token). NO auth middleware —
+      // the token IS the auth; presenting an unknown one yields 404,
+      // a revoked or expired one yields 410. The page carries no
+      // <button>, no /api/control/ string, no github.com anchor;
+      // see serveShare() in src/snapshot.ts.
+      const shm = path.match(/^\/share\/([0-9a-fA-F]+)$/);
+      if (shm && req.method === "GET") {
+        const result = serveShare(db, shm[1]);
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
       }
       // static portal
       let file = path === "/" ? "index.html" : path.replace(/^\//, "");
