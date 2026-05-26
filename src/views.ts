@@ -5,6 +5,7 @@ import { jobLive, selfCancelDays } from "./live.ts";
 import { openAlerts } from "./alerts.ts";
 import { daemonStatus } from "./daemon.ts";
 import { ingestProjectPRs, projectPRs } from "./ingest/prs.ts";
+import { anomaliesForRun, recentAnomalies } from "./anomaly.ts";
 
 const PHASES = ["ship", "groom", "review", "eng"];
 
@@ -84,12 +85,21 @@ export function fleetView(db: DB, cfg: FleetConfig) {
     // grid doesn't have to fan out to N extra HTTP calls. The /api/.../forecast
     // route still exists for callers that want the figure in isolation.
     const forecast = forecastFor(db, p.slug);
+    // Ticket 0008: per-project anomaly summary for the home card pill.
+    // count_24h is the bucket the spec asks for; latest_at is what drives
+    // the red-vs-amber decision client-side (< 1h → red, otherwise amber).
+    const anomalyAgg = db.prepare(
+      "SELECT COUNT(*) AS n, MAX(created_at) AS latest FROM anomaly a "
+      + "JOIN run r ON r.id = a.run_id "
+      + "WHERE r.project_id = ? AND a.created_at >= datetime('now','-1 day')",
+    ).get(p.id) as { n: number; latest: string | null };
+    const anomalies = { count_24h: anomalyAgg.n ?? 0, latest_at: anomalyAgg.latest ?? null };
     totalCost += agg.cost ?? 0; totalRuns += agg.runs ?? 0;
     out.push({
       slug: p.slug, name: p.name, displayState: displayState(jobs, scDays, usage),
       selfCancelDays: scDays, engEnabled: !!p.eng_enabled,
       cost: agg.cost ?? 0, cost7d: cost7.c ?? 0, runs: agg.runs ?? 0,
-      jobs, telemetry, usageLimit: usage, autoKill, forecast,
+      jobs, telemetry, usageLimit: usage, autoKill, forecast, anomalies,
     });
   }
   // Total-fleet forecast = sum of per-project projections (null projections
@@ -194,5 +204,9 @@ export function runView(db: DB, id: number) {
   if (!run) return null;
   const events = db.prepare("SELECT seq,ts,kind,tool_name,tool_use_id,input_summary,output_summary,is_error FROM run_event WHERE run_id=? ORDER BY seq").all(id);
   const project = db.prepare("SELECT slug,name FROM project WHERE id=?").get(run.project_id);
-  return { run, events, project };
+  // Ticket 0008: surface anomaly rows attached to this run so the SPA's
+  // run-detail page can render the badge without a second fetch. Empty
+  // array (not null) when the run is clean — keeps the SPA branch simple.
+  const anomalies = anomaliesForRun(db, id);
+  return { run, events, project, anomalies };
 }

@@ -10,6 +10,7 @@ import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
 import { fleetView, projectView, runView, forecastFor } from "./views.ts";
+import { recentAnomalies } from "./anomaly.ts";
 import { doAction } from "./control.ts";
 import { diskUsage } from "./infra.ts";
 import { evalAlerts } from "./alerts.ts";
@@ -231,6 +232,17 @@ export function startServer(host = "127.0.0.1", port = 7070) {
           return diskUsage(dm[1])
             .then((r) => json(res, r))
             .catch((e: any) => json(res, { error: String(e?.message ?? e) }, 500));
+        }
+        // Anomalies for a project (ticket 0008). Default N=10, hard cap 50.
+        // 200 with `{anomalies: []}` for an unknown slug — same shape as
+        // /events, so the SPA can render "no anomalies" without a 404 path.
+        const am = path.match(/^\/api\/projects\/([\w-]+)\/anomalies$/);
+        if (am) {
+          const proj = db.prepare("SELECT id FROM project WHERE slug=?").get(am[1]) as { id: number } | undefined;
+          if (!proj) return json(res, { anomalies: [] });
+          const raw = Number(url.searchParams.get("limit") ?? "10");
+          const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 50) : 10;
+          return json(res, { anomalies: recentAnomalies(db, proj.id, limit) });
         }
         // Typed event stream (ticket 0001). Read-only, slug-scoped, capped.
         const em = path.match(/^\/api\/projects\/([\w-]+)\/events$/);

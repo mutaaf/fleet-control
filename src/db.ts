@@ -139,6 +139,29 @@ CREATE TABLE IF NOT EXISTS auth_token (
   last_used_at  TEXT,
   revoked_at    TEXT
 );
+
+-- Anomaly flags (ticket 0008). One row per (run_id, kind) — the UNIQUE
+-- constraint is also the idempotency guard: re-running flagRun() on a
+-- run that already has a flag for that metric is a silent no-op. kind is
+-- one of 'duration' or 'cost'. value is the candidate run's measured
+-- figure (ms or USD); baseline_mean / baseline_stddev describe the
+-- prior-14-day window the threshold was computed from; sample_count is
+-- how many runs went into that window (must be >= 5 to fire).
+-- candidate_reason is a deterministic heuristic string (no transcript
+-- I/O) — see src/anomaly.ts for the rules.
+CREATE TABLE IF NOT EXISTS anomaly (
+  id               INTEGER PRIMARY KEY,
+  run_id           INTEGER REFERENCES run(id) ON DELETE CASCADE,
+  kind             TEXT NOT NULL,
+  value            REAL,
+  baseline_mean    REAL,
+  baseline_stddev  REAL,
+  sample_count     INTEGER,
+  candidate_reason TEXT,
+  created_at       TEXT,
+  UNIQUE(run_id, kind)
+);
+CREATE INDEX IF NOT EXISTS anomaly_created_at ON anomaly(created_at DESC);
 `;
 
 export type DB = DatabaseSync;

@@ -72,6 +72,18 @@ a.card:hover { border-color: #3a3b34; background: var(--panel2); }
   background: rgba(217,138,43,.1); border: 1px solid rgba(217,138,43,.35); color: var(--warn); }
 .banner.bad { background: rgba(181,72,60,.1); border-color: rgba(181,72,60,.4); color: var(--bad); }
 
+/* Ticket 0008: anomaly pill on the project card. Sits inside .state so it
+   reads as part of the status group. Red (fresh, <1h) demands attention;
+   amber (stale, within 24h) is a softer "look when you can". The pill is a
+   <span> with a data-anom-link handler that intercepts the parent <a>'s
+   navigation and deep-links into ?view=anomalies. */
+.anomaly-pill { font-family: var(--mono); font-size: 11px; padding: 1px 8px;
+  border-radius: 20px; border: 1px solid var(--line); cursor: pointer; transition: filter .12s; }
+.anomaly-pill:hover { filter: brightness(1.15); }
+.anomaly-pill.fresh { color: var(--bad); border-color: rgba(210,106,94,.55); background: rgba(181,72,60,.14); }
+.anomaly-pill.stale { color: var(--warn); border-color: rgba(217,138,43,.45); background: rgba(217,138,43,.08); }
+.anomaly-badge { margin-top: 14px; }
+
 /* job detail (now/last/next) */
 .jobcard { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; }
 .jobcard h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
