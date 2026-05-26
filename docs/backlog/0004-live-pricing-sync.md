@@ -1,7 +1,7 @@
 ---
 id: 0004
 title: Live Anthropic pricing sync into pricing table
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-26
@@ -79,3 +79,5 @@ checks for.
   ALTER for `pricing.fetched_at`, `pricing sync|show` CLI subcommands,
   `/api/pricing` route, and a footer line in `web/app.js` with a stale-
   warning badge when `fetched_at` > 24h.
+- 2026-05-26 — shipped via PR #7 (squash-merged to main). All 7 new
+  tests pass; typecheck + validate green; zero new runtime deps.
