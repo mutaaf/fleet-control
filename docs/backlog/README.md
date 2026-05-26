@@ -19,6 +19,11 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
+| 0014 | Cross-project tool-call leaderboard | P1 | groomed | observability |
+| 0015 | Embeddable status badge SVG per project | P1 | groomed | portal |
+| 0016 | fleetctl doctor — one-shot install + ingest diagnostic | P2 | groomed | infra |
+| 0017 | Today's inbox — cross-project "what needs me" view | P2 | groomed | portal |
+| 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | proposed | ingest |
 | 0001 | Ingest events.jsonl from each project | P0 | shipped | ingest |
 | 0002 | SSE live tool-call stream from active transcripts | P0 | shipped | portal |
 | 0003 | Per-user scoped tokens with audit log | P1 | shipped | control |
@@ -26,10 +31,9 @@ proposes new ones, `review` grades them.
 | 0005 | 30-day cost forecast per project | P1 | shipped | observability |
 | 0006 | Stale-checkout janitor with disk view | P1 | shipped | infra |
 | 0007 | Inline PR diff with sticky action bar | P1 | shipped | portal |
+| 0011 | Mobile-first portal pass for home and project pages | P1 | shipped | portal |
 | 0008 | Anomaly detection on run duration and cost | P2 | shipped | observability |
 | 0009 | ntfy push notifications for high-priority events | P2 | shipped | observability |
 | 0010 | One-click GitHub-URL project import | P2 | shipped | control |
-| 0011 | Mobile-first portal pass for home and project pages | P1 | shipped | portal |
 | 0012 | Weekly "what shipped" digest with wins and trends | P2 | shipped | observability |
 | 0013 | Shareable read-only fleet snapshot with anonymized slugs | P2 | shipped | portal |
-| 0014 | Cross-project tool-call leaderboard | P2 | proposed | observability |
