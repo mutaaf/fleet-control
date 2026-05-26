@@ -29,7 +29,7 @@ proposes new ones, `review` grades them.
 | 0008 | Anomaly detection on run duration and cost | P2 | groomed | observability |
 | 0009 | ntfy push notifications for high-priority events | P2 | groomed | observability |
 | 0010 | One-click GitHub-URL project import | P2 | groomed | control |
-| 0011 | Mobile-first portal pass for home and project pages | P1 | groomed | portal |
+| 0011 | Mobile-first portal pass for home and project pages | P1 | shipped | portal |
 | 0012 | Weekly "what shipped" digest with wins and trends | P2 | proposed | observability |
 | 0013 | Shareable read-only fleet snapshot with anonymized slugs | P2 | proposed | portal |
 | 0014 | Cross-project tool-call leaderboard | P2 | proposed | observability |

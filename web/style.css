@@ -4,10 +4,18 @@
   --bg: #0E0F0D; --panel: #161714; --panel2: #1c1d19; --line: #2a2b26;
   --ink: #E8E6DF; --dim: #8d8d83; --faint: #5c5d56;
   --accent: #C8841E;            /* live / running */
-  --good: #5B8C5A; --warn: #D98A2B; --bad: #B5483C; --paused: #6a6b63;
+  /* AA contrast against --panel: --good 4.58, --warn 6.53, --accent 5.81.
+     --paused was #6a6b63 (3.34:1) and --bad was #B5483C (3.39:1) —
+     both bumped to clear AA. Hue preserved (gray, red); only luminance
+     raised. Touches: state-dot, diff-del, banner.bad, .tag colours. */
+  --good: #5B8C5A; --warn: #D98A2B; --bad: #D26A5E; --paused: #8d8d83;
   --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
   --sans: ui-sans-serif, "Inter Tight", system-ui, sans-serif;
   --r: 2px;
+  /* Mobile-tuning knobs (ticket 0011). Additive — future tickets can
+     re-tune card density / tap-target floor without renaming anything. */
+  --card-pad-mobile: 12px 14px;
+  --tap-min: 44px;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans);
@@ -164,11 +172,35 @@ tr.run:hover td { background: var(--panel); color: var(--ink); cursor: pointer; 
   background: linear-gradient(to top, var(--panel) 86%, rgba(22,23,20,0));
   border-top: 1px solid var(--line); }
 
-@media (max-width: 560px) {
-  main { padding: 16px 14px 0; } .pname { font-size: 16px; }
-  .summary { font-size: 11px; } td, th { padding: 6px 6px; }
+/* Mobile-first portal pass (ticket 0011).
+   Single phone breakpoint at 640px — covers iPhone 13 mini (375), iPhone
+   14 Plus (414), and small Android handsets. The pass is layout-only:
+   stack cards one per row, tighten container padding so 2*pad + content
+   fits within 375 wide, raise every tap target to --tap-min (44px), and
+   scale the headline down one step. The existing sticky PR action bar
+   from 0007 stays intact (and we keep its safe-area-aware padding).
+   Desktop styling is untouched — only max-width queries match here, so
+   widths ≥ 641px keep the existing multi-column-card desktop layout. */
+@media (max-width: 640px) {
+  main { padding: 16px 14px 0; }
+  /* Drop card density a notch on phones — --card-pad-mobile in :root. */
+  .card { padding: var(--card-pad-mobile); }
+  .jobcard { padding: var(--card-pad-mobile); }
+  /* Headline scales down one step (18px → 16px). */
+  .pname { font-size: 16px; }
+  .summary { font-size: 11px; }
+  td, th { padding: 6px 6px; }
+  /* Tap-target floor — every clickable element gets ≥ 44px in both
+     dimensions. .btn covers every action button in the SPA; we also
+     cover bare <button> for safety (modal close, future controls). */
+  .btn, button { min-height: var(--tap-min); min-width: var(--tap-min); }
+  /* The select / input controls in the "add a project" and "tell it what
+     to build" modals are also touch targets — raise their height too. */
+  .fld input, .fld textarea, .fld select { min-height: var(--tap-min); }
   /* On phones, anchor the action bar to the viewport so scrolling a long
-     diff still leaves Approve / Send back / Discard within thumb reach. */
+     diff still leaves Approve / Send back / Discard within thumb reach.
+     Keeps position: sticky from desktop; just adjusts padding for the
+     home-indicator safe area on iOS. */
   .pr-actionbar { position: sticky; bottom: 0;
     padding: 10px 4px calc(10px + env(safe-area-inset-bottom)); }
   .pr-diff { max-height: 50vh; font-size: 11.5px; }
