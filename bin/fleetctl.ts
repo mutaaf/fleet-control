@@ -10,6 +10,7 @@ import { evalAlerts, openAlerts } from "../src/alerts.ts";
 import { mintToken, listTokens, revokeToken, type Scope } from "../src/auth.ts";
 import { syncPricing, pricingRows, DEFAULT_PRICING_FILE } from "../src/pricing.ts";
 import { flagRun } from "../src/anomaly.ts";
+import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -234,6 +235,16 @@ switch (cmd) {
     break;
   }
   case "tokens": tokens(); break;
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show]");
+  case "ntfy": {
+    if (arg === "test") {
+      const code = await ntfyTestCommand(ntfyConfigFrom(cfg));
+      if (code !== 0) process.exitCode = code;
+    } else {
+      console.log("usage: fleetctl ntfy test");
+      process.exitCode = 1;
+    }
+    break;
+  }
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run") db.close();

@@ -10,6 +10,7 @@ import { execFile, execFileSync } from "node:child_process";
 import type { DB } from "./db.ts";
 import type { FleetConfig } from "./config.ts";
 import { activeRun, selfCancelDays } from "./live.ts";
+import { ntfyConfigFrom, ntfyForAlert, ntfyForAnomaly } from "./ntfy.ts";
 
 const UID = process.getuid?.() ?? 0;
 // "Too long" *floors* (minutes). The real threshold is adaptive: p95 of this
@@ -131,9 +132,52 @@ export function evalAlerts(db: DB, cfg: FleetConfig, notify = true): number {
     "INSERT INTO alert(project_id,phase,type,severity,title,detail,dedup_key,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(dedup_key) DO NOTHING",
   );
   let added = 0;
+  const ncfg = ntfyConfigFrom(cfg);
   for (const a of fresh) {
     const r = ins.run(a.project_id, a.phase, a.type, a.severity, a.title, a.detail, a.dedup_key, now.toISOString());
-    if (r.changes > 0) { added++; if (notify) osa(a.title, a.detail); }
+    if (r.changes > 0) {
+      added++;
+      if (notify) {
+        osa(a.title, a.detail);
+        // Best-effort ntfy fan-out — dispatcher dedups per (dedup_key) for
+        // the process lifetime and returns silently when ntfyTopic is
+        // unset. We fire-and-forget so a slow remote doesn't stall the
+        // ingest pass; transport failures are logged in src/ntfy.ts.
+        void ntfyForAlert(db, cfg, ncfg, a);
+      }
+    }
+  }
+
+  // --- ntfy fan-out for newly-inserted anomaly rows (ticket 0009) -----
+  // We scan recent anomalies whose run_id belongs to one of the projects
+  // we just touched. The in-memory dedup in src/ntfy.ts ensures we never
+  // POST the same (run_id, kind) twice in one daemon lifetime, even if
+  // multiple evalAlerts ticks see the same row.
+  if (notify && ncfg.topic) {
+    const recent = db.prepare(
+      "SELECT a.run_id AS run_id, a.kind AS kind, a.value AS value, "
+      + "  a.baseline_mean AS baseline_mean, a.baseline_stddev AS baseline_stddev, "
+      + "  a.candidate_reason AS candidate_reason, r.project_id AS project_id "
+      + "FROM anomaly a JOIN run r ON r.id = a.run_id "
+      + "WHERE a.created_at >= datetime('now','-1 day') "
+      + "ORDER BY a.created_at DESC LIMIT 50",
+    ).all() as Array<{
+      run_id: number; kind: string; value: number; baseline_mean: number;
+      baseline_stddev: number; candidate_reason: string | null; project_id: number;
+    }>;
+    for (const row of recent) {
+      const sigma = row.baseline_stddev > 0
+        ? (row.value - row.baseline_mean) / row.baseline_stddev : 0;
+      void ntfyForAnomaly(db, cfg, ncfg, {
+        project_id: row.project_id,
+        run_id: row.run_id,
+        kind: row.kind,
+        value: row.value,
+        baseline_mean: row.baseline_mean,
+        stddev_multiplier: sigma,
+        candidate_reason: row.candidate_reason,
+      });
+    }
   }
 
   // --- auto-resolve: close alerts whose condition has cleared ---------

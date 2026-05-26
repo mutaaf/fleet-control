@@ -1,7 +1,7 @@
 ---
 id: 0009
 title: ntfy push notifications for high-priority events
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-05-26
@@ -84,4 +84,19 @@ The kit becomes operable from anywhere, on any device, with zero infra.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branch `feat/0009-ntfy-push` opened.
+  Plan: add `sendNtfy()` in `src/alerts.ts` (https POST with injectable
+  request factory for tests), gate dispatch on `ntfyTopic` from
+  `fleet-control.config.json`, wire severity → ntfy priority, dedup by
+  the same key as osascript, dispatch on new `anomaly` rows too, add
+  `fleetctl ntfy test` CLI subcommand. Tests stub `node:https` via
+  `setHttpsRequest()` injection — no global monkey-patching.
+- 2026-05-26 — implementation-dev: landed `src/ntfy.ts` (new module —
+  keeps `src/alerts.ts` from getting any wider) with `sendNtfy`,
+  `setHttpsRequest`/`resetHttpsRequest` test seam, `ntfyForAlert`,
+  `ntfyForAnomaly`, `ntfyConfigFrom`, and `ntfyTestCommand`. Wired
+  `src/alerts.ts` to fire ntfy alongside osascript per new alert row
+  AND for any anomaly created in the last 24h. Added `fleetctl ntfy
+  test` subcommand. New `ntfyTopic` + `portalUrl` fields on
+  `FleetConfig` (both optional). 12 new tests in `tests/ntfy.test.ts`
+  cover every AC checkbox; full suite 96/96 green.
