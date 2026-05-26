@@ -1,4 +1,6 @@
 // Fleet control plane SPA (zero-dep). Plain language by default; hash routing.
+import { renderDiffHtml, TRUNCATION_MARKER_SNIPPET } from "/diff.js";
+
 const app = document.getElementById("app");
 const summary = document.getElementById("fleet-summary");
 const foot = document.getElementById("foot");
@@ -377,18 +379,75 @@ function prSection(p) {
   if (!prs.length) return "";
   const ci = { green: "✓ checks pass", red: "✗ checks failing", pending: "checks running…", none: "" };
   return `<div class="eyebrow">Finished work waiting for you</div>` + prs.map((pr) => `
-    <div class="card" style="padding:12px 16px">
-      <div class="card-head"><span class="pname" style="font-size:15px">${esc(pr.title)}</span>
-        <span class="state dim mono">#${pr.number} · ${ci[pr.ci_state] || ""}</span></div>
+    <div class="card pr-card" data-pr-card data-slug="${esc(p.slug)}" data-repo="${esc(p.repo)}" data-number="${pr.number}" data-url="${esc(pr.url || "")}">
+      <div class="card-head pr-head" data-pr-toggle>
+        <span class="pname" style="font-size:15px">${esc(pr.title)}</span>
+        <span class="state dim mono">#${pr.number} · ${ci[pr.ci_state] || ""} <span class="pr-caret">▸</span></span>
+      </div>
       <div class="metarow" style="margin-top:8px">
         <span class="faint mono">+${pr.additions} −${pr.deletions}</span>
-        <button class="btn sm primary" data-act="pr-merge" data-slug="${p.slug}" data-number="${pr.number}" data-confirm="Approve and publish #${pr.number}? It merges to main when checks pass.">Approve &amp; publish</button>
-        <button class="btn sm" data-act="pr-changes" data-slug="${p.slug}" data-number="${pr.number}">Send back…</button>
-        <button class="btn sm" data-act="pr-close" data-slug="${p.slug}" data-number="${pr.number}" data-confirm="Discard #${pr.number}? This closes the work.">Discard</button>
-        ${pr.url ? `<a class="btn sm" href="${esc(pr.url)}" target="_blank">View on GitHub</a>` : ""}
+        ${pr.url ? `<a class="btn sm" href="${esc(pr.url)}" target="_blank" onclick="event.stopPropagation()">View on GitHub</a>` : ""}
+      </div>
+      <div class="pr-expand hidden">
+        <div class="pr-diff" data-pr-diff><div class="dim mono">loading diff…</div></div>
+        <div class="pr-actionbar">
+          <button class="btn sm primary" data-act="pr-merge" data-slug="${p.slug}" data-number="${pr.number}" data-confirm="Approve and publish #${pr.number}? It merges to main when checks pass.">Approve &amp; publish</button>
+          <button class="btn sm" data-act="pr-changes" data-slug="${p.slug}" data-number="${pr.number}">Send back…</button>
+          <button class="btn sm" data-act="pr-close" data-slug="${p.slug}" data-number="${pr.number}" data-confirm="Discard #${pr.number}? This closes the work.">Discard</button>
+        </div>
       </div>
     </div>`).join("");
 }
+
+// ---- Inline PR diff (ticket 0007) ----------------------------------------
+// Click the PR card head → toggle .pr-expand and lazy-load the diff once.
+// The diff <div> is sticky-bar's scroll container; the action bar is
+// position:sticky inside .pr-expand so it stays visible on mobile while
+// the operator scrolls a long diff.
+async function loadPrDiff(card) {
+  const diffEl = card.querySelector("[data-pr-diff]");
+  if (!diffEl || diffEl.dataset.loaded === "1") return;
+  const repo = card.dataset.repo;
+  const number = card.dataset.number;
+  const ghUrl = card.dataset.url || "";
+  const tok = localStorage.getItem("fleetToken") || "";
+  const u = "/api/prs/" + repo + "/" + number + "/diff";
+  let r, text;
+  try {
+    r = await fetch(u, { headers: tok ? { "x-fleet-token": tok } : {} });
+    text = await r.text();
+  } catch {
+    diffEl.innerHTML = `<div class="dim mono">couldn't reach the server</div>`;
+    return;
+  }
+  if (!r.ok) {
+    diffEl.innerHTML = `<div class="dim mono">${esc(text || "diff unavailable")}</div>`;
+    return;
+  }
+  const truncated = r.headers.get("x-diff-truncated") === "1" || text.includes(TRUNCATION_MARKER_SNIPPET);
+  let html = renderDiffHtml(text);
+  if (truncated && ghUrl) {
+    html += `<div class="diff-truncated"><a href="${esc(ghUrl)}" target="_blank">open full diff in GitHub →</a></div>`;
+  }
+  diffEl.innerHTML = html;
+  diffEl.dataset.loaded = "1";
+}
+document.addEventListener("click", (e) => {
+  // Ignore clicks on links, buttons, or anything with [data-act]/[data-modal]
+  // inside the head — those should fire their own handlers, not toggle.
+  if (e.target.closest("a, button, [data-act], [data-modal]")) return;
+  const toggle = e.target.closest("[data-pr-toggle]");
+  if (!toggle) return;
+  const card = toggle.closest("[data-pr-card]");
+  if (!card) return;
+  const expand = card.querySelector(".pr-expand");
+  const caret = card.querySelector(".pr-caret");
+  if (!expand) return;
+  const opening = expand.classList.contains("hidden");
+  expand.classList.toggle("hidden");
+  if (caret) caret.textContent = opening ? "▾" : "▸";
+  if (opening) loadPrDiff(card);
+});
 function jobCard(j, slug) {
   const next = j.paused ? "paused" : j.loaded ? until(j.next) : "not set up";
   const toggle = j.paused
