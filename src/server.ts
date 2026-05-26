@@ -2,10 +2,9 @@
 // Binds 127.0.0.1 by default; set host 0.0.0.0 in fleet-control.config.json for
 // LAN access (phone/tablet) — Phase 4 adds the admin token before control routes.
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes, timingSafeEqual } from "node:crypto";
 import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
@@ -15,38 +14,48 @@ import { doAction } from "./control.ts";
 import { evalAlerts } from "./alerts.ts";
 import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
 import { tailTranscript, type TailEvent } from "./live.ts";
+import {
+  authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
+  type Scope, type TokenRecord,
+} from "./auth.ts";
 
 const CONFIG_FILE = join(process.cwd(), "fleet-control.config.json");
-
-/** Read or generate the admin token (required for control actions over the LAN). */
-function adminToken(): string {
-  let cfg: any = {};
-  if (existsSync(CONFIG_FILE)) { try { cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8")); } catch { /* */ } }
-  if (!cfg.adminToken) {
-    cfg.adminToken = randomBytes(24).toString("hex");
-    writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
-  }
-  return cfg.adminToken;
-}
-const TOKEN = adminToken();
 
 function isLoopback(req: any): boolean {
   const ip = req.socket?.remoteAddress ?? "";
   return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
 }
-function controlAuthed(req: any): boolean {
-  if (isLoopback(req)) return true; // local portal/CLI is trusted
-  const t = String(req.headers["x-fleet-token"] ?? "");
-  if (t.length !== TOKEN.length) return false;
-  try { return timingSafeEqual(Buffer.from(t), Buffer.from(TOKEN)); } catch { return false; }
+
+/** Result of a scoped-auth check. `principal` is null for loopback (the local
+ *  CLI / portal — trusted, no token). For remote callers it's the matched
+ *  auth_token row, whose `name` we record on every control_audit row. */
+export interface AuthOutcome {
+  ok: boolean;
+  status: number; // HTTP status on failure
+  message: string; // human-friendly message on failure
+  principal: TokenRecord | null;
 }
-/** Auth for the SSE stream: loopback bypasses; remote needs x-fleet-token,
- *  passed via header OR ?token= query (browser EventSource can't set headers). */
-function streamAuthed(req: any, url: URL): boolean {
-  if (isLoopback(req)) return true;
-  const t = String(req.headers["x-fleet-token"] ?? url.searchParams.get("token") ?? "");
-  if (t.length !== TOKEN.length) return false;
-  try { return timingSafeEqual(Buffer.from(t), Buffer.from(TOKEN)); } catch { return false; }
+
+/** Single auth chokepoint for the JSON API + SSE. Loopback bypasses tokens
+ *  entirely (the local CLI/portal is trusted). Remote callers must send the
+ *  `x-fleet-token` header (or `?token=` for SSE since browser EventSource
+ *  can't set custom headers) AND that token's scope must dominate `required`.
+ *  Updates last_used_at on success as a side effect of authenticate(). */
+export function requireAuth(db: DB, req: any, required: Scope, url?: URL): AuthOutcome {
+  if (isLoopback(req)) return { ok: true, status: 200, message: "", principal: null };
+  const raw = String(req.headers["x-fleet-token"] ?? (url ? url.searchParams.get("token") ?? "" : ""));
+  if (!raw) return { ok: false, status: 401, message: "not authorized — pair this device first", principal: null };
+  const p = authenticate(db, raw);
+  if (!p) return { ok: false, status: 401, message: "unknown or revoked token", principal: null };
+  if (!scopeAllows(p.scope, required)) {
+    return { ok: false, status: 403, message: `this token has scope '${p.scope}', need '${required}'`, principal: p };
+  }
+  return { ok: true, status: 200, message: "", principal: p };
+}
+
+function actorOf(req: any, principal: TokenRecord | null): { actor: string; actor_name: string } {
+  if (principal) return { actor: "lan", actor_name: principal.name };
+  return { actor: isLoopback(req) ? "local" : "lan", actor_name: isLoopback(req) ? "local" : "anonymous" };
 }
 function readBody(req: any): Promise<any> {
   return new Promise((resolve) => {
@@ -77,6 +86,11 @@ const json = (res: any, body: unknown, code = 200) => {
 export function startServer(host = "127.0.0.1", port = 7070) {
   const cfg = loadConfig();
   const db = openDb(cfg.dbPath);
+  // One-shot: if the legacy adminToken still lives in the config and we have
+  // no auth_token rows, promote it to a real admin-scoped token so existing
+  // paired devices keep working through the upgrade. After this returns the
+  // adminToken field is gone from disk (see src/auth.ts).
+  migrateLegacyAdminTokenIfPresent(db, CONFIG_FILE);
   runIngestPass(db, cfg); lastIngest = Date.now();
 
   const server = createServer((req, res) => {
@@ -86,16 +100,22 @@ export function startServer(host = "127.0.0.1", port = 7070) {
       // control actions (management) — POST, auth-gated for non-loopback
       const cm = path.match(/^\/api\/control\/([\w-]+)$/);
       if (cm && req.method === "POST") {
-        if (!controlAuthed(req)) return json(res, { ok: false, message: "not authorized — pair this device first" }, 401);
+        // Token management lives inside doAction("tokens-*") and requires
+        // admin; every other control verb requires control. Daemon toggle
+        // is local-only infrastructure → control is sufficient.
+        const required: Scope = cm[1].startsWith("tokens-") ? "admin" : "control";
+        const auth = requireAuth(db, req, required);
+        if (!auth.ok) return json(res, { ok: false, message: auth.message }, auth.status);
         return readBody(req).then((body) => {
           let r;
           try {
+            const who = actorOf(req, auth.principal);
             if (cm[1] === "daemon") { // always-on toggle (off by default)
               const on = body.enabled ?? body.on;
               if (on) installDaemon(Number(body.interval) || 60); else uninstallDaemon();
               r = { ok: true, message: on ? "Always-on monitoring enabled." : "Always-on monitoring disabled." };
             } else {
-              r = doAction(db, isLoopback(req) ? "local" : "lan", cm[1], body);
+              r = doAction(db, who.actor, cm[1], body, who.actor_name);
             }
           } catch (e: any) { r = { ok: false, message: String(e?.message ?? e) }; }
           lastIngest = 0; // force fresh state next read
@@ -110,9 +130,10 @@ export function startServer(host = "127.0.0.1", port = 7070) {
       // EventSource can't set custom headers).
       const sm = path.match(/^\/api\/projects\/([\w-]+)\/stream$/);
       if (sm) {
-        if (!streamAuthed(req, url)) {
-          res.writeHead(401, { "content-type": "text/plain" });
-          return res.end("unauthorized");
+        const sauth = requireAuth(db, req, "read", url);
+        if (!sauth.ok) {
+          res.writeHead(sauth.status, { "content-type": "text/plain" });
+          return res.end(sauth.message);
         }
         const slug = sm[1];
         const optPhase = url.searchParams.get("phase") ?? undefined;
@@ -146,6 +167,9 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         return;
       }
       if (path.startsWith("/api/")) {
+        // All read endpoints require the `read` scope (loopback bypasses).
+        const rauth = requireAuth(db, req, "read", url);
+        if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
         if (path === "/api/fleet") return json(res, fleetView(db, cfg));
         const pm = path.match(/^\/api\/project\/([\w-]+)$/);
@@ -175,8 +199,10 @@ export function startServer(host = "127.0.0.1", port = 7070) {
   server.listen(port, host, () => {
     console.log(`fleet-control portal → http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
     if (host === "0.0.0.0") {
-      console.log(`  LAN access enabled. Pair a device with this admin token:`);
-      console.log(`  ${TOKEN}`);
+      // We deliberately never log a token here — mint one with
+      //   `fleetctl tokens add <device-name> --scope <read|control|admin>`
+      // which prints it ONCE so it's only on the operator's screen.
+      console.log(`  LAN access enabled. Mint a token with: fleetctl tokens add <device-name> --scope read`);
     }
   });
   return server;
