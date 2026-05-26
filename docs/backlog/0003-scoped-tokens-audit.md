@@ -1,7 +1,7 @@
 ---
 id: 0003
 title: Per-user scoped tokens with audit log
-status: groomed
+status: in-progress
 priority: P1
 area: control
 created: 2026-05-26
@@ -74,4 +74,8 @@ Multi-device-by-design is a real property. People notice.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: picked up; opened `feat/0003-scoped-tokens-audit`.
+  Plan: add `auth_token` table + `actor_name` column via ALTER, new `tokens`
+  subcommand on `bin/fleetctl.ts`, scope-gated `requireAuth` in `src/server.ts`
+  with backward-compat for the legacy `adminToken`, then `tests/auth-tokens.test.ts`
+  exercising mint/use/revoke against in-memory routes.
