@@ -156,6 +156,11 @@ export function openDb(path: string): DB {
     // an opaque "local"/"lan" actor. Back-fill is implicit — pre-existing
     // rows show actor_name=NULL which the views surface as "admin (legacy)".
     "ALTER TABLE control_audit ADD COLUMN actor_name TEXT",
+    // ticket 0004: pricing rows now carry the wall-clock of the last
+    // successful sync. Older DBs that lived through the hardcoded-pricing
+    // era pick up the column on next open; the value stays NULL until
+    // the first syncPricing() call stamps it.
+    "ALTER TABLE pricing ADD COLUMN fetched_at TEXT",
   ]) { try { db.exec(ddl); } catch { /* already there */ } }
   return db;
 }

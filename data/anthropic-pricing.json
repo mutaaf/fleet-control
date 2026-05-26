@@ -1,0 +1,13 @@
+{
+  "_comment": "Anthropic model pricing in USD per million tokens. Bootstrap source of truth for `fleetctl pricing sync` (ticket 0004). Manually updated; a follow-up ticket can swap to a live HTTP fetch from anthropic.com/pricing.",
+  "_updated": "2026-05-26",
+  "_source": "https://www.anthropic.com/pricing",
+  "models": [
+    { "id": "claude-opus-4-7",   "input_per_mtok": 15.00, "output_per_mtok": 75.00, "cache_read_per_mtok": 1.50,  "cache_write_per_mtok": 18.75 },
+    { "id": "claude-opus-4",     "input_per_mtok": 15.00, "output_per_mtok": 75.00, "cache_read_per_mtok": 1.50,  "cache_write_per_mtok": 18.75 },
+    { "id": "claude-sonnet-4-5", "input_per_mtok":  3.00, "output_per_mtok": 15.00, "cache_read_per_mtok": 0.30,  "cache_write_per_mtok":  3.75 },
+    { "id": "claude-sonnet-4",   "input_per_mtok":  3.00, "output_per_mtok": 15.00, "cache_read_per_mtok": 0.30,  "cache_write_per_mtok":  3.75 },
+    { "id": "claude-haiku-4-5",  "input_per_mtok":  0.80, "output_per_mtok":  4.00, "cache_read_per_mtok": 0.08,  "cache_write_per_mtok":  1.00 },
+    { "id": "claude-haiku-4",    "input_per_mtok":  0.80, "output_per_mtok":  4.00, "cache_read_per_mtok": 0.08,  "cache_write_per_mtok":  1.00 }
+  ]
+}
