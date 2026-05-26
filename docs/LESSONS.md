@@ -60,3 +60,17 @@ guesses are brittle under load. Fix: helper `waitFor(predicate, maxMs)`
 that polls every 20ms up to a generous timeout, then asserts. Same
 principle as flaky web-driver tests — assert on the *condition*, not on a
 sleep length.
+
+## 2026-05-26 — don't fake a "lazy require" in an ESM file; just import
+
+Symptom: while wiring `src/control.ts` to call into the new `src/auth.ts`
+I started writing a `require_auth_lazy()` indirection because I half-
+remembered the "don't eagerly import" pattern from CJS. Caught it before
+push because the file uses `import` everywhere else and `require` isn't
+in scope. Fix: `import * as auth from "./auth.ts"` at the top. node's
+type-stripper hoists named imports and tree-shaking is not our problem
+here — every consumer of `control.ts` already imports the DB module, so
+the marginal cost of pulling in `node:crypto` is invisible. General rule
+for this repo: there is exactly one module system (ESM via `.ts`); reach
+for `import`, never `require`, never `await import()` unless you
+genuinely need the laziness.
