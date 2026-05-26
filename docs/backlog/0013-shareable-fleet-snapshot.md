@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: Shareable read-only fleet snapshot with anonymized slugs
-status: in-progress
+status: shipped
 priority: P2
 area: portal
 created: 2026-05-26
