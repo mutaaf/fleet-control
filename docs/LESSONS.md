@@ -273,3 +273,35 @@ diff needs to be accurate below ~1ms, avoid `julianday()`'s float-day
 intermediate and decompose into integer seconds + fractional remainder
 via `strftime`. Same trap will bite any future P99 latency rollup,
 SLA-band aggregator, or run-duration drift detector.
+
+## 2026-05-26 — in-process `startServer()` tests need an empty-roots config + run-row seeds, not direct rollup inserts
+
+Symptom: while shipping ticket 0015 (badge route) the first cut of
+`tests/badge-route.test.ts` booted `startServer()` against a tmpdir DB,
+seeded `cost_rollup_day` directly, then asserted the `$3.21` cost
+badge — and watched the test take ~80 seconds and fail with no
+dollar amount in the response. Two compounding causes: (1)
+`startServer()` synchronously calls `runIngestPass(db, cfg)` which
+walks `cfg.projectRoots` / `cfg.installedRoot` / `cfg.cacheBase` —
+all defaulting to subdirs of the operator's real `$HOME`, so the
+test was reading the entire fleet on every boot; and (2) the very
+last step of that pass, `recomputeRollups()`, does
+`DELETE FROM cost_rollup_day` unconditionally and then re-inserts
+from the `run` table — wiping the seeded rollup row before the
+request ever ran. Fix: the test now plants a temporary
+`fleet-control.config.json` in cwd pointing
+`projectRoots`/`installedRoot`/`cacheBase`/`claudeProjects` at an
+empty tmpdir (snapshotted + restored on cleanup so a dev's local
+config isn't clobbered), AND seeds cost data via a real `run` row
+so the recompute step derives the same `cost_rollup_day` value the
+production rollup would. Boot time dropped from ~80s to ~1s per
+test and the cost branch became green. General rules for this
+repo: (1) any test that boots `startServer()` in-process MUST
+isolate the config — `FLEET_DB_PATH` alone is not enough because
+discovery still walks real filesystem roots; (2) any test that
+depends on `cost_rollup_day` MUST seed through `run` rows, never
+direct rollup inserts, because `runIngestPass()` re-derives the
+table on every pass; (3) when you need to plant a side-effecting
+file in cwd, snapshot any prior contents and restore on cleanup so
+a developer running tests on a live config doesn't lose their
+admin token.

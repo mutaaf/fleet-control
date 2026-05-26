@@ -1,7 +1,7 @@
 ---
 id: 0015
 title: Embeddable status badge SVG per project
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-05-26
@@ -149,3 +149,7 @@ Each box maps 1:1 to a test scenario.
   `origin/main`. Flipped status to `in-progress`. Tests first per AC,
   then the implementation in `src/badge.ts`, a new `GET /badge/<slug>.svg`
   route in `src/server.ts`, and the "Embed" panel in `web/app.js`.
+- 2026-05-26: shipped via PR #32 — typecheck + validate both green.
+  Operators now get one-line SVG badges per project with the three
+  documented metrics; copy-buttons under "Embed badge" on the project
+  page stamp the markdown snippet for each.
