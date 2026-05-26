@@ -12,13 +12,38 @@ import type { FleetConfig } from "./config.ts";
 import { activeRun, selfCancelDays } from "./live.ts";
 
 const UID = process.getuid?.() ?? 0;
-// "Too long" thresholds (minutes). A run past this is considered hung — we'll
-// kill it so subsequent scheduled fires aren't blocked by a wedged child.
-const HUNG_MIN: Record<string, number> = { ship: 15, groom: 45, review: 8, eng: 15 };
+// "Too long" *floors* (minutes). The real threshold is adaptive: p95 of this
+// (project, phase)'s historical successful runs × 1.5, with a floor at these
+// values and a hard cap at 8 hours. This matters because legit ship runs on
+// some projects routinely take 30–115m; a flat fleet-wide 15m would auto-kill
+// healthy work. Set the floor with the original conservative defaults so a
+// brand-new project (no history yet) still benefits from auto-heal.
+const HUNG_FLOOR_MIN: Record<string, number> = { ship: 15, groom: 45, review: 8, eng: 15 };
+const HUNG_CAP_MIN = 480; // 8 hours — anything past this really is stuck.
 // Re-kill grace: don't auto-kill again within this window per (slug,phase) so a
 // child that's mid-SIGTERM has time to wind down before we escalate to SIGKILL.
 const KILL_COOLDOWN_MS = 90_000;
 const lastKill = new Map<string, number>();
+
+/** Adaptive hung threshold for (project, phase). Returns minutes.
+ * Uses p95 of past successful runs × 1.5; bounded by HUNG_FLOOR_MIN[phase]
+ * and HUNG_CAP_MIN. Falls back to floor for projects with little history. */
+function hungThresholdMin(db: DB, projectId: number, phase: string): number {
+  const floor = HUNG_FLOOR_MIN[phase] ?? 15;
+  const count = (db.prepare(
+    "SELECT COUNT(*) AS n FROM run WHERE project_id=? AND phase=? AND duration_ms IS NOT NULL AND outcome IN ('shipped','healed','reviewed-ok','reviewed-changes','no-op')",
+  ).get(projectId, phase) as { n: number }).n;
+  if (count < 5) return floor;
+  const offset = Math.max(0, Math.floor(count * 0.95) - 1);
+  const row = db.prepare(
+    `SELECT duration_ms FROM run WHERE project_id=? AND phase=? AND duration_ms IS NOT NULL
+       AND outcome IN ('shipped','healed','reviewed-ok','reviewed-changes','no-op')
+     ORDER BY duration_ms ASC LIMIT 1 OFFSET ?`,
+  ).get(projectId, phase, offset) as { duration_ms: number } | undefined;
+  if (!row) return floor;
+  const p95Min = row.duration_ms / 60_000;
+  return Math.min(HUNG_CAP_MIN, Math.max(floor, Math.round(p95Min * 1.5)));
+}
 
 interface NewAlert { project_id: number; phase: string | null; type: string; severity: string; title: string; detail: string; dedup_key: string; }
 
@@ -73,11 +98,13 @@ export function evalAlerts(db: DB, cfg: FleetConfig, notify = true): number {
       if (!running) continue;
       const { elapsedMs } = activeRun(cfg, aliases, ph);
       const mins = elapsedMs ? elapsedMs / 60000 : 0;
-      const threshold = HUNG_MIN[ph] ?? 15;
+      const threshold = hungThresholdMin(db, p.id, ph);
       if (mins > threshold) {
         // Raise the alert (dedup per hour so it doesn't spam).
         fresh.push({ project_id: p.id, phase: ph, type: "hung_run", severity: "warn",
-          title: `${p.name}: ${ph} running ${Math.round(mins)}m`, detail: `Longer than usual — auto-killing so the next run can fire.`, dedup_key: `hung:${p.slug}:${ph}:${hour}` });
+          title: `${p.name}: ${ph} running ${Math.round(mins)}m`,
+          detail: `Beyond the ${Math.round(threshold)}m adaptive threshold (1.5× p95) — auto-killing so the next run can fire.`,
+          dedup_key: `hung:${p.slug}:${ph}:${hour}` });
         // Self-heal: kill the job so subsequent scheduled fires aren't blocked.
         const cooldownKey = `${p.slug}:${ph}`;
         const since = Date.now() - (lastKill.get(cooldownKey) ?? 0);
@@ -87,12 +114,12 @@ export function evalAlerts(db: DB, cfg: FleetConfig, notify = true): number {
           lastKill.set(cooldownKey, Date.now());
           db.prepare("INSERT INTO control_audit(ts,actor,action,target,args_json,exit_code,stdout_tail) VALUES(?,?,?,?,?,?,?)")
             .run(now.toISOString(), "auto-kill", "kill-hung", `${p.slug}/${ph}`,
-              JSON.stringify({ mins: Math.round(mins), signal: sig, threshold }), 0,
-              `${sig}'d ${label} after ${Math.round(mins)}m (threshold ${threshold}m)`);
+              JSON.stringify({ mins: Math.round(mins), signal: sig, threshold: Math.round(threshold) }), 0,
+              `${sig}'d ${label} after ${Math.round(mins)}m (adaptive threshold ${Math.round(threshold)}m)`);
         } catch (e: any) {
           db.prepare("INSERT INTO control_audit(ts,actor,action,target,args_json,exit_code,stdout_tail) VALUES(?,?,?,?,?,?,?)")
             .run(now.toISOString(), "auto-kill", "kill-hung", `${p.slug}/${ph}`,
-              JSON.stringify({ mins: Math.round(mins), signal: sig, threshold }), 1,
+              JSON.stringify({ mins: Math.round(mins), signal: sig, threshold: Math.round(threshold) }), 1,
               String(e?.message ?? e).slice(0, 400));
         }
       }
