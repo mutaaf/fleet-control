@@ -158,3 +158,28 @@ the detector remains useful in BOTH scenarios. General rule for any
 threshold-style detector (forecast bands, regression alerts, drift
 detectors): the test fixture's σ must be wide enough that "within bounds"
 is geometrically meaningful, not just an artifact of a flat baseline.
+
+## 2026-05-26 — shell-out modules need an injectable runner for tests
+
+Symptom: writing tests for the new `register-url` action (ticket 0010) I
+needed to assert the exact argv that `gh repo view` and `git clone`
+would be called with, plus stub their filesystem effects (a fake `.git`
+dir at the dest path so the downstream `scaffoldAndInstall()` recognised
+the clone). The existing code path used a free-standing
+`function run(cmd, args)` that called `execFileSync` directly, so every
+test would have tried to spawn the real binaries against a tmpdir
+fixture — flaky at best, and impossible for the `bash install.sh` step
+which writes a real launchd plist. Cause: the module had no test seam.
+Fix: replace `function run(...)` with a module-level mutable
+`activeRunner` plus exported `_setRunnerForTests(fn)` /
+`_resetRunnerForTests()` helpers (leading underscore = "do not call in
+production"). Production callers keep their existing `run(cmd, args)`
+call sites unchanged; tests swap the runner in `try { ... } finally {
+_resetRunnerForTests(); }`. This is the SAME shape as the
+`_resetDedupForTests` seam in `src/ntfy.ts`, generalised: any module
+that gates side-effects (shell-out, network, launchd, fs.watch) behind
+a single function should expose a swap seam from day one, even when
+only one test wants it — otherwise the next ticket either rewrites the
+module to add one OR ships partly-untested. General rule for this repo:
+when a control action lands more than one `run(...)` call, the runner
+is a module variable, not a function declaration.
