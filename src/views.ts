@@ -78,6 +78,16 @@ export function fleetView(db: DB, cfg: FleetConfig) {
     const scDays = selfCancelDays(p.self_cancel);
     const agg = db.prepare("SELECT COUNT(*) runs, SUM(COALESCE(cost_usd,cost_usd_computed,0)) cost FROM run WHERE project_id=?").get(p.id) as any;
     const cost7 = db.prepare("SELECT SUM(cost_usd) c FROM cost_rollup_day WHERE project_id=? AND day >= date('now','-7 day')").get(p.id) as any;
+    // Ticket 0019: trailing-7d PRs merged from the run table (DISTINCT
+    // pr_number on shipped runs). Sourced from runs — NOT from
+    // control_audit — so auto-merged agent PRs are counted, not just
+    // PRs the operator clicked "Approve & publish" on.
+    const prs7 = db.prepare(
+      "SELECT COUNT(DISTINCT pr_number) AS n FROM run "
+      + "WHERE project_id = ? AND outcome = 'shipped' AND pr_number IS NOT NULL "
+      + "  AND started_at IS NOT NULL AND date(started_at) >= date('now','-7 day')",
+    ).get(p.id) as { n: number } | undefined;
+    const prsMerged7d = Number(prs7?.n ?? 0);
     const telemetry = (db.prepare("SELECT outcome FROM run WHERE project_id=? AND outcome IS NOT 'smoke' ORDER BY started_at DESC LIMIT 16").all(p.id) as any[]).reverse().map((r) => r.outcome);
     const usage = usageLimitState(db, p.id);
     const autoKill = lastAutoKill(db, p.slug);
@@ -99,6 +109,10 @@ export function fleetView(db: DB, cfg: FleetConfig) {
       slug: p.slug, name: p.name, displayState: displayState(jobs, scDays, usage),
       selfCancelDays: scDays, engEnabled: !!p.eng_enabled,
       cost: agg.cost ?? 0, cost7d: cost7.c ?? 0, runs: agg.runs ?? 0,
+      // prs_merged_7d (ticket 0019): trailing-7d count derived from
+      // run.pr_number on shipped runs. Additive — the SPA's existing
+      // fields are unchanged.
+      prs_merged_7d: prsMerged7d,
       jobs, telemetry, usageLimit: usage, autoKill, forecast, anomalies,
       // cadence: full schedule (so the SPA can show "every 6h, twice daily…")
       // and label the active pace preset when it matches a known one.
