@@ -1,7 +1,7 @@
 ---
 id: 0006
 title: Stale-checkout janitor with disk view
-status: in-progress
+status: shipped
 priority: P1
 area: infra
 created: 2026-05-26
@@ -77,3 +77,8 @@ real product.
   prefix regex. `/api/projects/:slug/disk` exposes the shape; SPA grows an
   expandable section with the cleanup button. Tests: `tests/disk.test.ts`
   drives both the disk view and the cleaner end-to-end via a tmpdir fixture.
+- 2026-05-26 — drift-fix (bundled into feat/0010-github-url-import): PR #10
+  for this ticket landed on main 2026-05-26 but the follow-up
+  `chore(0006): mark shipped` was never created. Flipping status to
+  `shipped` here + matching the README index row so the validator stays
+  green and the ship runner stops seeing this as in-flight.
