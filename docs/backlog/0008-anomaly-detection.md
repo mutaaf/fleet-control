@@ -35,22 +35,52 @@ Sees a red `anomaly` badge on a run; clicks to see the candidate reason
 
 - [ ] `src/anomaly.ts` (new) — `flagRun(db, run_id)` computes the
       (project, phase) baseline over the previous 14 days (mean + stddev
-      of `duration_ms` and `total_cost_usd`) and flags the run if either
-      is >3σ above the mean. Inserts a row in a new `anomaly` table:
-      `(run_id, kind, value, baseline_mean, baseline_stddev, candidate_reason)`.
+      of `duration_ms` and `cost_usd`) and flags the run if either is
+      >3σ above the mean AND the baseline has at least 5 samples. Inserts
+      a row per fired metric in a new `anomaly` table:
+      `(id INTEGER PRIMARY KEY, run_id, kind TEXT, value REAL,
+      baseline_mean REAL, baseline_stddev REAL, sample_count INTEGER,
+      candidate_reason TEXT, created_at TEXT, UNIQUE(run_id, kind))`. The
+      `kind` value is one of `duration` or `cost`.
+- [ ] Returns `{flagged: false, reason: "insufficient_baseline"}` when
+      sample_count < 5 — no row inserted. Test: 4 prior runs → no flag.
 - [ ] `bin/fleetctl.ts backfill` calls `flagRun` for each newly-ingested
-      run.
-- [ ] `candidate_reason` is a best-effort heuristic, not ML: scan the
-      transcript tail for repeated tool errors, missing test output, or
-      truncation. Top-3 phrases → comma-separated string. If nothing
-      stands out, returns `null`.
+      run, after the cost rollup pass so cost data is current.
+- [ ] `candidate_reason` is a deterministic heuristic, not ML. Scan the
+      run's `run_event` rows (already ingested) and return the first
+      matching string:
+      - `"repeated tool errors"` if `>= 3` events have `is_error = 1`.
+      - `"no test gate output"` if no `tool_use` event has `tool_name IN
+        ('Bash')` AND no event mentions `tsc|test|validate` in
+        `input_summary`.
+      - `"transcript truncated"` if the run's last event is a `tool_use`
+        with no matching `tool_result`.
+      - Otherwise `null`. No transcript file I/O.
 - [ ] `/api/projects/:slug/anomalies?limit=N` returns the recent flagged
-      runs.
-- [ ] `web/app.js` per-project card gains an "Anomalies (3)" link when
-      `anomaly_count_24h > 0`.
-- [ ] `tests/anomaly.test.ts` — seed 14 days of runs averaging
-      `duration_ms = 10000`, insert one at `60000`, assert it flags; one
-      at `15000`, assert it doesn't.
+      runs (default N=10, max 50). Shape:
+      `{anomalies: [{run_id, phase, kind, value, baseline_mean,
+      stddev_multiplier, candidate_reason, created_at}]}`.
+      Requires `read` scope.
+- [ ] `web/app.js` per-project card gains an "Anomalies (N)" pill linking
+      to `#/p/<slug>?view=anomalies` when at least one anomaly exists in
+      the trailing 24h. Pill is red if any anomaly is < 1h old, otherwise
+      amber.
+- [ ] `web/app.js` run detail page (`#/r/<id>`) shows an "Anomaly:
+      <kind> <multiplier>σ above baseline — <candidate_reason>" badge
+      when the run is flagged.
+- [ ] `tests/anomaly.test.ts` covers, with one test scenario per box:
+      - 14 days of runs at `duration_ms = 10000`, insert one at `60000`,
+        assert one `duration` anomaly row written.
+      - same baseline, insert one at `15000`, assert no row written.
+      - 4 prior runs only, insert a 10× outlier, assert no row written
+        and the helper returns `insufficient_baseline`.
+      - seed 3 `is_error = 1` events on a run, assert
+        `candidate_reason = "repeated tool errors"`.
+      - re-running `flagRun` on the same run is idempotent — second call
+        returns `{flagged: false, reason: "already_flagged"}` (UNIQUE
+        constraint).
+- [ ] `tsc --noEmit` clean. No new runtime deps. No shell-string
+      composition (no shell at all in this module).
 
 ## Out of scope
 

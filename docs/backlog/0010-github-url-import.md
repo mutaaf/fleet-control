@@ -36,25 +36,46 @@ manually.
 
 ## Acceptance criteria
 
-- [ ] New action `register-url` in `src/control.ts` accepting `{repo_url,
-      slug?, name?}`. `repo_url` must match
-      `^https://github.com/[\w.-]+/[\w.-]+$`.
+- [ ] New action `register-url` in `src/control.ts` accepting
+      `{repo_url, slug?, name?, days?, eng?}`. `repo_url` must match
+      the strict regex `^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(\.git)?$`.
+      A non-matching URL returns `{ok: false, error: "bad_url"}` with
+      HTTP 400 — no shell-out. Test: pass
+      `https://github.com/foo;rm -rf /` and assert rejection before any
+      child process spawns.
+- [ ] `slug` defaults to the URL's repo name lowercased; if it collides
+      with an existing project slug, the action returns
+      `{ok: false, error: "slug_exists"}`. Test: register the same URL
+      twice, assert second call rejected.
 - [ ] Action flow:
-      1. Verify `gh repo view <owner/name>` succeeds (auth + exists).
-      2. `git clone <repo_url> ~/Desktop/projects/<slug>`. If the dir
-         already exists, abort with a clear message.
-      3. Delegate to the existing `registerProject` with that path. (No
-         logic duplication.)
-- [ ] `web/app.js` wizard adds a second input "Or paste a GitHub URL" with
-      a "Clone & connect" button.
+      1. Verify with `execFile("gh", ["repo", "view", "<owner/name>",
+         "--json", "name"])` that the repo exists and the operator has
+         access. Argv array only — no shell-string composition. Test:
+         stub gh to return non-zero, assert the action surfaces
+         `error: "repo_unreachable"`.
+      2. `execFile("git", ["clone", "--depth=50", repo_url,
+         dest_path])` into `<projectRoots[0]>/<slug>`. Test: stub git to
+         succeed against a tmpdir fixture, assert clone called with
+         exactly that argv.
+      3. Delegate to the existing `registerProject(path, opts)` with the
+         cloned dir. No scaffold logic duplication.
+- [ ] `web/app.js` wizard adds a second input "Or paste a GitHub URL"
+      with a "Clone & connect" button. On click, POSTs to
+      `/api/control/register-url`. Shows inline error messages on the
+      400 cases above.
 - [ ] On failure mid-flow (clone fails, register fails), the partially-
-      created `~/Desktop/projects/<slug>` is cleaned up via the safe
-      cleaner (ticket 0006 path-prefix guard).
-- [ ] `control_audit` row records `action=register-url` with the repo_url.
+      created `<projectRoots[0]>/<slug>` is removed by calling the same
+      safe-rm helper landed in 0006 (path-prefix guard on
+      `<projectRoots[0]>`). Test: stub register to throw after clone,
+      assert the dest dir is gone after the action returns.
+- [ ] `control_audit` row records `action=register-url`, `target=<slug>`,
+      `args_json` containing only `repo_url` + `slug` (not any token).
 - [ ] `tests/register-url.test.ts` — stub `gh` and `git clone` to write
-      a fixture dir, call the action, assert the manifest + AGENTS.md
-      sections are present.
-- [ ] Auth: requires `admin` scope (ticket 0003).
+      a fixture dir under a tmpdir override of `projectRoots`, call the
+      action, assert `agents.config.sh`, `AGENTS.md` (Agent parameters
+      section), and `docs/backlog/{README,_template}.md` exist after.
+- [ ] Auth: requires `admin` scope (ticket 0003 — shipped).
+- [ ] No new runtime deps. `tsc --noEmit` clean.
 
 ## Out of scope
 
@@ -70,8 +91,8 @@ manually.
 - Reuse `registerProject` for the post-clone work. Don't duplicate the
   scaffold logic.
 - `web/app.js` — extend the existing wizard.
-- Blocked-by: 0003 (scoped tokens, for admin scope enforcement) and 0006
-  (the safe-rm path-prefix guard).
+- Blocked-by: 0006 (the safe-rm path-prefix guard) — currently
+  in-progress; ship after it merges. 0003 (admin scope) already shipped.
 - No new deps.
 
 ## Implementation log
