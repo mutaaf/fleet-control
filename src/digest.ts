@@ -34,7 +34,16 @@ export interface DigestPeriod {
 
 export interface DigestTotals {
   runs: number;
+  /** Count of DISTINCT pr_number on shipped runs in the window. This is
+   *  the operator-visible "PRs merged" number — it reflects auto-merged
+   *  PRs (the agent-fleet normal path) AS WELL AS PRs the operator
+   *  approved via the portal. See ticket 0019. */
   prs_merged: number;
+  /** The audit-derived count (rows in control_audit with
+   *  action='pr-merge', i.e. PRs the operator explicitly approved via
+   *  the portal's "Approve & publish" button). Kept on the JSON object
+   *  so a future ticket can split "via portal" vs "auto-merged". */
+  prs_merged_via_portal: number;
   prs_sent_back: number;
   cost_usd: number;
   self_cancels: number;
@@ -45,7 +54,11 @@ export interface DigestProject {
   slug: string;
   name: string;
   runs: number;
+  /** Per-project version of DigestTotals.prs_merged — DISTINCT pr_number
+   *  on shipped runs in the window, scoped to this project. */
   prs_merged: number;
+  /** Per-project version of DigestTotals.prs_merged_via_portal. */
+  prs_merged_via_portal: number;
   prs_sent_back: number;
   cost_usd: number;
   top_phase: string;
@@ -232,10 +245,17 @@ function anomaliesByProject(db: DB, period: DigestPeriod): Map<number, number> {
  *  rows. The audit `target` is "<slug>/<number>" for PR actions so we
  *  parse the leading slug. (We don't try to reconcile against the `pr`
  *  table — that's a snapshot of current state, not a historical event
- *  log; the audit table IS the per-week event log.) */
+ *  log; the audit table IS the per-week event log.)
+ *
+ *  Note (ticket 0019): the audit `merged` count is what we expose as
+ *  `prs_merged_via_portal`. The operator-visible `prs_merged` figure
+ *  uses `mergedRunsByProject()` instead — the audit table only records
+ *  PRs the operator explicitly approved via the portal's button, so
+ *  auto-merged agent PRs never landed here and the count read as 0
+ *  even when GitHub showed dozens of merges. */
 interface AuditRow { slug: string; action: string; n: number; }
 
-function prActionsByProject(db: DB, period: DigestPeriod): Map<string, { merged: number; sent_back: number }> {
+function prActionsByProject(db: DB, period: DigestPeriod): Map<string, { merged_via_portal: number; sent_back: number }> {
   const rows = db.prepare(
     "SELECT substr(target, 1, instr(target, '/') - 1) AS slug, action, COUNT(*) AS n "
     + "FROM control_audit "
@@ -245,13 +265,38 @@ function prActionsByProject(db: DB, period: DigestPeriod): Map<string, { merged:
     + "  AND instr(target, '/') > 0 "
     + "GROUP BY slug, action",
   ).all(period.start, period.end) as unknown as AuditRow[];
-  const m = new Map<string, { merged: number; sent_back: number }>();
+  const m = new Map<string, { merged_via_portal: number; sent_back: number }>();
   for (const r of rows) {
-    const entry = m.get(r.slug) ?? { merged: 0, sent_back: 0 };
-    if (r.action === "pr-merge") entry.merged += r.n;
+    const entry = m.get(r.slug) ?? { merged_via_portal: 0, sent_back: 0 };
+    if (r.action === "pr-merge") entry.merged_via_portal += r.n;
     else if (r.action === "pr-changes") entry.sent_back += r.n;
     m.set(r.slug, entry);
   }
+  return m;
+}
+
+/** Merged-PR counts per project, derived from the `run` table. We count
+ *  DISTINCT pr_number among rows where outcome='shipped' AND pr_number
+ *  IS NOT NULL — DISTINCT because the same PR can be touched by more
+ *  than one run (e.g. a heal retry that lands on the same number), and
+ *  we don't want re-runs to inflate the headline. Scoped to the digest
+ *  window via started_at. Returns a Map keyed by project_id (the digest
+ *  joins it onto the rollup row by id, since two projects can share a
+ *  pr_number for their own repos). */
+interface MergedRunsRow { project_id: number; n: number; }
+
+export function mergedRunsByProject(db: DB, period: DigestPeriod): Map<number, number> {
+  const rows = db.prepare(
+    "SELECT project_id, COUNT(DISTINCT pr_number) AS n "
+    + "FROM run "
+    + "WHERE outcome = 'shipped' "
+    + "  AND pr_number IS NOT NULL "
+    + "  AND started_at IS NOT NULL "
+    + "  AND date(started_at) >= ? AND date(started_at) < ? "
+    + "GROUP BY project_id",
+  ).all(period.start, period.end) as unknown as MergedRunsRow[];
+  const m = new Map<number, number>();
+  for (const r of rows) m.set(r.project_id, Number(r.n) || 0);
   return m;
 }
 
@@ -348,6 +393,7 @@ export function weeklyDigest(db: DB, opts: DigestOptions = {}): Digest {
   const scMap = selfCancelsByProject(db, period);
   const anMap = anomaliesByProject(db, period);
   const prMap = prActionsByProject(db, period);
+  const mergedRunsMap = mergedRunsByProject(db, period);
 
   const projects: DigestProject[] = [];
   for (const r of rollup) {
@@ -361,7 +407,12 @@ export function weeklyDigest(db: DB, opts: DigestOptions = {}): Digest {
     const top_phase = phases.length > 0 ? phases[0].phase : "";
     const sc = scMap.get(r.id) ?? 0;
     const an = anMap.get(r.id) ?? 0;
-    const prCounts = prMap.get(r.slug) ?? { merged: 0, sent_back: 0 };
+    const prCounts = prMap.get(r.slug) ?? { merged_via_portal: 0, sent_back: 0 };
+    // Ticket 0019: prs_merged comes from the run table (DISTINCT
+    // pr_number on shipped runs), keyed by project_id since two
+    // different repos can share the same pr_number. The audit-derived
+    // figure stays available as prs_merged_via_portal.
+    const merged_from_runs = mergedRunsMap.get(r.id) ?? 0;
     const notable: string[] = [];
     if (sc > 0) notable.push(`self-cancels:${sc}`);
     if (an > 0) notable.push(`anomalies:${an}`);
@@ -369,7 +420,8 @@ export function weeklyDigest(db: DB, opts: DigestOptions = {}): Digest {
       slug: r.slug,
       name: r.name ?? r.slug,
       runs: r.runs,
-      prs_merged: prCounts.merged,
+      prs_merged: merged_from_runs,
+      prs_merged_via_portal: prCounts.merged_via_portal,
       prs_sent_back: prCounts.sent_back,
       cost_usd: Number(r.cost_usd ?? 0),
       top_phase,
@@ -392,15 +444,17 @@ export function weeklyDigest(db: DB, opts: DigestOptions = {}): Digest {
     return s + (n ? Number(n.slice("anomalies:".length)) : 0);
   }, 0);
   const totalPrMerged = projects.reduce((s, p) => s + p.prs_merged, 0);
+  const totalPrMergedViaPortal = projects.reduce((s, p) => s + p.prs_merged_via_portal, 0);
   const totalPrSentBack = projects.reduce((s, p) => s + p.prs_sent_back, 0);
 
   const visibleProjects = projects.filter(
-    (p) => p.runs > 0 || p.prs_merged > 0 || p.prs_sent_back > 0,
+    (p) => p.runs > 0 || p.prs_merged > 0 || p.prs_merged_via_portal > 0 || p.prs_sent_back > 0,
   );
 
   const totals: DigestTotals = {
     runs: totalRuns,
     prs_merged: totalPrMerged,
+    prs_merged_via_portal: totalPrMergedViaPortal,
     prs_sent_back: totalPrSentBack,
     cost_usd: totalCost,
     self_cancels: totalSc,

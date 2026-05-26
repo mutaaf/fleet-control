@@ -63,17 +63,22 @@ function daysAgoIso(daysAgo: number, hourUtc = 12): string {
 }
 
 /** Insert one run row with explicit started_at + cost. Keeps fixtures
- *  short — every column the digest reads is set, the rest stays NULL. */
+ *  short — every column the digest reads is set, the rest stays NULL.
+ *
+ *  Ticket 0019: `prNumber` is the column the new prs_merged query reads
+ *  (DISTINCT pr_number on shipped runs); pass it for any test that wants
+ *  a non-zero merged count. */
 function seedRun(db: DB, opts: {
   projectId: number; phase: string; startedAt: string; durationMs?: number;
   costUsd?: number; outcome?: string | null; sessionId?: string;
+  prNumber?: number | null;
 }): number {
   const sid = opts.sessionId ?? `sess-${Math.random().toString(36).slice(2, 10)}`;
   db.prepare(
-    "INSERT INTO run(project_id,phase,session_id,started_at,duration_ms,cost_usd,outcome,cost_source) "
-    + "VALUES(?,?,?,?,?,?,?, 'live')",
+    "INSERT INTO run(project_id,phase,session_id,started_at,duration_ms,cost_usd,outcome,pr_number,cost_source) "
+    + "VALUES(?,?,?,?,?,?,?,?, 'live')",
   ).run(opts.projectId, opts.phase, sid, opts.startedAt, opts.durationMs ?? 1000,
-        opts.costUsd ?? 0, opts.outcome ?? null);
+        opts.costUsd ?? 0, opts.outcome ?? null, opts.prNumber ?? null);
   return (db.prepare("SELECT last_insert_rowid() AS id").get() as any).id;
 }
 
@@ -147,16 +152,22 @@ test("AC2: narrative bullets match the documented templates verbatim", () => {
   try {
     _resetDigestCacheForTests();
     const a = seedProject(db, "alpha", "Alpha");
-    // 2 ships PRs merged via control_audit; 1 self-cancelled run; 1 anomaly.
+    // Ticket 0019: prs_merged comes from shipped runs with pr_number set,
+    // not from control_audit. Two shipped runs → 2 merged PRs. We keep the
+    // legacy audit rows too so prs_merged_via_portal stays exercised.
     seedAudit(db, daysAgoIso(1), "pr-merge", "alpha/42");
     seedAudit(db, daysAgoIso(2), "pr-merge", "alpha/43");
-    const r1 = seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(1), costUsd: 5, outcome: "self-cancel" });
+    seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(1), costUsd: 0, outcome: "shipped", prNumber: 42 });
+    seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(2), costUsd: 0, outcome: "shipped", prNumber: 43 });
+    const r1 = seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(1, 13), costUsd: 5, outcome: "self-cancel" });
     seedAnomaly(db, r1, "duration", daysAgoIso(1));
     // Prior week: $0 → delta_cost_vs_prior_week_pct = null, so no "spent X, ±Y% vs last week" line.
     // Current week cost: $5.
 
     const d = weeklyDigest(db, { now: NOW_ANCHOR });
     assert.equal(d.totals.prs_merged, 2);
+    assert.equal(d.totals.prs_merged_via_portal, 2,
+      "audit-derived count stays available as prs_merged_via_portal");
     assert.equal(d.totals.self_cancels, 1);
     assert.equal(d.totals.anomalies, 1);
     // narrative is between 3 and 7 plain-English bullets (per the ticket).
@@ -185,9 +196,14 @@ test("AC2: plural forms — multiple PRs / self-cancels / anomalies use the docu
   try {
     _resetDigestCacheForTests();
     const a = seedProject(db, "beta", "Beta");
+    // Ticket 0019: prs_merged sourced from runs. Three shipped runs with
+    // distinct pr_number → "beta shipped 3 PRs".
     seedAudit(db, daysAgoIso(1), "pr-merge", "beta/1");
     seedAudit(db, daysAgoIso(2), "pr-merge", "beta/2");
     seedAudit(db, daysAgoIso(3), "pr-merge", "beta/3");
+    seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(1, 11), costUsd: 0, outcome: "shipped", prNumber: 1 });
+    seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(2, 11), costUsd: 0, outcome: "shipped", prNumber: 2 });
+    seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(3, 11), costUsd: 0, outcome: "shipped", prNumber: 3 });
     const r1 = seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(1), costUsd: 2, outcome: "self-cancel" });
     const r2 = seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(2), costUsd: 2, outcome: "self-cancel" });
     seedAnomaly(db, r1, "duration", daysAgoIso(1));
@@ -207,10 +223,15 @@ test("AC2: plural forms — multiple PRs / self-cancels / anomalies use the docu
 });
 
 // ────────────────────────────────────────────────────────────────────
-// AC3 — prs_merged/prs_sent_back from control_audit
+// AC3 — prs_merged_via_portal + prs_sent_back from control_audit
+//
+// Ticket 0019: `prs_merged` now reads from the `run` table (see
+// tests/prs-merged.test.ts). The audit-derived count stays on the JSON
+// object as `prs_merged_via_portal`, and `prs_sent_back` continues to
+// come from audit (no operator-clicked "request changes" → no count).
 // ────────────────────────────────────────────────────────────────────
 
-test("AC3: prs_merged + prs_sent_back are counted from control_audit rows", () => {
+test("AC3: prs_merged_via_portal + prs_sent_back are counted from control_audit rows", () => {
   const { db, cleanup } = tempDb();
   try {
     _resetDigestCacheForTests();
@@ -230,12 +251,14 @@ test("AC3: prs_merged + prs_sent_back are counted from control_audit rows", () =
     seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(2), costUsd: 0.10, outcome: "shipped" });
 
     const d = weeklyDigest(db, { now: NOW_ANCHOR });
-    assert.equal(d.totals.prs_merged, 2, "totals.prs_merged counts only in-window pr-merge rows");
-    assert.equal(d.totals.prs_sent_back, 1, "totals.prs_sent_back counts only in-window pr-changes rows");
+    assert.equal(d.totals.prs_merged_via_portal, 2,
+      "prs_merged_via_portal counts only in-window pr-merge rows");
+    assert.equal(d.totals.prs_sent_back, 1,
+      "totals.prs_sent_back counts only in-window pr-changes rows");
 
     const alpha = d.projects.find((p) => p.slug === "alpha");
     assert.ok(alpha, "alpha must appear in projects");
-    assert.equal(alpha!.prs_merged, 2);
+    assert.equal(alpha!.prs_merged_via_portal, 2);
     assert.equal(alpha!.prs_sent_back, 1);
   } finally { cleanup(); }
 });
@@ -349,7 +372,9 @@ test("AC7: renderDigestMarkdown returns deterministic markdown with totals + per
     _resetDigestCacheForTests();
     const a = seedProject(db, "alpha", "Alpha");
     const b = seedProject(db, "beta",  "Beta");
-    seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(1), costUsd: 3, outcome: "shipped" });
+    // Ticket 0019: prs_merged reads from run.pr_number on shipped runs.
+    // The alpha ship-run here doubles as the source for "PRs merged: 1".
+    seedRun(db, { projectId: a, phase: "ship", startedAt: daysAgoIso(1), costUsd: 3, outcome: "shipped", prNumber: 1 });
     seedRun(db, { projectId: b, phase: "ship", startedAt: daysAgoIso(2), costUsd: 1, outcome: "shipped" });
     seedAudit(db, daysAgoIso(1), "pr-merge", "alpha/1");
 
