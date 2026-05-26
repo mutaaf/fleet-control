@@ -1,7 +1,7 @@
 ---
 id: 0014
 title: Cross-project tool-call leaderboard
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-26
@@ -154,4 +154,11 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26: Picked up by implementation-dev. Branch `feat/0014-leaderboard`.
+  Plan: add `fleetLeaderboard(db, opts?)` to `src/views.ts` (three SQL
+  helpers — `tools`, `projects`, `heatmap` — composed into one payload),
+  wire `GET /api/fleet/leaderboard?days=N` in `src/server.ts`, and add a
+  `#/leaderboard` hash route + empty-state in `web/app.js`. Tests in
+  `tests/leaderboard.test.ts` (one per AC). No new runtime deps, no
+  schema migration — all reads target existing `run`, `run_event`, and
+  `cost_rollup_day` tables.

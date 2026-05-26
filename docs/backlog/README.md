@@ -19,7 +19,7 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
-| 0014 | Cross-project tool-call leaderboard | P1 | groomed | observability |
+| 0014 | Cross-project tool-call leaderboard | P1 | in-progress | observability |
 | 0015 | Embeddable status badge SVG per project | P1 | groomed | portal |
 | 0016 | fleetctl doctor — one-shot install + ingest diagnostic | P2 | groomed | infra |
 | 0017 | Today's inbox — cross-project "what needs me" view | P2 | groomed | portal |
