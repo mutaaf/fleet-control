@@ -1,7 +1,7 @@
 ---
 id: 0011
 title: Mobile-first portal pass for home and project pages
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-05-26
