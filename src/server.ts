@@ -2,6 +2,7 @@
 // Binds 127.0.0.1 by default; set host 0.0.0.0 in fleet-control.config.json for
 // LAN access (phone/tablet) — Phase 4 adds the admin token before control routes.
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,7 @@ import { pricingRows, lastSyncedAt, syncPricing } from "./pricing.ts";
 import { fetchPrDiff } from "./diff.ts";
 import { weeklyDigest } from "./digest.ts";
 import { serveShare } from "./snapshot.ts";
+import { renderBadge, projectBadge, parseMetric } from "./badge.ts";
 import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
   type Scope, type TokenRecord,
@@ -287,6 +289,46 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         const rm = path.match(/^\/api\/run\/(\d+)$/);
         if (rm) { const v = runView(db, Number(rm[1])); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
         return json(res, { error: "unknown endpoint" }, 404);
+      }
+      // Ticket 0015: embeddable status badge SVG per project. Public
+      // by design — same posture as /share/<token>; the slug is not a
+      // secret on a LAN and a public deployment is the operator's
+      // choice. An unknown slug is a 200 grey "unknown" badge (NOT a
+      // 404 — a 404 inside an <img> is uglier than a placeholder).
+      // An invalid metric is a 400 with a plain-text body. Cached for
+      // 60 seconds with an ETag derived from sha256(body) so README
+      // renderers can revalidate cheaply.
+      const bm = path.match(/^\/badge\/([\w-]+)\.svg$/);
+      if (bm && req.method === "GET") {
+        const slug = bm[1];
+        const metric = parseMetric(url.searchParams.get("metric"));
+        if (metric === null) {
+          res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("unknown metric — try one of: status, cost, ship");
+        }
+        const data = projectBadge(db, slug, metric);
+        const body = renderBadge(data);
+        const etag = '"' + createHash("sha256").update(body).digest("hex") + '"';
+        // If-None-Match short-circuit so README renderers re-validate
+        // cheaply. We compare on the strong-quoted ETag so a future
+        // weak-validator change here doesn't silently start matching.
+        const inm = req.headers["if-none-match"];
+        if (typeof inm === "string" && inm === etag) {
+          res.writeHead(304, {
+            "etag": etag,
+            "cache-control": "public, max-age=60",
+          });
+          return res.end();
+        }
+        res.writeHead(200, {
+          "content-type": "image/svg+xml; charset=utf-8",
+          "cache-control": "public, max-age=60",
+          "etag": etag,
+          // Badges are intended for embedding; expose the route to
+          // any origin (the bytes are public by design).
+          "access-control-allow-origin": "*",
+        });
+        return res.end(body);
       }
       // Ticket 0013: read-only shareable fleet snapshot.
       // GET /share/<token> renders an HTML page directly from the
