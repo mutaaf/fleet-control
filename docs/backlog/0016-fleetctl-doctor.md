@@ -1,7 +1,7 @@
 ---
 id: 0016
 title: fleetctl doctor — one-shot install + ingest diagnostic
-status: groomed
+status: in-progress
 priority: P2
 area: infra
 created: 2026-05-26
@@ -150,4 +150,7 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched `feat/0016-fleetctl-doctor`,
+  flipped status to in-progress. Next: write `tests/doctor.test.ts` (one
+  `test()` per AC checkbox), then `src/doctor.ts` + `bin/fleetctl.ts`
+  wiring.

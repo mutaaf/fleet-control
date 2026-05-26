@@ -14,6 +14,7 @@ import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
 import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
 import { listSnapshots } from "../src/snapshot.ts";
 import { doAction } from "../src/control.ts";
+import { defaultDeps, runDoctor, renderHuman, renderJson, exitCodeFor } from "../src/doctor.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import { homedir } from "node:os";
@@ -358,6 +359,26 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>]");
+  case "doctor": {
+    // `fleetctl doctor [--json]` — one-shot install + ingest diagnostic
+    // (ticket 0016). Wraps runDoctor() in a try/catch so a doctor crash
+    // exits 2 (per spec) without dragging the rest of the CLI down.
+    try {
+      const wantJson = argv.includes("--json");
+      // FLEET_DOCTOR_OFFLINE=1 short-circuits the network / launchctl
+      // probes so the CLI subprocess tests stay hermetic (no real
+      // `gh`, `launchctl`, or loopback connect attempts).
+      const offline = process.env.FLEET_DOCTOR_OFFLINE === "1";
+      const result = await runDoctor(defaultDeps(db), { offline });
+      if (wantJson) process.stdout.write(renderJson(result) + "\n");
+      else process.stdout.write(renderHuman(result, { color: process.stdout.isTTY === true }));
+      process.exitCode = exitCodeFor(result);
+    } catch (e: any) {
+      process.stderr.write(`doctor: crashed — ${String(e?.message ?? e)}\n`);
+      process.exitCode = 2;
+    }
+    break;
+  }
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|doctor [--json]]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run") db.close();
