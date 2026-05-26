@@ -1,8 +1,8 @@
 ---
 id: 0014
 title: Cross-project tool-call leaderboard
-status: proposed
-priority: P2
+status: groomed
+priority: P1
 area: observability
 created: 2026-05-26
 owner: gtm-innovation
