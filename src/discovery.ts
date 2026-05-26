@@ -45,6 +45,7 @@ function parseManifest(path: string): Manifest | null {
       review_interval: v.REVIEW_INTERVAL ?? "300",
       eng_hours: v.ENG_HOURS ?? "",
       eng_minute: v.ENG_MINUTE ?? "",
+      max_daily_usd: v.MAX_DAILY_USD ?? "",          // optional daily $ cap (ticket 0004)
     },
     manifestPath: path,
   };

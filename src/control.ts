@@ -32,6 +32,9 @@ const KNOWN_ACTIONS = new Set([
   // control; set-pace is a named preset for one project; set-pace-fleet
   // applies a preset across every project at once.
   "set-cadence", "set-pace", "set-pace-fleet",
+  // Budget cap control — writes MAX_DAILY_USD to the manifest so the
+  // operator doesn't have to hand-edit agents.config.sh + reinstall.
+  "set-budget",
 ]);
 
 /** Strict regex for GitHub HTTPS repo URLs (ticket 0010). Owner/name must
@@ -230,6 +233,27 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         if (!cfg) throw new Error(`unknown pace '${preset}' — use aggressive, steady, conservative, or trickle`);
         out = applyCadence(p, cfg);
         message = `${slug} set to ${preset} pace.`; break;
+      }
+      case "set-budget": {            // daily $ cap (MAX_DAILY_USD)
+        // body.max_daily_usd: number > 0 sets a cap; 0 / "" / null unsets it.
+        // The engine reads MAX_DAILY_USD via `${MAX_DAILY_USD:-}` so an
+        // empty string is treated as "no cap" — we don't need a separate
+        // remove path.
+        if (isRunning(p)) { ok = false; message = "A job is running right now — try again in a minute."; break; }
+        const raw = body?.max_daily_usd;
+        let cap = "";
+        if (raw !== null && raw !== undefined && raw !== "") {
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n < 0) throw new Error("max_daily_usd must be a non-negative number");
+          if (n > 0) cap = (Math.round(n * 100) / 100).toString();
+        }
+        const mdir = manifestDirFor(p);
+        editOrAppendManifest(manifestFileFor(p), "MAX_DAILY_USD", cap);
+        out = run("bash", [KIT_INSTALL, mdir]);
+        message = cap
+          ? `Daily cap set to $${cap} for ${slug}.`
+          : `Daily cap cleared for ${slug}.`;
+        break;
       }
       case "clean-checkouts": {       // janitor pass over ~/.cache/<slug>-agent-*-checkout
         // Refuse while a job is in flight — its checkout is presumably the
