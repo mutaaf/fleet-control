@@ -1,7 +1,7 @@
 ---
 id: 0012
 title: Weekly "what shipped" digest with wins and trends
-status: proposed
+status: shipped
 priority: P2
 area: observability
 created: 2026-05-26
@@ -135,4 +135,16 @@ Each box maps 1:1 to a test scenario the dev agent writes.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — picked up by implementation-dev. Branch
+  `feat/0012-weekly-digest`. Wrote failing tests first for each
+  acceptance-criteria checkbox (digest helper, deterministic narrative
+  templates, PR counts via control_audit, delta-vs-prior-week null guard,
+  cached /api/digest/week route, SPA "Last week" banner, `fleetctl digest`
+  markdown writer, `--save` idempotency). No new runtime deps; no schema
+  migration — every figure is a SELECT against the existing tables.
+- 2026-05-26 — shipped. `src/digest.ts` (weeklyDigest +
+  renderDigestMarkdown + isoWeekKey + cache reset seam), `/api/digest/week`
+  route in `src/server.ts`, `digestBanner()` + tap-to-expand in
+  `web/app.js`, `.digest-*` rules in `web/style.css`, `fleetctl digest
+  [--week|--last-7] [--save]` subcommand. 13/13 digest tests green, full
+  suite 118/118, typecheck + backlog validate clean.

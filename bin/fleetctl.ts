@@ -11,6 +11,10 @@ import { mintToken, listTokens, revokeToken, type Scope } from "../src/auth.ts";
 import { syncPricing, pricingRows, DEFAULT_PRICING_FILE } from "../src/pricing.ts";
 import { flagRun } from "../src/anomaly.ts";
 import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
+import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join as pathJoin } from "node:path";
+import { homedir } from "node:os";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -209,6 +213,40 @@ function pricing() {
   console.log("usage: fleetctl pricing <sync [--file path] | show>");
 }
 
+/** `fleetctl digest [--week|--last-7] [--save]` — ticket 0012. Prints the
+ *  rolling 7-day digest as markdown to stdout. `--save` additionally
+ *  writes the markdown to `$FLEET_STATE_DIR/digests/<isoweek>.md` (env
+ *  override exists for tests; production falls back to
+ *  `~/.local/state/fleet-control/digests/`). `--week` and `--last-7`
+ *  are aliases for the same window — both spellings appear in the
+ *  ticket so we accept either. */
+function digest() {
+  const wantSave = argv.includes("--save");
+  // --week / --last-7 are aliases. We don't differentiate; both just
+  // confirm the operator wants "last 7 days" (which is the only window
+  // we support in v1; daily is explicitly out of scope per the ticket).
+  // noCache: true so the CLI never reports stale numbers after a fresh
+  // backfill on the same shell line.
+  const d = weeklyDigest(db, { noCache: true });
+  const md = renderDigestMarkdown(d);
+  process.stdout.write(md);
+  if (wantSave) {
+    const stateDir = process.env.FLEET_STATE_DIR
+      ?? pathJoin(homedir(), ".local", "state", "fleet-control");
+    const digestsDir = pathJoin(stateDir, "digests");
+    mkdirSync(digestsDir, { recursive: true });
+    // Filename = ISO week of the period's *start* (we want the
+    // post-Monday digest to keep landing in the same file across the
+    // week — recompute is idempotent because we overwrite). Without
+    // this, a Sunday recompute could shift into the next ISO week and
+    // create a second file.
+    const wk = isoWeekKey(new Date(d.period.start + "T12:00:00Z"));
+    const path = pathJoin(digestsDir, `${wk}.md`);
+    writeFileSync(path, md);
+    console.error(`${c.grn}saved${c.rst} ${path}`);
+  }
+}
+
 switch (cmd) {
   case "backfill": backfill(); break;
   case "status": case undefined: status(); break;
@@ -235,6 +273,7 @@ switch (cmd) {
     break;
   }
   case "tokens": tokens(); break;
+  case "digest": digest(); break;
   case "ntfy": {
     if (arg === "test") {
       const code = await ntfyTestCommand(ntfyConfigFrom(cfg));
@@ -245,6 +284,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run") db.close();

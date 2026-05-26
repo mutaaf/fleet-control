@@ -30,6 +30,6 @@ proposes new ones, `review` grades them.
 | 0009 | ntfy push notifications for high-priority events | P2 | shipped | observability |
 | 0010 | One-click GitHub-URL project import | P2 | shipped | control |
 | 0011 | Mobile-first portal pass for home and project pages | P1 | shipped | portal |
-| 0012 | Weekly "what shipped" digest with wins and trends | P2 | proposed | observability |
+| 0012 | Weekly "what shipped" digest with wins and trends | P2 | shipped | observability |
 | 0013 | Shareable read-only fleet snapshot with anonymized slugs | P2 | proposed | portal |
 | 0014 | Cross-project tool-call leaderboard | P2 | proposed | observability |
