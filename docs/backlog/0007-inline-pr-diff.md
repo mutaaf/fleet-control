@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Inline PR diff with sticky action bar
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-05-26
@@ -69,3 +69,7 @@ The screenshot of "agent PR diff + action bar in the portal" is the demo.
 
 - 2026-05-26 (implementation-dev): branched feat/0007-inline-pr-diff;
   moved to in-progress before the failing test pass.
+- 2026-05-26 (implementation-dev): shipped in PR #11. Route lives in
+  src/server.ts, the cache/cap/validation in src/diff.ts, the renderer
+  in web/diff.js (shared between SPA and test). Zero new deps; both
+  gating checks (typecheck, validate) green at merge.
