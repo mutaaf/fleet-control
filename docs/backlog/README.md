@@ -20,7 +20,7 @@ proposes new ones, `review` grades them.
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
 | 0014 | Cross-project tool-call leaderboard | P1 | shipped | observability |
-| 0015 | Embeddable status badge SVG per project | P1 | in-progress | portal |
+| 0015 | Embeddable status badge SVG per project | P1 | shipped | portal |
 | 0016 | fleetctl doctor — one-shot install + ingest diagnostic | P2 | groomed | infra |
 | 0017 | Today's inbox — cross-project "what needs me" view | P2 | groomed | portal |
 | 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | proposed | ingest |
