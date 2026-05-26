@@ -190,8 +190,21 @@ function card(p) {
 }
 
 // ---- Project --------------------------------------------------------------
+// Typed-event probe (ticket 0001): if the very latest event is a run_started
+// in the last 30 minutes, surface its phase + age above the transcript-tail
+// fallback. Failures are silent — the rest of the panel renders regardless.
+async function latestRunStarted(slug) {
+  try {
+    const d = await get("/api/projects/" + slug + "/events?limit=1");
+    const e = d?.events?.[0];
+    if (!e || e.type !== "run_started" || !e.ts) return null;
+    const ageMs = Date.now() - new Date(e.ts).getTime();
+    if (!(ageMs >= 0) || ageMs > 30 * 60_000) return null;
+    return { phase: e.phase, ts: e.ts, ageMs, payload: e.payload };
+  } catch { return null; }
+}
 async function project(slug) {
-  const p = await get("/api/project/" + slug);
+  const [p, nowEv] = await Promise.all([get("/api/project/" + slug), latestRunStarted(slug)]);
   summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
   const [cls, label] = STATE[p.displayState] || STATE.off;
   const ulBanner = p.usageLimit?.blocked
@@ -203,7 +216,7 @@ async function project(slug) {
       <span class="state"><span class="dot ${cls}"></span>${label}</span></div>
     <div class="metarow"><span class="dim mono">${esc(p.repo)}</span>
       ${p.selfCancelDays != null ? `<span>${p.selfCancelDays < 0 ? "stopped" : "keeps running " + p.selfCancelDays + "d"}</span>` : ""}</div>
-    ${ulBanner}${akBanner}
+    ${ulBanner}${akBanner}${nowBanner(nowEv)}
     <div class="actions">
       ${p.selfCancelDays != null && p.selfCancelDays <= 7 ? `<button class="btn primary" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>` : `<button class="btn" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>`}
       <button class="btn" data-act="resume" data-slug="${p.slug}">Resume all jobs</button>
@@ -218,6 +231,11 @@ async function project(slug) {
     <table><thead><tr><th>when</th><th>job</th><th>did</th><th>PR</th><th>tokens</th><th>cost</th></tr></thead>
     <tbody>${p.recent.map(runRow).join("")}</tbody></table>`;
   foot.textContent = "live · " + new Date().toLocaleTimeString();
+}
+function nowBanner(ev) {
+  if (!ev) return "";
+  const phaseName = PHASE[ev.phase] || ev.phase || "An agent";
+  return `<div class="banner">● ${esc(phaseName)} is running now — started ${ago(ev.ts)}.</div>`;
 }
 function prSection(p) {
   const prs = (p.prs || []).filter((x) => x.is_agent);

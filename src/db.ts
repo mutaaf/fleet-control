@@ -111,6 +111,20 @@ CREATE TABLE IF NOT EXISTS alert (
   type TEXT, severity TEXT, title TEXT, detail TEXT,
   dedup_key TEXT UNIQUE, created_at TEXT, notified_at TEXT, resolved_at TEXT
 );
+
+-- Typed event stream ingested from ~/.cache/<slug>-agent/events.jsonl.
+-- One row per JSONL line, deduped by a watermark byte-offset (see
+-- src/ingest/events.ts). Named agent_event (not event) to avoid clashing
+-- with the existing run_event table and to keep grep cleanly disambiguated.
+CREATE TABLE IF NOT EXISTS agent_event (
+  id           INTEGER PRIMARY KEY,
+  slug         TEXT NOT NULL,
+  ts           TEXT,
+  phase        TEXT,
+  type         TEXT,
+  payload_json TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_event_slug_ts ON agent_event(slug, ts DESC);
 `;
 
 export type DB = DatabaseSync;
