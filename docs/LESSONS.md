@@ -227,3 +227,27 @@ only one test wants it — otherwise the next ticket either rewrites the
 module to add one OR ships partly-untested. General rule for this repo:
 when a control action lands more than one `run(...)` call, the runner
 is a module variable, not a function declaration.
+
+## 2026-05-26 — CLI subprocess tests need a FLEET_DB_PATH env seam
+
+Symptom: while shipping ticket 0013 (shareable snapshots) the AC7
+test needed to drive `bin/fleetctl.ts snapshot create|list|revoke`
+end-to-end via `spawnSync` so the actual argv parser was exercised.
+The natural seed pattern — seed a tmpdir DB, then run the CLI
+against it — failed because `loadConfig()` derives `dbPath` from
+`homedir()`. Even with `HOME=<tmpdir>` set in the env, the CLI
+opened a *fresh* DB at `<tmpdir>/.local/state/fleet-control/fleet.db`
+instead of the one the test seeded at `<tmpdir>/fleet.db`. Cause:
+the only "where does the DB live" knob in production is the
+optional `fleet-control.config.json`; tests don't write one, and
+shoehorning a config file into every subprocess test is noisier
+than the test it gates. Fix: add `FLEET_DB_PATH` env override at
+the bottom of `loadConfig()` — `if (process.env.FLEET_DB_PATH)
+cfg.dbPath = process.env.FLEET_DB_PATH`. Operators get an
+incidental external-disk knob; tests get a one-env-var seam.
+General rule for this repo: any CLI subcommand that's worth a
+subprocess test (i.e. one whose value comes from its argv parser,
+not the inner helper) should be driveable against a tmpdir DB via
+a single env var — adding the knob is cheaper than threading a
+custom config file through every test, and it's a feature
+operators actually want.
