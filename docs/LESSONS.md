@@ -251,3 +251,25 @@ not the inner helper) should be driveable against a tmpdir DB via
 a single env var — adding the knob is cheaper than threading a
 custom config file through every test, and it's a feature
 operators actually want.
+
+## 2026-05-26 — `julianday()` drifts ~10us per timestamp; decompose with `strftime` for sub-ms diffs
+
+Symptom: ticket 0014's AC2 asserted `total_seconds ≈ 5.0` (± 1e-6) for
+two `run_event` rows exactly 5.000s apart; the helper used
+`SUM((julianday(er.ts) - julianday(eu.ts)) * 86400.0)` and returned
+`5.000013113021851s` — off by ~13us, enough to fail the tight
+tolerance. Cause: `julianday()` returns the number of days since
+4713-12-24 BC as a 64-bit float; multiplying that fractional-day delta
+by 86400 loses precision because the integer day component (~2.46M)
+eats most of the mantissa before you scale back to seconds. The drift
+is invisible at second-level resolution but breaks any test asserting
+sub-millisecond accuracy. Fix: compute the integer-seconds diff with
+`CAST(strftime('%s', ts) AS INTEGER)` (no float roundtrip), then add
+the fractional component as `CAST(strftime('%f', ts) AS REAL) -
+CAST(strftime('%S', ts) AS INTEGER)` per side. This isolates the
+sub-second part (0.000–0.999) and adds it cleanly to an exact
+integer-second base. General rule for this repo: when a SQL timestamp
+diff needs to be accurate below ~1ms, avoid `julianday()`'s float-day
+intermediate and decompose into integer seconds + fractional remainder
+via `strftime`. Same trap will bite any future P99 latency rollup,
+SLA-band aggregator, or run-duration drift detector.
