@@ -109,9 +109,11 @@ export function startServer(host = "127.0.0.1", port = 7070) {
       const cm = path.match(/^\/api\/control\/([\w-]+)$/);
       if (cm && req.method === "POST") {
         // Token management lives inside doAction("tokens-*") and requires
-        // admin; every other control verb requires control. Daemon toggle
+        // admin; one-click GitHub-URL import (ticket 0010) also requires
+        // admin — it spawns a clone + install on disk on the operator's
+        // behalf. Every other control verb requires control. Daemon toggle
         // is local-only infrastructure → control is sufficient.
-        const required: Scope = cm[1].startsWith("tokens-") ? "admin" : "control";
+        const required: Scope = (cm[1].startsWith("tokens-") || cm[1] === "register-url") ? "admin" : "control";
         const auth = requireAuth(db, req, required);
         if (!auth.ok) return json(res, { ok: false, message: auth.message }, auth.status);
         return readBody(req).then(async (body) => {

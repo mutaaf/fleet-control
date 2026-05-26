@@ -168,6 +168,34 @@ function round1(n: number): number {
   return Math.round(n * 10) / 10;
 }
 
+/** safeRmUnder(prefix, target) — generic path-prefix-guarded `rm -rf`.
+ *
+ *  Used by the `register-url` action (ticket 0010) to clean up a partial
+ *  `<projectRoots[0]>/<slug>` directory when the clone-then-register flow
+ *  trips mid-way. Same defensive shape as the per-slug cleaner above:
+ *   - both paths must be absolute;
+ *   - `target` must sit strictly *under* `prefix` (i.e. `target.startsWith(
+ *     prefix + path.sep)`); identical paths are refused so a typo'd
+ *     `prefix === target` can't wipe the whole projects root;
+ *   - neither path may contain `..` (defence-in-depth against a body that
+ *     somehow smuggled a traversal segment through earlier validation);
+ *   - uses `node:fs/promises rm({recursive,force})` — no shell-out.
+ *
+ *  Returns true when an `rm` was attempted (whether or not it found
+ *  anything to remove), false when the safety check refused the path. */
+export async function safeRmUnder(prefix: string, target: string): Promise<boolean> {
+  if (typeof prefix !== "string" || typeof target !== "string") return false;
+  if (!prefix.startsWith("/") || !target.startsWith("/")) return false;
+  if (prefix.includes("..") || target.includes("..")) return false;
+  // The trailing separator is load-bearing: it stops `/a/projects` from
+  // matching `/a/projects-evil` as a prefix.
+  const sep = prefix.endsWith("/") ? "" : "/";
+  if (!target.startsWith(prefix + sep)) return false;
+  if (target === prefix) return false; // never wipe the root itself
+  await rm(target, { recursive: true, force: true });
+  return true;
+}
+
 /** cleanCheckouts(slug, olderThanDays) — janitor pass.
  *
  *  Removes every `*-checkout` directory under ~/.cache/<slug>-agent* whose

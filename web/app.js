@@ -125,14 +125,20 @@ function ticketForm(slug) {
 }
 function addForm() {
   return `<h2>Add a project</h2>
-    <p class="dim">Connect a folder you already have. It must be a git repo pushed to GitHub.</p>
+    <p class="dim">Two ways: connect a folder you already have, or paste a GitHub URL and we'll clone it for you.</p>
     ${field("a-path", "Folder path", "/Users/you/Desktop/projects/myapp")}
     ${field("a-name", "Name (optional)", "My App")}
     <div class="frow">
       <label class="fld"><span>Keep running for</span><select id="a-days"><option value="30">30 days</option><option value="90">90 days</option><option value="14">14 days</option></select></label>
       <label class="chk"><input type="checkbox" id="a-eng"> Also let it tidy the code</label>
     </div>
-    <div class="frow end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" data-submit="add">Connect & start</button></div>`;
+    <div class="frow end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" data-submit="add">Connect & start</button></div>
+    <div class="addurl">
+      <div class="dim" style="margin:14px 0 6px">— or —</div>
+      ${field("a-url", "Or paste a GitHub URL", "https://github.com/you/myapp")}
+      ${field("a-url-slug", "Slug (optional, defaults to repo name)", "myapp")}
+      <div class="frow end"><button class="btn primary" data-submit="add-url">Clone &amp; connect</button></div>
+    </div>`;
 }
 document.addEventListener("click", (e) => {
   const s = e.target.closest("[data-submit]");
@@ -145,6 +151,21 @@ document.addEventListener("click", (e) => {
       criteria: v("t-crit").split("\n").map((x) => x.trim()).filter(Boolean),
       priority: document.getElementById("t-pri").value, area: v("t-area") || "growth",
       idea: document.getElementById("t-idea").checked });
+  } else if (s.dataset.submit === "add-url") {
+    // Ticket 0010: one-click GitHub-URL import. Client-side regex matches
+    // the server's GH_URL_RE so the toast lands before the round-trip.
+    const v = (id) => document.getElementById(id).value.trim();
+    const url = v("a-url");
+    if (!url) return toast("a GitHub URL is required", false);
+    if (!/^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(\.git)?$/.test(url)) {
+      return toast("URL must look like https://github.com/<owner>/<name>", false);
+    }
+    act("register-url", {
+      repo_url: url,
+      slug: v("a-url-slug") || undefined,
+      days: +document.getElementById("a-days").value,
+      eng: document.getElementById("a-eng").checked,
+    });
   } else {
     const v = (id) => document.getElementById(id).value.trim();
     if (!v("a-path")) return toast("a folder path is required", false);
