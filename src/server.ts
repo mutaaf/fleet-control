@@ -9,7 +9,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { doAction } from "./control.ts";
 import { diskUsage } from "./infra.ts";
@@ -227,6 +227,15 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
         if (path === "/api/fleet") return json(res, fleetView(db, cfg));
+        // Cross-project tool-call leaderboard (ticket 0014). One JSON
+        // payload composed of three SQL aggregations (tools across the
+        // fleet, projects, cost-by-phase heatmap). `days` query param
+        // defaults to 14, clamped to [1, 90] — clampDays() lives in
+        // views.ts so the tests share the same source of truth.
+        if (path === "/api/fleet/leaderboard") {
+          const days = clampDays(url.searchParams.get("days"));
+          return json(res, fleetLeaderboard(db, { days }));
+        }
         // Weekly digest (ticket 0012). Cached for 5 min inside the helper
         // keyed by the period — cheap to recompute, but a polled SPA could
         // hit this every 5s on the home view. Same shape as the Digest

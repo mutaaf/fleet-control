@@ -199,6 +199,340 @@ export function forecastFor(db: DB, slug: string): Forecast | null {
   return { daily_mean_7d, daily_mean_14d, projected_30d: daily_mean_7d * 30, samples };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Cross-project tool-call leaderboard (ticket 0014).
+//
+// Pure SQL aggregation against `run`, `run_event`, and `cost_rollup_day`.
+// One helper composes three single-statement SQL reads (tools, projects,
+// heatmap). No schema migration, no new tables — the data is already
+// captured by the existing transcript ingester.
+//
+// Window discipline:
+//   - Default `days = 14`. Same date-rounded boundary the digest helper
+//     uses: `end` is today (UTC, midnight) and `start` is `days` before
+//     that. Anchor wall-clock can be pinned via `opts.now` for tests.
+//   - Route handler runs `clampDays()` on `days` before passing it in
+//     (default 14, min 1, max 90). The fn lives in this module so both
+//     unit tests and the server share one source of truth.
+//
+// Tie-break discipline:
+//   - Tools sorted by `invocations DESC, name ASC` so a fleet that
+//     leans equally on Bash and Edit still renders deterministically
+//     across re-fetches.
+//   - top_projects within each tool: `invocations DESC, slug ASC`.
+//   - Projects sorted by `runs_in_window DESC, slug ASC`.
+//
+// The ts_to_unix helper assumes ISO-8601 strings (the format the
+// transcript ingester writes). SQLite's `strftime('%s', ts)` returns
+// seconds-since-epoch as text; we cast to REAL so the arithmetic stays
+// honest at sub-second resolution (the spec asserts a 5.0s diff).
+// ────────────────────────────────────────────────────────────────────
+
+export interface LeaderboardWindow {
+  /** ISO date (yyyy-mm-dd) — inclusive lower bound. */
+  start: string;
+  /** ISO date (yyyy-mm-dd) — exclusive upper bound (today). */
+  end: string;
+  /** Window length in days. */
+  days: number;
+}
+
+export interface LeaderboardToolRow {
+  name: string;
+  invocations: number;
+  total_seconds: number;
+  /** 0..1, NaN-safe (0 when no uses). */
+  error_rate: number;
+  top_projects: Array<{ slug: string; invocations: number }>;
+}
+
+export interface LeaderboardProjectRow {
+  slug: string;
+  name: string;
+  top_tool: string | null;
+  tool_diversity: number;
+  avg_tools_per_run: number;
+  runs_in_window: number;
+}
+
+export interface LeaderboardHeatmapRow {
+  slug: string;
+  by_phase: { ship: number; groom: number; review: number; eng: number };
+}
+
+export interface Leaderboard {
+  window: LeaderboardWindow;
+  tools: LeaderboardToolRow[];
+  projects: LeaderboardProjectRow[];
+  heatmap: LeaderboardHeatmapRow[];
+}
+
+export interface LeaderboardOptions {
+  /** ISO timestamp used as "now" for windowing. Default: current wall
+   *  clock. Tests pin this so seeded `started_at` / `ts` values bucket
+   *  predictably. */
+  now?: string;
+  /** Window length in days. Default 14, min 1, max 90. The route
+   *  handler should call `clampDays()` before passing in. */
+  days?: number;
+}
+
+const PHASES_FOUR = ["ship", "groom", "review", "eng"] as const;
+type PhaseFour = typeof PHASES_FOUR[number];
+
+/** Clamp the `days` query param to [1, 90] with default 14. Garbage
+ *  (NaN, undefined, empty string, non-numeric) → 14. Fractional inputs
+ *  are floored. The route handler is the only production caller; tests
+ *  exercise the full grid. */
+export function clampDays(raw: unknown): number {
+  if (raw == null || raw === "") return 14;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 14;
+  const i = Math.floor(n);
+  if (i < 1) return 1;
+  if (i > 90) return 90;
+  return i;
+}
+
+/** yyyy-mm-dd from a Date (UTC). Mirrors digest.ts (kept local to
+ *  avoid cross-module coupling). */
+function isoDateUtc(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function computeWindow(now: Date, days: number): LeaderboardWindow {
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - days);
+  return { start: isoDateUtc(start), end: isoDateUtc(end), days };
+}
+
+// SQL row interfaces — narrow via `as unknown as RowT[]` per the
+// node:sqlite lesson in docs/LESSONS.md.
+interface ToolAggRow {
+  tool_name: string;
+  invocations: number;
+  errored_results: number;
+}
+
+interface ToolPairRow {
+  tool_name: string;
+  total_seconds: number;
+}
+
+interface ToolByProjectRow {
+  tool_name: string;
+  slug: string;
+  invocations: number;
+}
+
+interface ProjectAggRow {
+  id: number;
+  slug: string;
+  name: string;
+  runs_in_window: number;
+  tool_diversity: number;
+  total_tool_uses: number;
+}
+
+interface TopToolRow {
+  project_id: number;
+  tool_name: string;
+  uses: number;
+}
+
+interface HeatmapRow {
+  project_id: number;
+  slug: string;
+  phase: string;
+  cost_usd: number;
+}
+
+/** Build the cross-project leaderboard. Single helper, three SQL
+ *  statements composed into one payload. */
+export function fleetLeaderboard(db: DB, opts: LeaderboardOptions = {}): Leaderboard {
+  const now = opts.now ? new Date(opts.now) : new Date();
+  const days = clampDays(opts.days ?? 14);
+  const window = computeWindow(now, days);
+
+  // ── Tools (cross-fleet aggregation) ─────────────────────────────
+  // `invocations` is the count of tool_use rows for that tool whose ts
+  // falls in the window. `errored_results` is the count of tool_result
+  // rows with is_error=1 keyed by tool_use_id that matched a tool_use
+  // for that tool in the window.
+  const toolAgg = db.prepare(
+    "SELECT e.tool_name AS tool_name, "
+    + "       COUNT(*) AS invocations, "
+    + "       (SELECT COUNT(*) FROM run_event er "
+    + "          JOIN run_event eu ON eu.tool_use_id = er.tool_use_id "
+    + "         WHERE er.kind = 'tool_result' AND er.is_error = 1 "
+    + "           AND eu.kind = 'tool_use' AND eu.tool_name = e.tool_name "
+    + "           AND date(eu.ts) >= ? AND date(eu.ts) < ?) AS errored_results "
+    + "  FROM run_event e "
+    + " WHERE e.kind = 'tool_use' AND e.tool_name IS NOT NULL "
+    + "   AND date(e.ts) >= ? AND date(e.ts) < ? "
+    + " GROUP BY e.tool_name "
+    + " ORDER BY invocations DESC, e.tool_name ASC",
+  ).all(window.start, window.end, window.start, window.end) as unknown as ToolAggRow[];
+
+  // total_seconds per tool: sum(result.ts - use.ts) for matched pairs.
+  // Matched = same tool_use_id, one row of each kind. We use SQLite's
+  // `strftime('%s', ts)` (integer seconds since epoch) for the bulk of
+  // the diff and `strftime('%f', ts)` (SS.SSS — seconds-with-millis
+  // within the minute) for sub-second precision, rather than
+  // `julianday()` which goes through a floating-point fractional-day
+  // intermediate that drifts ~10us per timestamp and fails the
+  // AC2 5.0s ± 1e-6 tolerance. The difference `%f - CAST(%S AS INTEGER)`
+  // isolates the fractional component (0.000..0.999), and summing
+  // (integer_seconds_diff + er_fraction - eu_fraction) gives an exact
+  // millisecond-resolution duration.
+  // Only the tool_use's ts must fall in window — the matching result
+  // can land just after a window boundary and we still want to count it.
+  const toolPairs = db.prepare(
+    "SELECT eu.tool_name AS tool_name, "
+    + "       SUM("
+    + "         (CAST(strftime('%s', er.ts) AS INTEGER) - CAST(strftime('%s', eu.ts) AS INTEGER))"
+    + "         + (CAST(strftime('%f', er.ts) AS REAL) - CAST(strftime('%S', er.ts) AS INTEGER))"
+    + "         - (CAST(strftime('%f', eu.ts) AS REAL) - CAST(strftime('%S', eu.ts) AS INTEGER))"
+    + "       ) AS total_seconds "
+    + "  FROM run_event eu "
+    + "  JOIN run_event er ON er.tool_use_id = eu.tool_use_id "
+    + " WHERE eu.kind = 'tool_use' AND er.kind = 'tool_result' "
+    + "   AND eu.tool_name IS NOT NULL "
+    + "   AND eu.tool_use_id IS NOT NULL "
+    + "   AND date(eu.ts) >= ? AND date(eu.ts) < ? "
+    + " GROUP BY eu.tool_name",
+  ).all(window.start, window.end) as unknown as ToolPairRow[];
+  const secondsByTool = new Map<string, number>();
+  for (const r of toolPairs) {
+    secondsByTool.set(r.tool_name, Number(r.total_seconds) || 0);
+  }
+
+  // top_projects per tool: invocations by project for each tool in the
+  // window. We collect everything in one query and bucket in JS — same
+  // shape as the digest's phaseCostsByProject().
+  const toolByProject = db.prepare(
+    "SELECT e.tool_name AS tool_name, p.slug AS slug, COUNT(*) AS invocations "
+    + "  FROM run_event e "
+    + "  JOIN run r ON r.id = e.run_id "
+    + "  JOIN project p ON p.id = r.project_id "
+    + " WHERE e.kind = 'tool_use' AND e.tool_name IS NOT NULL "
+    + "   AND date(e.ts) >= ? AND date(e.ts) < ? "
+    + " GROUP BY e.tool_name, p.slug "
+    + " ORDER BY invocations DESC, p.slug ASC",
+  ).all(window.start, window.end) as unknown as ToolByProjectRow[];
+  const topProjectsByTool = new Map<string, Array<{ slug: string; invocations: number }>>();
+  for (const r of toolByProject) {
+    const list = topProjectsByTool.get(r.tool_name) ?? [];
+    list.push({ slug: r.slug, invocations: r.invocations });
+    topProjectsByTool.set(r.tool_name, list);
+  }
+
+  const tools: LeaderboardToolRow[] = toolAgg.map((row) => {
+    const total_seconds = Math.max(0, secondsByTool.get(row.tool_name) ?? 0);
+    const error_rate = row.invocations > 0 ? row.errored_results / row.invocations : 0;
+    // Cap top_projects at the top 3 per the user story.
+    const tops = (topProjectsByTool.get(row.tool_name) ?? []).slice(0, 3);
+    return {
+      name: row.tool_name,
+      invocations: row.invocations,
+      total_seconds,
+      error_rate,
+      top_projects: tops,
+    };
+  });
+
+  // ── Projects ────────────────────────────────────────────────────
+  // One row per project: runs_in_window from `run`, tool_diversity from
+  // distinct tool_name in run_event, total_tool_uses from row count.
+  // We LEFT JOIN so a project with zero runs in window still appears
+  // (with the agg counts at 0 / null → coerced to 0).
+  const projAgg = db.prepare(
+    "SELECT p.id AS id, p.slug AS slug, p.name AS name, "
+    + "       COUNT(DISTINCT CASE WHEN date(r.started_at) >= ? AND date(r.started_at) < ? THEN r.id END) AS runs_in_window, "
+    + "       COUNT(DISTINCT CASE WHEN e.kind = 'tool_use' AND e.tool_name IS NOT NULL "
+    + "                            AND date(e.ts) >= ? AND date(e.ts) < ? THEN e.tool_name END) AS tool_diversity, "
+    + "       COUNT(CASE WHEN e.kind = 'tool_use' AND date(e.ts) >= ? AND date(e.ts) < ? THEN 1 END) AS total_tool_uses "
+    + "  FROM project p "
+    + "  LEFT JOIN run r ON r.project_id = p.id "
+    + "  LEFT JOIN run_event e ON e.run_id = r.id "
+    + " GROUP BY p.id, p.slug, p.name "
+    + " ORDER BY runs_in_window DESC, p.slug ASC",
+  ).all(
+    window.start, window.end,
+    window.start, window.end,
+    window.start, window.end,
+  ) as unknown as ProjectAggRow[];
+
+  // top_tool per project: the tool with most uses in window. We grab
+  // one row per project via a window function emulation (sort + JS
+  // pick) to stay portable across SQLite versions. Tie-break: name asc.
+  const topToolRows = db.prepare(
+    "SELECT r.project_id AS project_id, e.tool_name AS tool_name, COUNT(*) AS uses "
+    + "  FROM run_event e "
+    + "  JOIN run r ON r.id = e.run_id "
+    + " WHERE e.kind = 'tool_use' AND e.tool_name IS NOT NULL "
+    + "   AND date(e.ts) >= ? AND date(e.ts) < ? "
+    + " GROUP BY r.project_id, e.tool_name "
+    + " ORDER BY r.project_id ASC, uses DESC, e.tool_name ASC",
+  ).all(window.start, window.end) as unknown as TopToolRow[];
+  const topToolByProject = new Map<number, string>();
+  for (const r of topToolRows) {
+    if (!topToolByProject.has(r.project_id)) {
+      topToolByProject.set(r.project_id, r.tool_name);
+    }
+  }
+
+  const projects: LeaderboardProjectRow[] = projAgg.map((row) => ({
+    slug: row.slug,
+    name: row.name ?? row.slug,
+    top_tool: topToolByProject.get(row.id) ?? null,
+    tool_diversity: Number(row.tool_diversity) || 0,
+    avg_tools_per_run: row.runs_in_window > 0
+      ? (Number(row.total_tool_uses) || 0) / row.runs_in_window
+      : 0,
+    runs_in_window: Number(row.runs_in_window) || 0,
+  }));
+
+  // ── Heatmap ─────────────────────────────────────────────────────
+  // cost_rollup_day rows in window, grouped by (project, phase). One
+  // row per project in the output with a fixed {ship,groom,review,eng}
+  // bag; missing phases → 0.
+  const heatRows = db.prepare(
+    "SELECT cr.project_id AS project_id, p.slug AS slug, cr.phase AS phase, "
+    + "       SUM(COALESCE(cr.cost_usd, 0)) AS cost_usd "
+    + "  FROM cost_rollup_day cr "
+    + "  JOIN project p ON p.id = cr.project_id "
+    + " WHERE cr.day >= ? AND cr.day < ? "
+    + " GROUP BY cr.project_id, p.slug, cr.phase",
+  ).all(window.start, window.end) as unknown as HeatmapRow[];
+  const heatBySlug = new Map<string, LeaderboardHeatmapRow>();
+  for (const r of heatRows) {
+    const existing = heatBySlug.get(r.slug) ?? {
+      slug: r.slug,
+      by_phase: { ship: 0, groom: 0, review: 0, eng: 0 },
+    };
+    if ((PHASES_FOUR as readonly string[]).includes(r.phase)) {
+      existing.by_phase[r.phase as PhaseFour] += Number(r.cost_usd) || 0;
+    }
+    heatBySlug.set(r.slug, existing);
+  }
+  // Ensure every project from the projects array gets a heatmap row,
+  // even if it had no cost_rollup_day entries in window. Sort by slug
+  // for deterministic render order.
+  for (const p of projects) {
+    if (!heatBySlug.has(p.slug)) {
+      heatBySlug.set(p.slug, {
+        slug: p.slug,
+        by_phase: { ship: 0, groom: 0, review: 0, eng: 0 },
+      });
+    }
+  }
+  const heatmap = [...heatBySlug.values()].sort((a, b) => a.slug.localeCompare(b.slug));
+
+  return { window, tools, projects, heatmap };
+}
+
 export function runView(db: DB, id: number) {
   const run = db.prepare("SELECT * FROM run WHERE id=?").get(id) as any;
   if (!run) return null;

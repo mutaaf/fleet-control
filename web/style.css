@@ -206,6 +206,30 @@ tr.run:hover td { background: var(--panel); color: var(--ink); cursor: pointer; 
 .digest-narrative { padding-left: 18px; margin: 4px 0 0; }
 .digest-narrative li { padding: 2px 0; font-size: 13px; color: var(--dim); }
 
+/* Cross-project tool-call leaderboard (ticket 0014).
+   Three stacked tables — tools, projects, heatmap — sharing one
+   `.leaderboard` selector for the dense-table look. The heatmap reuses
+   the same table chrome and just tints cells with rgba(--accent) at a
+   linearly-scaled alpha (computed in JS against the row max). Mobile
+   leans on the same MQ as the rest of the SPA: tables get horizontal
+   scroll on narrow viewports so cells stay readable without re-flowing
+   into tiny columns. */
+table.leaderboard { margin: 8px 0 18px; }
+table.leaderboard td, table.leaderboard th { padding: 8px 12px; }
+table.leaderboard tbody tr:hover td { background: var(--panel); color: var(--ink); }
+table.leaderboard td b { color: var(--ink); }
+table.leaderboard.heatmap td.heat-cell {
+  text-align: right; font-variant-numeric: tabular-nums; color: var(--ink);
+  border-right: 1px solid var(--bg);
+}
+table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
+
+/* Top-nav "Compare" link from the home summary. Sits inline; the
+   monospace pulse of the cursor in the brand stays the dominant
+   chrome. We hover it to --accent so the affordance reads. */
+.summary .navlink { color: var(--accent); margin-left: 6px; }
+.summary .navlink:hover { text-decoration: underline; }
+
 /* Mobile-first portal pass (ticket 0011).
    Single phone breakpoint at 640px — covers iPhone 13 mini (375), iPhone
    14 Plus (414), and small Android handsets. The pass is layout-only:
@@ -238,4 +262,7 @@ tr.run:hover td { background: var(--panel); color: var(--ink); cursor: pointer; 
   .pr-actionbar { position: sticky; bottom: 0;
     padding: 10px 4px calc(10px + env(safe-area-inset-bottom)); }
   .pr-diff { max-height: 50vh; font-size: 11.5px; }
+  /* Ticket 0014: leaderboard tables get horizontal scroll at narrow
+     viewports rather than re-flowing into illegibly tight columns. */
+  table.leaderboard { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 }
