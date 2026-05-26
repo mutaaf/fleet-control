@@ -9,6 +9,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
+import { recentEvents } from "./ingest/events.ts";
 import { fleetView, projectView, runView } from "./views.ts";
 import { doAction } from "./control.ts";
 import { evalAlerts } from "./alerts.ts";
@@ -98,6 +99,13 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         if (path === "/api/fleet") return json(res, fleetView(db, cfg));
         const pm = path.match(/^\/api\/project\/([\w-]+)$/);
         if (pm) { const v = projectView(db, cfg, pm[1]); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
+        // Typed event stream (ticket 0001). Read-only, slug-scoped, capped.
+        const em = path.match(/^\/api\/projects\/([\w-]+)\/events$/);
+        if (em) {
+          const limit = Number(url.searchParams.get("limit") ?? "50");
+          const safe = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 500) : 50;
+          return json(res, { slug: em[1], events: recentEvents(db, em[1], safe) });
+        }
         const rm = path.match(/^\/api\/run\/(\d+)$/);
         if (rm) { const v = runView(db, Number(rm[1])); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
         return json(res, { error: "unknown endpoint" }, 404);

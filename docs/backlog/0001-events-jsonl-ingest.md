@@ -1,7 +1,7 @@
 ---
 id: 0001
 title: Ingest events.jsonl from each project
-status: groomed
+status: in-progress
 priority: P0
 area: ingest
 created: 2026-05-26
@@ -77,4 +77,14 @@ recognizes immediately.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: opened `feat/0001-events-jsonl-ingest`,
+  flipped status to in-progress, drafted failing test
+  `tests/ingest-events.test.ts` (fixture with 3 lines incl. one malformed,
+  expects 2 inserts then 0 on a second pass). Plan: add `agent_event` table
+  (avoid `event` reserved-keyword feel) + `(slug, ts DESC)` index, watermark
+  source key `events:<slug>`, mirror `runs.jsonl` byte-offset cursor pattern
+  for crash-safe re-reads. New file `src/ingest/events.ts` + wiring in
+  `src/ingest/index.ts` and `bin/fleetctl.ts backfill`. New route
+  `/api/projects/:slug/events?limit=N` (slug-scoped, no auth — read-only
+  read-side). "Now" panel additive: when most recent `run_started` is within
+  30 min, show `phase` from the event; else keep transcript-tail fallback.

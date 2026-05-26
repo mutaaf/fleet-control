@@ -5,6 +5,7 @@ import { syncProjects } from "../discovery.ts";
 import { seedPricing } from "../pricing.ts";
 import { ingestProjectTranscripts } from "./transcripts.ts";
 import { ingestProjectRuns } from "./runs.ts";
+import { ingestEvents } from "./events.ts";
 
 export function recomputeRollups(db: DB): void {
   db.exec("DELETE FROM cost_rollup_day");
@@ -31,6 +32,11 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
       if (!aliases.includes(p.slug)) aliases.push(p.slug);
       total += ingestProjectTranscripts(db, cfg, p.id, aliases);
       ingestProjectRuns(db, cfg, p.id, p.slug); // measured cost overlay (live > computed)
+      // Typed event stream (agent-fleet ticket 0002). Read across every alias
+      // slug so renamed projects keep flowing without a manual backfill.
+      for (const aliasSlug of aliases) {
+        try { ingestEvents(db, aliasSlug, cfg.cacheBase); } catch { /* keep ingesting */ }
+      }
     }
     recomputeRollups(db);
     db.exec("COMMIT");
