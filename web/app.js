@@ -107,6 +107,7 @@ function openModal(kind, slug) {
   else if (kind === "add") html = addForm();
   else if (kind === "cadence") html = cadenceForm(slug);
   else if (kind === "fleet-pace") html = fleetPaceForm();
+  else if (kind === "budget") html = budgetForm(slug);
   wrap.innerHTML = `<div class="modal">${html}</div>`;
   wrap.addEventListener("click", (e) => { if (e.target === wrap) wrap.remove(); });
   document.body.appendChild(wrap);
@@ -210,6 +211,26 @@ function cadenceForm(slug) {
     </div>`;
 }
 
+// ---- budget cap -----------------------------------------------------------
+//
+// Per-project daily $ cap (MAX_DAILY_USD in agents.config.sh). The engine
+// soft-aborts the next run when today's UTC spend reaches the cap, emitting
+// a `budget_block` event. Empty / 0 = no cap (current default).
+function budgetForm(slug) {
+  const cad = (window._cadenceFor && window._cadenceFor[slug]) || {};
+  const current = cad.max_daily_usd || "";
+  const placeholder = current ? "" : "e.g. 20";
+  return `<h2>Daily $ cap for ${esc(slug)}</h2>
+    <p class="dim">When today's UTC spend reaches this, the next run soft-aborts and writes a <code>budget_block</code> event. Leave empty to remove the cap.</p>
+    <label class="fld"><span>Cap ($ per day)</span>
+      <input id="b-cap" type="number" min="0" step="0.01" value="${esc(current)}" placeholder="${placeholder}"></label>
+    <p class="dim" style="font-size:12px">Currently: ${current ? `<b>$${esc(current)}</b> per day` : "<b>no cap</b>"}. The cap kicks in on the next scheduled run, not the one in flight.</p>
+    <div class="frow end">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" data-submit="budget" data-slug="${esc(slug)}">Apply</button>
+    </div>`;
+}
+
 function fleetPaceForm() {
   // Show the current pace of each project so the operator can see whether
   // the fleet is already mixed (e.g. one project on trickle, others on default).
@@ -263,6 +284,12 @@ document.addEventListener("click", (e) => {
     const preset = document.getElementById("fp-preset").value;
     if (!confirm(`Apply "${preset}" pace to every project? Currently-running jobs will be skipped.`)) return;
     act("set-pace-fleet", { preset });
+  } else if (s.dataset.submit === "budget") {
+    const raw = document.getElementById("b-cap").value.trim();
+    if (raw && (!Number.isFinite(Number(raw)) || Number(raw) < 0)) {
+      return toast("cap must be a non-negative number", false);
+    }
+    act("set-budget", { slug: s.dataset.slug, max_daily_usd: raw });
   } else if (s.dataset.submit === "add") {
     const v = (id) => document.getElementById(id).value.trim();
     if (!v("a-path")) return toast("a folder path is required", false);
@@ -544,6 +571,7 @@ async function project(slug, params) {
       <button class="btn" data-act="pause" data-slug="${p.slug}" data-confirm="Pause all of ${esc(p.name)}’s jobs? It will stop working autonomously until resumed.">Pause project</button>
       <button class="btn" data-act="eng-toggle" data-slug="${p.slug}" data-enabled="${p.engEnabled ? "0" : "1"}">${p.engEnabled ? "Turn off code-tidying" : "Also tidy the code"}</button>
       <button class="btn" data-modal="cadence" data-slug="${p.slug}" title="Pace: ${esc(p.pace || "custom")}">Change schedule…</button>
+      <button class="btn" data-modal="budget" data-slug="${p.slug}" title="${p.cadence?.max_daily_usd ? "Cap: $" + p.cadence.max_daily_usd + "/day" : "No daily cap"}">Daily cap…</button>
       <button class="btn primary" data-modal="ticket" data-slug="${p.slug}">Tell it what to build</button>
       <button class="btn" data-embed-toggle data-slug="${p.slug}">Embed badge</button>
     </div>
