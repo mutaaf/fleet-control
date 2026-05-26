@@ -159,6 +159,50 @@ threshold-style detector (forecast bands, regression alerts, drift
 detectors): the test fixture's σ must be wide enough that "within bounds"
 is geometrically meaningful, not just an artifact of a flat baseline.
 
+## 2026-05-26 — `node:sqlite`'s `.all()` needs `as unknown as T[]` when narrowing
+
+Symptom: while shipping ticket 0012 (weekly digest), wrapping the rows
+returned by `db.prepare(...).all(...)` in a typed `interface FooRow` and
+casting via `as FooRow[]` failed `tsc --noEmit` with TS2352:
+"Conversion of type 'Record<string, SQLOutputValue>[]' to type 'FooRow[]'
+may be a mistake because neither type sufficiently overlaps". Cause:
+node:sqlite's declared return type for `StatementSync.all()` is
+`Record<string, SQLOutputValue>[]` — an index signature, not an open
+object — and TypeScript refuses a direct narrowing cast between an
+index-signature type and a closed interface because the structural-check
+heuristic says "these don't look related enough". The existing codebase
+sidestepped this by going through `as any[]` first (the readability cost
+of which is real). Fix: `as unknown as FooRow[]`. The double-cast through
+`unknown` is TypeScript's officially-blessed escape hatch — it tells the
+checker "I assert this conversion despite the overlap heuristic" without
+introducing an `any` that contaminates downstream type inference. General
+rule for this repo: any new SQLite read that defines a row interface
+SHOULD use `as unknown as RowT[]` (or `as unknown as RowT | undefined`
+for `.get()`). Pure `as any[]` is fine in legacy code but loses the
+typed-property checks the rest of the file enforces.
+
+## 2026-05-26 — expose a build counter for cache-hit tests, not a fetcher swap
+
+Symptom: ticket 0012's AC5 needed a "second call within the TTL must
+not re-query the database" assertion for `weeklyDigest()`'s 5-min
+cache. The ntfy and diff modules use an *injected fetcher* whose call
+count is the test signal — but `weeklyDigest` has no injected
+dependency to swap (it's pure SQL against the DB the caller passes in,
+and stubbing every `db.prepare` call would be both noisy and
+brittle). Cause: the "injected-thing-with-a-counter" pattern only
+works when there's already a seam for an injected thing. Pure-SQL
+helpers don't have one. Fix: export a single
+`_getDigestCacheBuildsForTests(): number` getter alongside the
+existing `_resetDigestCacheForTests()` reset; the helper increments
+`buildCounter` only on a cache MISS, so a test can assert "counter
+went up by 1, then by 0" without touching any of the SQL. General
+rule: when a module's "did this re-compute?" question can't be
+answered by a side-effect (no network call, no shell-out), expose a
+read-only counter via a `_get…ForTests` getter. The leading underscore
++ "ForTests" suffix matches the `_reset…ForTests` /
+`_setRunnerForTests` convention already in the repo and signals to
+reviewers that production code doesn't read this.
+
 ## 2026-05-26 — shell-out modules need an injectable runner for tests
 
 Symptom: writing tests for the new `register-url` action (ticket 0010) I

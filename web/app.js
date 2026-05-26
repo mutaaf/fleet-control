@@ -220,11 +220,63 @@ function telemetry(arr) {
 }
 
 // ---- Home -----------------------------------------------------------------
+// Ticket 0012: weekly digest banner. We fetch the digest in parallel with
+// /api/fleet so the home render isn't slowed by a second round-trip; the
+// banner is rendered above the alerts and "Your projects" list. Tapping it
+// expands the per-project rows inline. Errors fall through silently — the
+// home page must still render if the digest endpoint is unavailable.
+async function fetchDigest() {
+  try { return await get("/api/digest/week"); } catch { return null; }
+}
+
+/** Render the "Last week" banner at the top of the home view from a
+ *  /api/digest/week payload. Returns an HTML string. Tap-to-expand is
+ *  handled by a document-level listener registered once at bottom of file. */
+function digestBanner(d) {
+  if (!d || !d.totals) return "";
+  const t = d.totals;
+  // Headline strip — five compact stats. The merged-PR count is the
+  // headline (operator's favourite number) so it leads.
+  const headline = ""
+    + `<b>${t.prs_merged}</b> PR${t.prs_merged === 1 ? "" : "s"} merged`
+    + ` · <b>${t.prs_sent_back}</b> sent back`
+    + ` · <b>${usd(t.cost_usd)}</b> spent`
+    + ` · <b>${t.self_cancels}</b> self-cancel${t.self_cancels === 1 ? "" : "s"}`
+    + ` · <b>${t.anomalies}</b> anomal${t.anomalies === 1 ? "y" : "ies"}`;
+  // Per-project rows (hidden by default; expand on tap). One <li> per
+  // project, ordered as the digest sorted them (cost desc).
+  const rows = (d.projects || []).map((p) => {
+    const delta = p.delta_cost_vs_prior_week_pct;
+    const deltaStr = delta == null ? "new this week"
+      : (delta >= 0 ? "+" : "") + delta.toFixed(1) + "% vs last week";
+    return `<li class="digest-row">`
+      + `<a href="#/p/${esc(p.slug)}"><b>${esc(p.name || p.slug)}</b></a>`
+      + ` <span class="faint">· ${p.runs} runs · ${p.prs_merged} PR${p.prs_merged === 1 ? "" : "s"}`
+      + ` · ${usd(p.cost_usd)} · ${esc(deltaStr)}</span>`
+      + `</li>`;
+  }).join("");
+  const narrative = (d.narrative || []).map((b) => `<li>${esc(b)}</li>`).join("");
+  return `<div class="digest-banner" data-digest-banner>
+    <div class="digest-head" data-digest-toggle>
+      <span class="digest-eyebrow">Last week</span>
+      <span class="digest-stats">${headline}</span>
+      <span class="digest-caret">▸</span>
+    </div>
+    <div class="digest-body hidden">
+      ${rows ? `<ul class="digest-list">${rows}</ul>` : `<div class="faint">no projects ran last week</div>`}
+      ${narrative ? `<div class="digest-eyebrow">Narrative</div><ul class="digest-narrative">${narrative}</ul>` : ""}
+    </div>
+  </div>`;
+}
+
 async function home() {
-  const data = await get("/api/fleet");
+  // Fan out /api/fleet + /api/digest/week so the second round-trip doesn't
+  // delay the rest of the page. The banner is rendered above the alerts.
+  const [data, digestData] = await Promise.all([get("/api/fleet"), fetchDigest()]);
   const alerts = data.alerts || [];
   summary.innerHTML = `${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort`;
   app.innerHTML =
+    digestBanner(digestData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
     `<div class="eyebrow rowflex">Your projects <button class="btn sm" data-modal="add">+ Add a project</button></div>` + data.projects.map(card).join("") +
     `<div class="eyebrow" style="margin-top:28px">Across the fleet</div>
@@ -313,6 +365,24 @@ function card(p) {
       <span class="dim">${p.runs} runs</span>
     </div>${ulBanner}${akBanner}${banner}</a>`;
 }
+// Ticket 0012: "Last week" digest banner — tap the head to expand
+// the per-project rows. Same toggle pattern as the PR card head.
+document.addEventListener("click", (e) => {
+  const toggle = e.target.closest("[data-digest-toggle]");
+  if (!toggle) return;
+  // Don't hijack clicks that originated on a real link inside the head
+  // (e.g. a project name): let the navigation through.
+  if (e.target.closest("a")) return;
+  const banner = toggle.closest("[data-digest-banner]");
+  if (!banner) return;
+  const body = banner.querySelector(".digest-body");
+  const caret = banner.querySelector(".digest-caret");
+  if (!body) return;
+  const opening = body.classList.contains("hidden");
+  body.classList.toggle("hidden");
+  if (caret) caret.textContent = opening ? "▾" : "▸";
+});
+
 // Pill clicks: stop the parent <a class="card"> navigation and route to
 // the anomalies view explicitly. data-anom-link carries the slug.
 document.addEventListener("click", (e) => {

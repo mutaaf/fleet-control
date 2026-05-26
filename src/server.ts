@@ -18,6 +18,7 @@ import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
 import { tailTranscript, type TailEvent } from "./live.ts";
 import { pricingRows, lastSyncedAt, syncPricing } from "./pricing.ts";
 import { fetchPrDiff } from "./diff.ts";
+import { weeklyDigest } from "./digest.ts";
 import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
   type Scope, type TokenRecord,
@@ -210,6 +211,11 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
         if (path === "/api/fleet") return json(res, fleetView(db, cfg));
+        // Weekly digest (ticket 0012). Cached for 5 min inside the helper
+        // keyed by the period — cheap to recompute, but a polled SPA could
+        // hit this every 5s on the home view. Same shape as the Digest
+        // type in src/digest.ts; the SPA's home banner consumes it.
+        if (path === "/api/digest/week") return json(res, weeklyDigest(db));
         // Pricing table (ticket 0004). `synced_at` is the most-recent
         // fetched_at across all rows; `stale` flips true when that's older
         // than 24h so the SPA footer can render a warn badge.
