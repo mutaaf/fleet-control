@@ -7,6 +7,7 @@ import { runIngestPass } from "../src/ingest/index.ts";
 import { startServer } from "../src/server.ts";
 import { runDaemon, installDaemon, uninstallDaemon, daemonStatus } from "../src/daemon.ts";
 import { evalAlerts, openAlerts } from "../src/alerts.ts";
+import { mintToken, listTokens, revokeToken, type Scope } from "../src/auth.ts";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -23,7 +24,15 @@ const ago = (iso: string | null) => {
 
 const cfg = loadConfig();
 const db = openDb(cfg.dbPath);
-const [cmd, arg] = process.argv.slice(2);
+const argv = process.argv.slice(2);
+const [cmd, arg] = argv;
+
+/** Tiny flag parser: returns the value following --flag (or undefined).
+ *  Lets `tokens add laptop --scope admin` work without dragging in a CLI dep. */
+function flag(name: string): string | undefined {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
 
 function backfill() {
   const t0 = Date.now();
@@ -92,6 +101,54 @@ function show(id: string) {
   console.log();
 }
 
+/** `fleetctl tokens <add|list|revoke> ...` — mint, list, and revoke the
+ *  per-device scoped tokens that gate the LAN portal. Plaintext is printed
+ *  once on `add`; after that only the 8-char id-prefix is visible anywhere. */
+function tokens() {
+  const sub = arg;
+  if (sub === "add") {
+    const name = argv[2];
+    const scope = (flag("scope") ?? "read") as Scope;
+    if (!name) return console.log("usage: fleetctl tokens add <name> --scope <read|control|admin>");
+    try {
+      const m = mintToken(db, name, scope);
+      // Print to STDERR-visible-but-distinct lines so a careless pipe doesn't
+      // capture the secret. The operator sees it ONCE; no copy lives on disk.
+      console.log(`${c.grn}minted${c.rst} ${c.bold}${m.name}${c.rst} ${c.dim}(${m.scope}, id ${m.id_prefix})${c.rst}`);
+      console.log(`${c.ylw}token (shown once — copy it now):${c.rst}\n  ${m.token}`);
+    } catch (e: any) {
+      console.error(`${c.red}error:${c.rst} ${e?.message ?? e}`); process.exitCode = 1;
+    }
+    return;
+  }
+  if (sub === "list" || sub === undefined) {
+    const rows = listTokens(db);
+    if (!rows.length) return console.log(`${c.dim}no tokens. mint one with: fleetctl tokens add <name> --scope read${c.rst}`);
+    console.log(`\n${c.bold}ID-PREFIX  NAME                  SCOPE     LAST USED       REVOKED${c.rst}`);
+    console.log(c.dim + "─".repeat(70) + c.rst);
+    for (const r of rows) {
+      const rev = r.revoked_at ? c.red + "revoked" + c.rst : c.grn + "active" + c.rst;
+      const last = r.last_used_at ? ago(r.last_used_at) : c.dim + "never" + c.rst;
+      console.log(`${r.id_prefix}   ${r.name.padEnd(20)}  ${r.scope.padEnd(8)}  ${String(last).padEnd(14)}  ${rev}`);
+    }
+    console.log();
+    return;
+  }
+  if (sub === "revoke") {
+    const prefix = argv[2];
+    if (!prefix) return console.log("usage: fleetctl tokens revoke <id-prefix>");
+    try {
+      const ok = revokeToken(db, prefix);
+      if (ok) console.log(`${c.grn}revoked${c.rst} ${prefix}`);
+      else { console.log(`${c.ylw}no live token with prefix${c.rst} ${prefix}`); process.exitCode = 1; }
+    } catch (e: any) {
+      console.error(`${c.red}error:${c.rst} ${e?.message ?? e}`); process.exitCode = 1;
+    }
+    return;
+  }
+  console.log("usage: fleetctl tokens <add <name> --scope read|control|admin | list | revoke <id-prefix>>");
+}
+
 switch (cmd) {
   case "backfill": backfill(); break;
   case "status": case undefined: status(); break;
@@ -116,6 +173,7 @@ switch (cmd) {
     for (const x of a) console.log(`  ${x.severity === "critical" ? c.red : c.ylw}●${c.rst} ${x.title} ${c.dim}— ${x.detail}${c.rst}`);
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts]");
+  case "tokens": tokens(); break;
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run") db.close();

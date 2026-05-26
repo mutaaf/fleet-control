@@ -8,15 +8,18 @@ import { join, dirname, basename } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import type { DB } from "./db.ts";
 import { loadConfig } from "./config.ts";
+import * as auth from "./auth.ts";
 
 const UID = process.getuid?.() ?? 0;
 const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
 const KIT_INSTALL = join(KIT, "lib", "install.sh");
 const PHASES = ["ship", "groom", "review", "eng"];
-// Actions that need a real project; everything else (register) is handled specially.
+// Actions that need a real project; everything else (register, tokens-*)
+// is handled specially below before the per-project work begins.
 const KNOWN_ACTIONS = new Set([
   "kickstart", "pause", "resume", "keep-running", "eng-toggle",
   "pr-merge", "pr-changes", "pr-close", "create-ticket", "register",
+  "tokens-add", "tokens-revoke",
 ]);
 
 /** Prefer the working-tree manifest if it still exists (so edits land where the
@@ -57,16 +60,21 @@ function isRunning(p: Proj): boolean {
     catch { return false; }
   });
 }
-function audit(db: DB, actor: string, action: string, target: string, args: unknown, exit: number, out: string) {
-  db.prepare("INSERT INTO control_audit(ts,actor,action,target,args_json,exit_code,stdout_tail) VALUES(?,?,?,?,?,?,?)")
-    .run(new Date().toISOString(), actor, action, target, JSON.stringify(args), exit, out.slice(-500));
+function audit(db: DB, actor: string, action: string, target: string, args: unknown, exit: number, out: string, actorName?: string) {
+  db.prepare("INSERT INTO control_audit(ts,actor,action,target,args_json,exit_code,stdout_tail,actor_name) VALUES(?,?,?,?,?,?,?,?)")
+    .run(
+      new Date().toISOString(), actor, action, target, JSON.stringify(args),
+      exit, out.slice(-500),
+      actorName ?? (actor === "local" ? "local" : null),
+    );
 }
 
 export interface ActionResult { ok: boolean; message: string; output?: string; }
 
-export function doAction(db: DB, actor: string, action: string, body: any): ActionResult {
+export function doAction(db: DB, actor: string, action: string, body: any, actorName?: string): ActionResult {
   if (!KNOWN_ACTIONS.has(action)) throw new Error(`unknown action '${action}'`);
   if (action === "register") return registerProject(db, body); // no existing project
+  if (action === "tokens-add" || action === "tokens-revoke") return tokensAction(db, action, body, actor, actorName);
   const slug = body?.slug;
   if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
   const p = project(db, slug);
@@ -131,8 +139,40 @@ export function doAction(db: DB, actor: string, action: string, body: any): Acti
   } catch (e: any) {
     ok = false; message = String(e?.message ?? e); out = (e?.stderr ?? "") + (e?.stdout ?? "");
   }
-  audit(db, actor, action, `${slug}/${body?.phase ?? "*"}`, body, ok ? 0 : 1, out);
+  audit(db, actor, action, `${slug}/${body?.phase ?? "*"}`, body, ok ? 0 : 1, out, actorName);
   return { ok, message, output: out.slice(-400) || undefined };
+}
+
+/** API surface for the token CLI/portal. tokens-add returns the plaintext
+ *  ONCE in the response (the caller must show it to the operator and never
+ *  log it). tokens-revoke takes an id-prefix. Both write a control_audit
+ *  row so we can see who minted/revoked what. */
+function tokensAction(db: DB, action: string, body: any, actor: string, actorName?: string): ActionResult {
+  try {
+    if (action === "tokens-add") {
+      const name = String(body?.name ?? "");
+      const scope = String(body?.scope ?? "");
+      // Cast widens the runtime string into the Scope literal type;
+      // mintToken does its own validation and throws on a bad scope.
+      const m = auth.mintToken(db, name, scope as auth.Scope);
+      audit(db, actor, "tokens-add", `${m.name}/${m.scope}`, { name: m.name, scope: m.scope, id_prefix: m.id_prefix }, 0, "", actorName);
+      // The plaintext token IS in the response body — the caller (CLI or
+      // portal) shows it once. The audit row above carries only id_prefix.
+      return { ok: true, message: `minted token '${m.name}' (${m.scope})`, output: JSON.stringify(m) };
+    }
+    if (action === "tokens-revoke") {
+      const prefix = String(body?.id_prefix ?? body?.prefix ?? "");
+      const ok = auth.revokeToken(db, prefix);
+      audit(db, actor, "tokens-revoke", prefix, { id_prefix: prefix }, ok ? 0 : 1, "", actorName);
+      return ok
+        ? { ok: true, message: `revoked token ${prefix}` }
+        : { ok: false, message: `no live token with prefix ${prefix}` };
+    }
+    return { ok: false, message: `unknown tokens action '${action}'` };
+  } catch (e: any) {
+    audit(db, actor, action, String(body?.name ?? body?.id_prefix ?? "?"), body, 1, String(e?.message ?? e), actorName);
+    return { ok: false, message: String(e?.message ?? e) };
+  }
 }
 
 const today = () => new Date().toISOString().slice(0, 10);

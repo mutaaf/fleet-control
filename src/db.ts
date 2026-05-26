@@ -125,6 +125,20 @@ CREATE TABLE IF NOT EXISTS agent_event (
   payload_json TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_event_slug_ts ON agent_event(slug, ts DESC);
+
+-- Per-user scoped tokens (ticket 0003). Replaces the single shared admin
+-- token. id is the SHA256 hex digest of the plaintext token — we never
+-- store the plaintext itself. scope is one of read | control | admin with
+-- a strict hierarchy (admin covers control covers read). Revocation is a
+-- timestamp, not a row delete, so audit-log foreign keys stay live.
+CREATE TABLE IF NOT EXISTS auth_token (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  scope         TEXT NOT NULL,
+  created_at    TEXT,
+  last_used_at  TEXT,
+  revoked_at    TEXT
+);
 `;
 
 export type DB = DatabaseSync;
@@ -138,6 +152,10 @@ export function openDb(path: string): DB {
     "ALTER TABLE run ADD COLUMN usage_limit_at TEXT",
     "ALTER TABLE run ADD COLUMN usage_limit_until TEXT",
     "ALTER TABLE alert ADD COLUMN auto_resolve INTEGER DEFAULT 1",
+    // ticket 0003: control_audit now records WHO (by token name), not just
+    // an opaque "local"/"lan" actor. Back-fill is implicit — pre-existing
+    // rows show actor_name=NULL which the views surface as "admin (legacy)".
+    "ALTER TABLE control_audit ADD COLUMN actor_name TEXT",
   ]) { try { db.exec(ddl); } catch { /* already there */ } }
   return db;
 }

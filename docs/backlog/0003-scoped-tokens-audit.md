@@ -1,7 +1,7 @@
 ---
 id: 0003
 title: Per-user scoped tokens with audit log
-status: groomed
+status: shipped
 priority: P1
 area: control
 created: 2026-05-26
@@ -74,4 +74,24 @@ Multi-device-by-design is a real property. People notice.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: picked up; opened `feat/0003-scoped-tokens-audit`.
+  Plan: add `auth_token` table + `actor_name` column via ALTER, new `tokens`
+  subcommand on `bin/fleetctl.ts`, scope-gated `requireAuth` in `src/server.ts`
+  with backward-compat for the legacy `adminToken`, then `tests/auth-tokens.test.ts`
+  exercising mint/use/revoke against in-memory routes.
+- 2026-05-26 — shipped. Final shape:
+  - `src/auth.ts` (new) — `mintToken / listTokens / revokeToken / authenticate /
+    scopeAllows / migrateLegacyAdminTokenIfPresent`. SHA256 hash is the row's
+    primary key; plaintext is returned once on mint and never stored.
+  - `src/db.ts` — `auth_token` table; `control_audit.actor_name` ALTER.
+  - `src/server.ts` — `requireAuth(db, req, scope, url?)` chokepoint replaces
+    the old `controlAuthed/streamAuthed`. Read API requires `read`, SSE
+    requires `read`, `/api/control/*` requires `control`, token management
+    (`tokens-*`) requires `admin`. Legacy adminToken auto-migrates on first
+    boot then the config field is cleared.
+  - `bin/fleetctl.ts` — `tokens add|list|revoke` subcommand (one-shot plaintext
+    on add; only id-prefix elsewhere).
+  - `src/control.ts` — `doAction` grows an optional `actor_name`; new
+    `tokens-add / tokens-revoke` verbs flow through the same audit pipeline.
+  - Tests: `tests/auth-tokens.test.ts` (15) + `tests/auth-server.test.ts` (7)
+    + `tests/auth-audit.test.ts` (5). 40 tests total now, all green.
