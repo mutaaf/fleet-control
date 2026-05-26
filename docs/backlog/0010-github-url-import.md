@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: One-click GitHub-URL project import
-status: in-progress
+status: shipped
 priority: P2
 area: control
 created: 2026-05-26
@@ -111,3 +111,10 @@ manually.
   shell-out), slug collision, gh-unreachable surfacing, partial cleanup
   on register failure, audit row shape (no token), and the
   "register the URL → scaffold files appear" happy path.
+- 2026-05-26 — shipped via PR #22. Action `register-url` is live on
+  admin scope; SPA's add-project modal has the new "Clone & connect"
+  affordance; control_audit records `repo_url`+`slug` only; partial
+  dest dir is wiped via `safeRmUnder()` on any mid-flow failure. The
+  `_setRunnerForTests` / `_resetRunnerForTests` seam in `src/control.ts`
+  is the test-only swap point — production callers should never touch
+  it (same convention as `src/ntfy.ts:_resetDedupForTests`).
