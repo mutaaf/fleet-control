@@ -1,7 +1,7 @@
 ---
 id: 0009
 title: ntfy push notifications for high-priority events
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-05-26
