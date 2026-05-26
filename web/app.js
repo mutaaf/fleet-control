@@ -217,13 +217,33 @@ async function home() {
        <span class="dim">When on, the fleet is watched and you get alerts even with this closed (a little background CPU). Off: updates only while open.</span>
      </div></div>`;
   const pf = pricingFooter();
-  foot.textContent = "updated " + new Date(data.generatedAt).toLocaleTimeString() + (data.daemonOn ? " · always-on" : "") + (pf ? " · " + pf : "");
+  // Ticket 0005: total-fleet forecast — sum of per-project projected_30d.
+  // Projects without enough data contribute zero; surface that count so a
+  // small headline number doesn't read as "we're cheap" when really it's
+  // "we don't know yet". Hidden entirely until at least one project has a
+  // projection, so brand-new installs don't show "$0/mo (forecast)".
+  const ft = data.totals || {};
+  const fcLine = ft.forecast_ready
+    ? "forecast " + usd(ft.projected_30d) + "/mo across the fleet"
+      + (ft.forecast_ready < data.projects.length ? " (" + ft.forecast_ready + "/" + data.projects.length + " projects)" : "")
+    : "";
+  foot.textContent = "updated " + new Date(data.generatedAt).toLocaleTimeString() + (data.daemonOn ? " · always-on" : "") + (fcLine ? " · " + fcLine : "") + (pf ? " · " + pf : "");
   if (pricingMeta.stale) foot.title = "Pricing may be stale (synced >24h ago). Run: fleetctl pricing sync";
   else foot.removeAttribute("title");
 }
 function alertRow(a) {
   return `<div class="banner ${a.severity === "critical" ? "bad" : ""}" style="margin:0 0 8px">
     <b>${esc(a.title)}</b> — ${esc(a.detail)}</div>`;
+}
+function forecastSpan(f) {
+  // Ticket 0005: per-project "$X/mo (forecast)" derived from daily_mean_7d × 30.
+  // The 14d mean is exposed in a tooltip so a single hot day's spike on the
+  // 7d figure is easy to sanity-check. Until 3 days of data exist we render
+  // a soft "not enough yet" string instead of a number.
+  if (!f) return `<span class="dim">forecast: —</span>`;
+  if (f.projected_30d == null) return `<span class="dim" title="${esc(f.reason || "not enough data")}">forecast: not enough yet</span>`;
+  const tip = "14d mean: " + usd(f.daily_mean_14d) + "/day · 7d mean: " + usd(f.daily_mean_7d) + "/day";
+  return `<span title="${esc(tip)}"><b class="cost">${usd(f.projected_30d)}</b>/mo <span class="dim">(forecast)</span></span>`;
 }
 function card(p) {
   const [cls, label] = STATE[p.displayState] || STATE.off;
@@ -250,6 +270,7 @@ function card(p) {
     <div class="metarow">
       ${nextJob ? `<span>next: ${PHASE[nextJob.phase].toLowerCase()} <b>${until(nextJob.next)}</b></span>` : `<span class="dim">paused</span>`}
       <span>this week <b class="cost">${usd(p.cost7d)}</b></span>
+      <span>${forecastSpan(p.forecast)}</span>
       <span class="dim">${p.runs} runs</span>
     </div>${ulBanner}${akBanner}${banner}</a>`;
 }
