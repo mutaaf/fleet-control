@@ -37,4 +37,4 @@ proposes new ones, `review` grades them.
 | 0010 | One-click GitHub-URL project import | P2 | shipped | control |
 | 0012 | Weekly "what shipped" digest with wins and trends | P2 | shipped | observability |
 | 0013 | Shareable read-only fleet snapshot with anonymized slugs | P2 | shipped | portal |
-| 0019 | prs_merged count reads from runs not control_audit | P1 | in-progress | portal |
+| 0019 | prs_merged count reads from runs not control_audit | P1 | shipped | portal |
