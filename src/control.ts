@@ -9,7 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import type { DB } from "./db.ts";
 import { loadConfig } from "./config.ts";
 import * as auth from "./auth.ts";
-import { cleanCheckouts } from "./infra.ts";
+import { cleanCheckouts, safeRmUnder } from "./infra.ts";
 
 const UID = process.getuid?.() ?? 0;
 const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
@@ -20,9 +20,17 @@ const PHASES = ["ship", "groom", "review", "eng"];
 const KNOWN_ACTIONS = new Set([
   "kickstart", "pause", "resume", "keep-running", "eng-toggle",
   "pr-merge", "pr-changes", "pr-close", "create-ticket", "register",
+  "register-url",
   "tokens-add", "tokens-revoke",
   "clean-checkouts",
 ]);
+
+/** Strict regex for GitHub HTTPS repo URLs (ticket 0010). Owner/name must
+ *  match GitHub's own character set (letters, digits, `.`, `_`, `-`) and
+ *  the URL must terminate at the repo (with an optional bare `.git`
+ *  suffix). Anything else — SSH, http, query strings, extra path segments,
+ *  shell metas — is rejected upstream of any child process. */
+const GH_URL_RE = /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(\.git)?$/;
 
 /** Prefer the working-tree manifest if it still exists (so edits land where the
  * user can `git commit` them, and install.sh has a distinct src/dst for cp).
@@ -53,9 +61,18 @@ function label(p: Proj, phase: string): string {
   if (!PHASES.includes(phase)) throw new Error(`bad phase '${phase}'`);
   return `${p.namespace}.agent-${phase}`;
 }
-function run(cmd: string, args: string[]): string {
-  return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 120_000 });
-}
+/** Shell-out indirection (ticket 0010). Production code paths all execFile
+ *  with an argv array — never a shell string — and the test suite swaps
+ *  this for a recording stub via `_setRunnerForTests()`. The leading
+ *  underscore on the swap helpers signals "test seam only, never call in
+ *  production" (same convention as `_resetDedupForTests` in src/ntfy.ts). */
+type Runner = (cmd: string, args: string[]) => string;
+const defaultRunner: Runner = (cmd, args) =>
+  execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 120_000 });
+let activeRunner: Runner = defaultRunner;
+function run(cmd: string, args: string[]): string { return activeRunner(cmd, args); }
+export function _setRunnerForTests(fn: Runner): void { activeRunner = fn; }
+export function _resetRunnerForTests(): void { activeRunner = defaultRunner; }
 function isRunning(p: Proj): boolean {
   return PHASES.some((ph) => {
     try { return /\bstate = running\b/.test(run("launchctl", ["print", `gui/${UID}/${label(p, ph)}`])); }
@@ -76,6 +93,7 @@ export interface ActionResult { ok: boolean; message: string; output?: string; }
 export async function doAction(db: DB, actor: string, action: string, body: any, actorName?: string): Promise<ActionResult> {
   if (!KNOWN_ACTIONS.has(action)) throw new Error(`unknown action '${action}'`);
   if (action === "register") return registerProject(db, body); // no existing project
+  if (action === "register-url") return registerFromUrl(db, body, actor, actorName);
   if (action === "tokens-add" || action === "tokens-revoke") return tokensAction(db, action, body, actor, actorName);
   const slug = body?.slug;
   if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
@@ -282,32 +300,126 @@ function registerProject(db: DB, body: any): ActionResult {
   if (!remote) return { ok: false, message: "couldn't find a git remote (push it to GitHub first)" };
   const slug = kebab(body.slug || basename(path));
   const name = String(body.name || basename(path));
-  const days = Math.max(1, Math.min(365, Number(body.days) || 30));
+  const { out } = scaffoldAndInstall(path, { slug, name, remote, days: body.days, eng: !!body.eng });
+  audit(db, "register", "register", slug, { path }, 0, out);
+  return { ok: true, message: `Connected ${name}. It will start working on its schedule. Review its AGENTS.md § Agent parameters before its first run.`, output: out.slice(-300) };
+}
+
+/** Post-clone scaffold + launchd install — shared between Path A
+ *  (register) and Path B (register-url). Pure side-effects on the
+ *  filesystem + a single `bash install.sh` shell-out. Throws on install
+ *  failure so the caller can choose whether to clean up the dest dir
+ *  (register-url does; register doesn't because the operator owns the
+ *  folder). */
+interface ScaffoldOpts { slug: string; name: string; remote: string; days?: number; eng?: boolean; }
+function scaffoldAndInstall(path: string, opts: ScaffoldOpts): { out: string } {
+  const days = Math.max(1, Math.min(365, Number(opts.days) || 30));
   const d = new Date(Date.now() + days * 86_400_000);
   const sc = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
-
   // 1) manifest
   const manifest = join(path, "agents.config.sh");
   if (!existsSync(manifest))
-    writeFileSync(manifest, `PROJECT_NAME="${name}"\nSLUG="${slug}"\nNAMESPACE="com.${slug}"\nREPO_URL="${remote.replace(/\.git$/, "")}"\nMODEL="claude-opus-4-7"\nGIT_AUTHOR_NAME="${name} Agent"\nGIT_AUTHOR_EMAIL="noreply@anthropic.com"\nSELF_CANCEL="${sc}"\nSHIP_MINUTE=41\nGROOM_HOURS="0 6 12 18"\nGROOM_MINUTE=17\nREVIEW_INTERVAL=300\nENG_ENABLED=${body.eng ? 1 : 0}\n`);
+    writeFileSync(manifest, `PROJECT_NAME="${opts.name}"\nSLUG="${opts.slug}"\nNAMESPACE="com.${opts.slug}"\nREPO_URL="${opts.remote.replace(/\.git$/, "")}"\nMODEL="claude-opus-4-7"\nGIT_AUTHOR_NAME="${opts.name} Agent"\nGIT_AUTHOR_EMAIL="noreply@anthropic.com"\nSELF_CANCEL="${sc}"\nSHIP_MINUTE=41\nGROOM_HOURS="0 6 12 18"\nGROOM_MINUTE=17\nREVIEW_INTERVAL=300\nENG_ENABLED=${opts.eng ? 1 : 0}\n`);
   // 2) backlog scaffold + validator
   const bdir = join(path, "docs", "backlog");
   if (!existsSync(bdir)) {
     mkdirSync(bdir, { recursive: true });
-    cpSync(join(KIT, "templates", "backlog", "_template.md"), join(bdir, "_template.md"));
+    const tmpl = join(KIT, "templates", "backlog", "_template.md");
+    if (existsSync(tmpl)) cpSync(tmpl, join(bdir, "_template.md"));
+    else writeFileSync(join(bdir, "_template.md"), "# ticket template\n");
     writeFileSync(join(bdir, "README.md"), `# Backlog\n\n| id | title | priority | status | area |\n|----|-------|----------|--------|------|\n`);
   }
   const sdir = join(path, "scripts");
-  if (!existsSync(join(sdir, "check-backlog.mjs"))) { mkdirSync(sdir, { recursive: true }); cpSync(join(KIT, "templates", "scripts", "check-backlog.mjs"), join(sdir, "check-backlog.mjs")); }
+  if (!existsSync(join(sdir, "check-backlog.mjs"))) {
+    mkdirSync(sdir, { recursive: true });
+    const v = join(KIT, "templates", "scripts", "check-backlog.mjs");
+    if (existsSync(v)) cpSync(v, join(sdir, "check-backlog.mjs"));
+  }
   // 3) AGENTS.md § Agent parameters
   const agents = join(path, "AGENTS.md");
-  const section = existsSync(join(KIT, "templates", "AGENTS.section.md")) ? readFileSync(join(KIT, "templates", "AGENTS.section.md"), "utf8") : "## Agent parameters\n";
+  const section = existsSync(join(KIT, "templates", "AGENTS.section.md"))
+    ? readFileSync(join(KIT, "templates", "AGENTS.section.md"), "utf8")
+    : "## Agent parameters\n";
   if (!existsSync(agents)) writeFileSync(agents, `# AGENTS.md\n\n${section}`);
   else if (!/##\s*Agent parameters/.test(readFileSync(agents, "utf8"))) writeFileSync(agents, readFileSync(agents, "utf8") + "\n\n" + section);
   // 4) install launchd
   const out = run("bash", [KIT_INSTALL, path]);
-  audit(db, "register", "register", slug, { path }, 0, out);
-  return { ok: true, message: `Connected ${name}. It will start working on its schedule. Review its AGENTS.md § Agent parameters before its first run.`, output: out.slice(-300) };
+  return { out };
+}
+
+/** "Add a project" (Path B: paste a GitHub URL, ticket 0010) — verify, clone,
+ *  scaffold + install. Strict regex on `repo_url` is the FIRST line so a
+ *  shell-meta payload never reaches a child process. On any mid-flow
+ *  failure (gh, clone, install) the partial `<projectRoots[0]>/<slug>`
+ *  dir is removed via `safeRmUnder()` (path-prefix guarded on
+ *  projectRoots[0]). The control_audit row carries `repo_url`+`slug` only
+ *  — no tokens are persisted even if the caller smuggled one through. */
+async function registerFromUrl(db: DB, body: any, actor: string, actorName?: string): Promise<ActionResult> {
+  const repoUrl = String(body?.repo_url ?? "");
+  // Hard gate BEFORE any work — the regex is anchored on both ends and only
+  // permits GitHub's own character set for owner/name, so a `;rm -rf /`
+  // tail can't slip past it and we never compose a shell string anyway.
+  if (!GH_URL_RE.test(repoUrl)) {
+    audit(db, actor, "register-url", "?", { repo_url: repoUrl, slug: null, error: "bad_url" }, 1, "", actorName);
+    return { ok: false, message: "bad_url — must look like https://github.com/<owner>/<name>" };
+  }
+  // owner/name extraction is regex-validated above; `.git` suffix is
+  // optional in the URL and stripped from the slug derivation.
+  const cleaned = repoUrl.replace(/\.git$/, "");
+  const ownerName = cleaned.slice("https://github.com/".length); // <owner>/<name>
+  const repoName = ownerName.split("/")[1];
+  const slug = kebab(body?.slug || repoName);
+  if (!slug || !/^[\w-]{1,40}$/.test(slug)) {
+    audit(db, actor, "register-url", "?", { repo_url: repoUrl, slug }, 1, "", actorName);
+    return { ok: false, message: "bad slug derived from URL" };
+  }
+  const name = String(body?.name || repoName);
+  const cfg = loadConfig();
+  const root = cfg.projectRoots[0];
+  if (!root) {
+    audit(db, actor, "register-url", slug, { repo_url: repoUrl, slug }, 1, "", actorName);
+    return { ok: false, message: "no projectRoots configured" };
+  }
+  const dest = join(root, slug);
+  // Collision check: existing dir on disk OR existing DB row.
+  const existsDb = db.prepare("SELECT 1 FROM project WHERE slug=?").get(slug);
+  if (existsSync(dest) || existsDb) {
+    audit(db, actor, "register-url", slug, { repo_url: repoUrl, slug, error: "slug_exists" }, 1, "", actorName);
+    return { ok: false, message: `slug_exists — '${slug}' is already registered` };
+  }
+  // 1) gh repo view — proves the operator has access without leaking creds
+  //    into our argv. Failure → repo_unreachable; never proceed to clone.
+  try { run("gh", ["repo", "view", ownerName, "--json", "name"]); }
+  catch (e: any) {
+    const tail = String(e?.stderr ?? e?.stdout ?? e?.message ?? "").slice(-300);
+    audit(db, actor, "register-url", slug, { repo_url: repoUrl, slug, error: "repo_unreachable" }, 1, tail, actorName);
+    return { ok: false, message: "repo_unreachable — `gh repo view` could not see the repo", output: tail };
+  }
+  // 2) git clone into projectRoots[0]/<slug>. --depth=50 keeps the clone small
+  //    enough for first run while leaving the agent room to look back.
+  try { run("git", ["clone", "--depth=50", repoUrl, dest]); }
+  catch (e: any) {
+    const tail = String(e?.stderr ?? e?.stdout ?? e?.message ?? "").slice(-300);
+    // Belt-and-braces: if a stray dest dir slipped through, clean it up.
+    try { await safeRmUnder(root, dest); } catch { /* */ }
+    audit(db, actor, "register-url", slug, { repo_url: repoUrl, slug, error: "clone_failed" }, 1, tail, actorName);
+    return { ok: false, message: "clone_failed — git clone exited non-zero", output: tail };
+  }
+  // 3) Delegate to scaffoldAndInstall — same code path Path A uses.
+  try {
+    const { out } = scaffoldAndInstall(dest, { slug, name, remote: cleaned, days: body?.days, eng: !!body?.eng });
+    audit(db, actor, "register-url", slug, { repo_url: repoUrl, slug }, 0, out, actorName);
+    return {
+      ok: true,
+      message: `Connected ${name}. It will start working on its schedule. Review its AGENTS.md § Agent parameters before its first run.`,
+      output: out.slice(-300),
+    };
+  } catch (e: any) {
+    const tail = String(e?.stderr ?? e?.stdout ?? e?.message ?? "").slice(-300);
+    try { await safeRmUnder(root, dest); } catch { /* */ }
+    audit(db, actor, "register-url", slug, { repo_url: repoUrl, slug, error: "register_failed" }, 1, tail, actorName);
+    return { ok: false, message: "register_failed — post-clone scaffold/install threw", output: tail };
+  }
 }
 
 /** Key-targeted line rewrite of a shell manifest (preserves comments/order). */
