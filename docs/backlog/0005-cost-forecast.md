@@ -1,7 +1,7 @@
 ---
 id: 0005
 title: 30-day cost forecast per project
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-26
@@ -66,4 +66,8 @@ The "30-day forecast" card is a memorable screenshot.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branch `feat/0005-cost-forecast` opened;
+  ticket flipped `groomed` → `in-progress`. Next: failing tests in
+  `tests/forecast.test.ts` for the 7-days-at-$1 happy path and the
+  fewer-than-3-days null path, then the `forecastFor` helper +
+  `/api/projects/:slug/forecast` route + SPA card/footer.
