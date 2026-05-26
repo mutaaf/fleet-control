@@ -1,7 +1,7 @@
 ---
 id: 0006
 title: Stale-checkout janitor with disk view
-status: groomed
+status: in-progress
 priority: P1
 area: infra
 created: 2026-05-26
@@ -70,4 +70,10 @@ real product.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched `feat/0006-stale-checkout-janitor`,
+  ticket flipped to `in-progress`. Plan: `src/infra.ts` for `diskUsage(slug)`
+  via `node:fs/promises` recursive `stat` + a `clean-checkouts` action in
+  `src/control.ts` guarded by `isRunning` and a strict `$HOME/.cache/<slug>-agent`
+  prefix regex. `/api/projects/:slug/disk` exposes the shape; SPA grows an
+  expandable section with the cleanup button. Tests: `tests/disk.test.ts`
+  drives both the disk view and the cleaner end-to-end via a tmpdir fixture.
