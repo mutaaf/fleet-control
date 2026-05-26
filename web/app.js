@@ -314,6 +314,8 @@ async function project(slug) {
     ${prSection(p)}
     <div class="eyebrow">The jobs</div>
     ${p.jobs.map((j) => jobCard(j, p.slug)).join("")}
+    <div class="eyebrow">Disk</div>
+    <div id="disk-section" class="jobcard"><div class="kv dim">checking…</div></div>
     <div class="eyebrow">Recent activity</div>
     <table><thead><tr><th>when</th><th>job</th><th>did</th><th>PR</th><th>tokens</th><th>cost</th></tr></thead>
     <tbody>${p.recent.map(runRow).join("")}</tbody></table>`;
@@ -325,6 +327,45 @@ async function project(slug) {
   // refreshes the markup around it, but tearing down the EventSource on
   // every tick would defeat the point.
   if (!liveES) attachLiveStream(slug);
+  // Ticket 0006: per-project disk view. Fired in parallel with the rest of
+  // the project render so a slow filesystem walk never blocks the page.
+  loadDiskSection(slug);
+}
+// ---- Disk view (ticket 0006) ---------------------------------------------
+// Renders bytes/checkout_count/oldest_age_days plus an expandable list of
+// candidate checkout dirs and a "Clean checkouts older than 14 days" button
+// that wraps the clean-checkouts control action.
+function fmtBytes(n) {
+  if (!n || n < 1024) return (n || 0) + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+async function loadDiskSection(slug) {
+  const el = document.getElementById("disk-section");
+  if (!el) return;
+  let d;
+  try { d = await get("/api/projects/" + encodeURIComponent(slug) + "/disk"); }
+  catch { el.innerHTML = `<div class="kv dim">couldn't read disk usage</div>`; return; }
+  const candidates = (d.candidates || []);
+  const rows = candidates.map((c) =>
+    `<div class="kv mono"><span class="lbl">${c.age_days.toFixed(1)}d</span>${esc(c.path)} <span class="faint">· ${fmtBytes(c.bytes)}</span></div>`,
+  ).join("");
+  const hasStale = candidates.some((c) => c.age_days >= 14);
+  el.innerHTML = `
+    <h3>Cache footprint <span class="jobactions">
+      <button class="btn sm${hasStale ? " primary" : ""}" data-act="clean-checkouts" data-slug="${esc(slug)}"
+        data-confirm="Clean checkouts older than 14 days for ${esc(slug)}? This removes only stale agent working trees — runs.jsonl, events.jsonl, and logs/ stay put.">
+        Clean checkouts older than 14 days</button>
+    </span></h3>
+    <div class="metarow">
+      <span>${fmtBytes(d.bytes)} on disk</span>
+      <span>${d.checkout_count} checkout${d.checkout_count === 1 ? "" : "s"}</span>
+      <span>oldest <b>${d.oldest_age_days.toFixed(1)}d</b></span>
+    </div>
+    ${candidates.length ? `<details style="margin-top:8px"><summary class="dim">show candidates</summary>${rows}</details>`
+                        : `<div class="kv dim">no checkout directories</div>`}
+  `;
 }
 function nowBanner(ev) {
   if (!ev) return "";

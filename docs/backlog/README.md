@@ -24,7 +24,7 @@ proposes new ones, `review` grades them.
 | 0003 | Per-user scoped tokens with audit log | P1 | shipped | control |
 | 0004 | Live Anthropic pricing sync into pricing table | P1 | shipped | observability |
 | 0005 | 30-day cost forecast per project | P1 | shipped | observability |
-| 0006 | Stale-checkout janitor with disk view | P1 | groomed | infra |
+| 0006 | Stale-checkout janitor with disk view | P1 | in-progress | infra |
 | 0007 | Inline PR diff with sticky action bar | P1 | groomed | portal |
 | 0008 | Anomaly detection on run duration and cost | P2 | groomed | observability |
 | 0009 | ntfy push notifications for high-priority events | P2 | groomed | observability |

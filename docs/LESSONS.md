@@ -61,6 +61,32 @@ that polls every 20ms up to a generous timeout, then asserts. Same
 principle as flaky web-driver tests — assert on the *condition*, not on a
 sleep length.
 
+## 2026-05-26 — GitHub Actions sometimes doesn't fire on a freshly-opened PR
+
+Symptom: PR #10 for ticket 0006 sat for several minutes after both the
+initial `git push -u` AND an empty "ci: trigger checks" follow-up push with
+zero workflow runs queued for the head commit. `gh pr checks` printed "no
+checks reported on the branch"; `gh api /commits/HEAD/check-suites`
+returned only the unrelated Vercel app suite, never a GitHub-Actions suite
+for `ci.yml` or `auto-merge.yml`. The workflow file is correct
+(`on: pull_request: branches: [main]` is matched by the PR's
+`base=main / head=feat/0006-...`), Actions are enabled at the repo level,
+and the same workflow had fired for every prior agent PR. Cause: most
+likely a transient GitHub-side delivery hiccup on the `pull_request`
+webhook — re-pushing didn't recover it within a single ship slot. Fix
+options for the heal step:
+  1. push another empty commit to nudge `synchronize` (cheapest first try),
+  2. close + reopen the PR via `gh pr close && gh pr reopen` to force a
+     fresh `pull_request.opened` event,
+  3. as a last resort, add `workflow_dispatch:` to `ci.yml` so the heal
+     agent can `gh workflow run` directly.
+General rule: distinguish "CI red" (a run completed and failed — read the
+log, fix, push) from "CI absent" (no run was queued at all — re-trigger
+the webhook). The current heal loop only knows how to handle the first
+case; until it grows the second, leave a PR comment naming the situation
+so the next ship run treats this as a re-trigger rather than re-doing the
+work from scratch.
+
 ## 2026-05-26 — don't fake a "lazy require" in an ESM file; just import
 
 Symptom: while wiring `src/control.ts` to call into the new `src/auth.ts`

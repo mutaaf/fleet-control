@@ -11,6 +11,7 @@ import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
 import { fleetView, projectView, runView, forecastFor } from "./views.ts";
 import { doAction } from "./control.ts";
+import { diskUsage } from "./infra.ts";
 import { evalAlerts } from "./alerts.ts";
 import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
 import { tailTranscript, type TailEvent } from "./live.ts";
@@ -111,7 +112,7 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         const required: Scope = cm[1].startsWith("tokens-") ? "admin" : "control";
         const auth = requireAuth(db, req, required);
         if (!auth.ok) return json(res, { ok: false, message: auth.message }, auth.status);
-        return readBody(req).then((body) => {
+        return readBody(req).then(async (body) => {
           let r;
           try {
             const who = actorOf(req, auth.principal);
@@ -120,7 +121,10 @@ export function startServer(host = "127.0.0.1", port = 7070) {
               if (on) installDaemon(Number(body.interval) || 60); else uninstallDaemon();
               r = { ok: true, message: on ? "Always-on monitoring enabled." : "Always-on monitoring disabled." };
             } else {
-              r = doAction(db, who.actor, cm[1], body, who.actor_name);
+              // doAction is now async (ticket 0006 introduced an action that
+              // does node:fs/promises rm() — every action funnels through the
+              // same await so the call site stays one path).
+              r = await doAction(db, who.actor, cm[1], body, who.actor_name);
             }
           } catch (e: any) { r = { ok: false, message: String(e?.message ?? e) }; }
           lastIngest = 0; // force fresh state next read
@@ -193,6 +197,15 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         // exist (the view surfaces "not enough yet" instead of a number).
         const fm = path.match(/^\/api\/projects\/([\w-]+)\/forecast$/);
         if (fm) { const v = forecastFor(db, fm[1]); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
+        // Disk usage + stale-checkout candidates (ticket 0006). 200 with an
+        // all-zeros payload for an unknown slug — the SPA's expandable
+        // section just shows "0 GB · no candidates" rather than a 404.
+        const dm = path.match(/^\/api\/projects\/([\w-]+)\/disk$/);
+        if (dm) {
+          return diskUsage(dm[1])
+            .then((r) => json(res, r))
+            .catch((e: any) => json(res, { error: String(e?.message ?? e) }, 500));
+        }
         // Typed event stream (ticket 0001). Read-only, slug-scoped, capped.
         const em = path.match(/^\/api\/projects\/([\w-]+)\/events$/);
         if (em) {
