@@ -1,7 +1,7 @@
 ---
 id: 0016
 title: fleetctl doctor — one-shot install + ingest diagnostic
-status: in-progress
+status: shipped
 priority: P2
 area: infra
 created: 2026-05-26
@@ -154,3 +154,11 @@ Each box maps 1:1 to a test scenario.
   flipped status to in-progress. Next: write `tests/doctor.test.ts` (one
   `test()` per AC checkbox), then `src/doctor.ts` + `bin/fleetctl.ts`
   wiring.
+- 2026-05-26 — implementation-dev: shipped via PR #34. `src/doctor.ts`
+  (608 lines) over an injected `DoctorDeps` surface, `bin/fleetctl.ts`
+  `doctor [--json]` subcommand, `tests/doctor.test.ts` (31 passing
+  tests + 1 PERF-gated). Both gating checks (typecheck + validate)
+  green; merged to main as 2b467a2. Two novel lessons appended to
+  `docs/LESSONS.md`: (1) "no shell-string exec" static checks should
+  grep the import not the call site, (2) renderer-boundary
+  `redactSecrets()` as defence-in-depth.
