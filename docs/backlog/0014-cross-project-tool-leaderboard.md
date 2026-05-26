@@ -1,7 +1,7 @@
 ---
 id: 0014
 title: Cross-project tool-call leaderboard
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-26
@@ -162,3 +162,14 @@ Each box maps 1:1 to a test scenario.
   `tests/leaderboard.test.ts` (one per AC). No new runtime deps, no
   schema migration — all reads target existing `run`, `run_event`, and
   `cost_rollup_day` tables.
+- 2026-05-26: Shipped. `fleetLeaderboard()` and `clampDays()` live in
+  `src/views.ts`; `GET /api/fleet/leaderboard?days=N` (read scope,
+  clamped to [1, 90], default 14) wired in `src/server.ts`; new
+  `#/leaderboard` hash route in `web/app.js` renders three sections
+  (Tools, Projects, cost-by-phase heatmap) with a `fleetctl backfill`
+  empty-state for fresh installs. `total_seconds` uses
+  `strftime('%s'/'%f'/'%S')` (integer-second base + fractional
+  component) rather than `julianday()` to avoid ~10us floating-point
+  drift per timestamp — the AC2 5.0s ± 1e-6 tolerance is now hit
+  cleanly. 12 new tests, all 147 tests pass under
+  `node --test tests/*.test.ts`.

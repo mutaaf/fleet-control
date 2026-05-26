@@ -274,7 +274,7 @@ async function home() {
   // delay the rest of the page. The banner is rendered above the alerts.
   const [data, digestData] = await Promise.all([get("/api/fleet"), fetchDigest()]);
   const alerts = data.alerts || [];
-  summary.innerHTML = `${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort`;
+  summary.innerHTML = `${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort · <a href="#/leaderboard" class="navlink">Compare ›</a>`;
   app.innerHTML =
     digestBanner(digestData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
@@ -655,6 +655,104 @@ function traceLine(e) {
   return "";
 }
 
+// ---- Leaderboard (ticket 0014) -------------------------------------------
+// Cross-project tool-call leaderboard. Renders three sections:
+//   1. Tools — name, invocations, total seconds, error rate, top projects.
+//   2. Projects — slug, top tool, tool diversity, avg tools per run.
+//   3. Heatmap — cost by phase per project (ship/groom/review/eng).
+// Single fetch against /api/fleet/leaderboard; the window defaults to the
+// last 14 days. Empty-state copy points operators at `fleetctl backfill`
+// when no tool events have been ingested yet (fresh installs).
+async function leaderboard() {
+  let d;
+  try { d = await get("/api/fleet/leaderboard"); }
+  catch (e) {
+    app.innerHTML = `<div class="loading">couldn't load leaderboard.<br><span class="dim">${esc(e.message)}</span></div>`;
+    return;
+  }
+  summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
+  app.innerHTML = renderLeaderboard(d);
+  foot.textContent = "window: " + d.window.start + " → " + d.window.end + " (" + d.window.days + " days)";
+}
+
+function renderLeaderboard(d) {
+  const tools = d.tools || [];
+  const projects = d.projects || [];
+  const heatmap = d.heatmap || [];
+  // Empty-state: a freshly-installed fleet has no events yet. Point the
+  // operator at `fleetctl backfill` so the leaderboard fills out.
+  if (tools.length === 0) {
+    return `<a class="back" href="#/">‹ all projects</a>
+      <div class="card-head"><span class="pname">Fleet · Compare</span></div>
+      <div class="card" style="margin-top:14px">
+        <div class="kv dim">No tool events ingested yet.</div>
+        <div class="kv">Run <code class="mono">fleetctl backfill</code> to populate the leaderboard, then refresh this page.</div>
+      </div>`;
+  }
+  const fmtSec = (s) => {
+    if (!s || s < 1) return (s || 0).toFixed(2) + "s";
+    if (s < 60) return s.toFixed(1) + "s";
+    if (s < 3600) return (s / 60).toFixed(1) + "m";
+    return (s / 3600).toFixed(1) + "h";
+  };
+  const pctErr = (r) => (r > 0 ? (r * 100).toFixed(1) + "%" : "0%");
+  const toolRow = (t) => {
+    const tops = (t.top_projects || []).map((p) => esc(p.slug) + " (" + p.invocations + ")").join(", ");
+    return `<tr>
+      <td><b>${esc(t.name)}</b></td>
+      <td class="mono">${t.invocations}</td>
+      <td class="mono">${esc(fmtSec(t.total_seconds))}</td>
+      <td class="mono">${esc(pctErr(t.error_rate))}</td>
+      <td class="dim">${tops}</td>
+    </tr>`;
+  };
+  const projRow = (p) => `<tr>
+    <td><a href="#/p/${esc(p.slug)}"><b>${esc(p.name || p.slug)}</b></a></td>
+    <td class="mono">${esc(p.top_tool || "—")}</td>
+    <td class="mono">${p.tool_diversity}</td>
+    <td class="mono">${(p.avg_tools_per_run || 0).toFixed(1)}</td>
+    <td class="mono">${p.runs_in_window}</td>
+  </tr>`;
+  // Heatmap: relative intensity per cell, computed against the row max
+  // (so each project's stripe reads independently). We render USD inside
+  // each cell and tint the background; zero cells stay neutral.
+  const maxCellCost = Math.max(
+    1e-9,
+    ...heatmap.flatMap((h) => Object.values(h.by_phase || {}).map((v) => +v || 0)),
+  );
+  const heatRow = (h) => {
+    const phases = ["ship", "groom", "review", "eng"];
+    const cells = phases.map((ph) => {
+      const v = (h.by_phase && +h.by_phase[ph]) || 0;
+      const intensity = v / maxCellCost;
+      const alpha = Math.min(0.6, intensity * 0.6).toFixed(3);
+      return `<td class="heat-cell mono" style="background: rgba(200,132,30,${alpha})">${esc(usd(v))}</td>`;
+    });
+    return `<tr><td><b>${esc(h.slug)}</b></td>${cells.join("")}</tr>`;
+  };
+  return `<a class="back" href="#/">‹ all projects</a>
+    <div class="card-head"><span class="pname">Fleet · Compare</span>
+      <span class="state dim mono">last ${d.window.days} days</span></div>
+
+    <div class="eyebrow">Tools</div>
+    <table class="leaderboard">
+      <thead><tr><th>tool</th><th>invocations</th><th>total time</th><th>error rate</th><th>top projects</th></tr></thead>
+      <tbody>${tools.map(toolRow).join("")}</tbody>
+    </table>
+
+    <div class="eyebrow">Projects</div>
+    <table class="leaderboard">
+      <thead><tr><th>project</th><th>top tool</th><th>diversity</th><th>avg tools / run</th><th>runs</th></tr></thead>
+      <tbody>${projects.map(projRow).join("") || `<tr><td colspan="5" class="dim">no projects with runs in the window</td></tr>`}</tbody>
+    </table>
+
+    <div class="eyebrow">Cost by phase (heatmap)</div>
+    <table class="leaderboard heatmap">
+      <thead><tr><th>project</th><th>ship</th><th>groom</th><th>review</th><th>eng</th></tr></thead>
+      <tbody>${heatmap.map(heatRow).join("") || `<tr><td colspan="5" class="dim">no cost rollups in the window</td></tr>`}</tbody>
+    </table>`;
+}
+
 // ---- Router ---------------------------------------------------------------
 // Hash strings carry an optional `?view=anomalies` (or any future view) —
 // strip the query off the slug before fetching the project view, and pass
@@ -679,6 +777,12 @@ async function route() {
       timer = setInterval(() => project(s, params).catch(() => {}), 5000);
     } else if (path.startsWith("r/")) {
       await run(path.slice(2));
+    } else if (path === "leaderboard" || path.startsWith("leaderboard")) {
+      // Ticket 0014: cross-project tool-call leaderboard. One-shot
+      // render — no polling timer because the data window is fixed
+      // (last 14 days) and the leaderboard is a "glance" view, not a
+      // live monitor.
+      await leaderboard();
     } else {
       await home();
       timer = setInterval(() => home().catch(() => {}), 5000);
