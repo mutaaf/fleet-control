@@ -102,7 +102,12 @@ document.addEventListener("click", (e) => {
 // ---- modal forms ("tell it what to build", "add a project") ---------------
 function openModal(kind, slug) {
   const wrap = document.createElement("div"); wrap.className = "modal-bg"; wrap.id = "modal";
-  wrap.innerHTML = `<div class="modal">${kind === "ticket" ? ticketForm(slug) : addForm()}</div>`;
+  let html = "";
+  if (kind === "ticket") html = ticketForm(slug);
+  else if (kind === "add") html = addForm();
+  else if (kind === "cadence") html = cadenceForm(slug);
+  else if (kind === "fleet-pace") html = fleetPaceForm();
+  wrap.innerHTML = `<div class="modal">${html}</div>`;
   wrap.addEventListener("click", (e) => { if (e.target === wrap) wrap.remove(); });
   document.body.appendChild(wrap);
 }
@@ -140,6 +145,87 @@ function addForm() {
       <div class="frow end"><button class="btn primary" data-submit="add-url">Clone &amp; connect</button></div>
     </div>`;
 }
+
+// ---- cadence / pace -------------------------------------------------------
+//
+// Two forms: a per-project "Change schedule" modal (per-phase dropdowns) and a
+// fleet-wide "Set pace" modal (named preset → applies to every project).
+// Both POST to set-cadence / set-pace-fleet — the underlying engine writes
+// SHIP_HOURS et al. to each project's agents.config.sh and reinstalls launchd.
+
+// Preset name → human label so the modal can show "Currently: Conservative".
+const PACE_LABEL = {
+  aggressive: "Aggressive — fastest (current default)",
+  steady: "Steady — every 2 hours",
+  conservative: "Conservative — every 6 hours",
+  trickle: "Trickle — twice a day",
+  custom: "Custom — fine-tuned per phase",
+};
+function paceOptions(selected) {
+  return Object.entries(PACE_LABEL).filter(([k]) => k !== "custom")
+    .map(([k, lbl]) => `<option value="${k}"${selected === k ? " selected" : ""}>${lbl}</option>`).join("");
+}
+
+// Per-phase dropdown values that map to the manifest variables.
+const SHIP_OPTIONS = [
+  { label: "Every hour (default)", ship_hours: "" },
+  { label: "Every 2 hours", ship_hours: "0 2 4 6 8 10 12 14 16 18 20 22" },
+  { label: "Every 4 hours", ship_hours: "0 4 8 12 16 20" },
+  { label: "Every 6 hours", ship_hours: "0 6 12 18" },
+  { label: "Every 12 hours", ship_hours: "0 12" },
+  { label: "Once a day", ship_hours: "0" },
+];
+const GROOM_OPTIONS = [
+  { label: "4× a day (default)", groom_hours: "0 6 12 18" },
+  { label: "Twice a day", groom_hours: "0 12" },
+  { label: "Once a day", groom_hours: "0" },
+];
+const REVIEW_OPTIONS = [
+  { label: "Every 5 min (default)", review_interval: "300" },
+  { label: "Every 15 min", review_interval: "900" },
+  { label: "Every 30 min", review_interval: "1800" },
+  { label: "Every hour", review_interval: "3600" },
+];
+
+function cadenceForm(slug) {
+  // The current cadence values for this project arrive via window._cadenceFor
+  // — the project page sets that just before opening the modal so the dropdowns
+  // start on whatever the current schedule is.
+  const cad = (window._cadenceFor && window._cadenceFor[slug]) || {};
+  const pace = (window._paceFor && window._paceFor[slug]) || "custom";
+  const sel = (opts, key) => opts.map((o) =>
+    `<option value="${o[key] ?? ""}"${(cad[key] ?? "") === (o[key] ?? "") ? " selected" : ""}>${o.label}</option>`).join("");
+  return `<h2>How often should ${esc(slug)} run?</h2>
+    <p class="dim">Currently: <b>${PACE_LABEL[pace] || pace}</b>. Pick a different schedule per phase below.</p>
+    <label class="fld"><span>Builds features (ship)</span>
+      <select id="c-ship">${sel(SHIP_OPTIONS, "ship_hours")}</select></label>
+    <label class="fld"><span>Comes up with ideas (groom)</span>
+      <select id="c-groom">${sel(GROOM_OPTIONS, "groom_hours")}</select></label>
+    <label class="fld"><span>Checks the work (review)</span>
+      <select id="c-review">${sel(REVIEW_OPTIONS, "review_interval")}</select></label>
+    <p class="dim" style="font-size:12px">Slower schedules help when GitHub/CI is rate-limiting you or you're managing a usage limit.</p>
+    <div class="frow end">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" data-submit="cadence" data-slug="${esc(slug)}">Apply</button>
+    </div>`;
+}
+
+function fleetPaceForm() {
+  // Show the current pace of each project so the operator can see whether
+  // the fleet is already mixed (e.g. one project on trickle, others on default).
+  const rows = (window._allPaces || []).map(({ slug, pace }) =>
+    `<div class="kv"><span class="lbl">${esc(slug)}</span>${esc(PACE_LABEL[pace] || pace)}</div>`).join("");
+  return `<h2>Set the fleet pace</h2>
+    <p class="dim">Slow every project down at once. Useful when one repo's CI is rate-limiting you or your Anthropic usage is tight. Per-project tuning is still available on each project's page.</p>
+    ${rows ? `<div class="kvbox" style="margin:8px 0 12px">${rows}</div>` : ""}
+    <label class="fld"><span>New pace for everyone</span>
+      <select id="fp-preset">${paceOptions("conservative")}</select></label>
+    <p class="dim" style="font-size:12px">Projects with a currently-running job are skipped — the modal will tell you which ones you need to retry.</p>
+    <div class="frow end">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" data-submit="fleet-pace">Apply to all projects</button>
+    </div>`;
+}
 document.addEventListener("click", (e) => {
   const s = e.target.closest("[data-submit]");
   if (!s) return;
@@ -166,7 +252,18 @@ document.addEventListener("click", (e) => {
       days: +document.getElementById("a-days").value,
       eng: document.getElementById("a-eng").checked,
     });
-  } else {
+  } else if (s.dataset.submit === "cadence") {
+    // Per-phase form. We send the manifest keys directly so the server can
+    // apply any subset (omitted dropdowns stay at their current values).
+    const ship = document.getElementById("c-ship").value;
+    const groom = document.getElementById("c-groom").value;
+    const review = document.getElementById("c-review").value;
+    act("set-cadence", { slug: s.dataset.slug, SHIP_HOURS: ship, GROOM_HOURS: groom, REVIEW_INTERVAL: review });
+  } else if (s.dataset.submit === "fleet-pace") {
+    const preset = document.getElementById("fp-preset").value;
+    if (!confirm(`Apply "${preset}" pace to every project? Currently-running jobs will be skipped.`)) return;
+    act("set-pace-fleet", { preset });
+  } else if (s.dataset.submit === "add") {
     const v = (id) => document.getElementById(id).value.trim();
     if (!v("a-path")) return toast("a folder path is required", false);
     act("register", { path: v("a-path"), name: v("a-name"), days: +document.getElementById("a-days").value, eng: document.getElementById("a-eng").checked });
@@ -275,6 +372,8 @@ async function home() {
   const [data, digestData] = await Promise.all([get("/api/fleet"), fetchDigest()]);
   const alerts = data.alerts || [];
   summary.innerHTML = `${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort · <a href="#/leaderboard" class="navlink">Compare ›</a>`;
+  // Cache pace info so the "Set fleet pace" modal can show the current mix.
+  window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
     digestBanner(digestData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
@@ -284,6 +383,11 @@ async function home() {
        <span>total runs <b class="cost">${data.totals.runs}</b></span>
        <span>this week <b class="cost">${usd(data.projects.reduce((s, p) => s + (p.cost7d || 0), 0))}</b></span>
        <span class="dim">estimated effort · agents run on your Max plan (no real bill)</span>
+     </div></div>
+     <div class="eyebrow" style="margin-top:28px">Pace</div>
+     <div class="card"><div class="metarow" style="align-items:center">
+       <span>Slow the whole fleet down (one click) if GitHub/CI is rate-limiting you or your Anthropic usage is tight.</span>
+       <button class="btn primary" data-modal="fleet-pace">Set fleet pace…</button>
      </div></div>
      <div class="eyebrow" style="margin-top:28px">Monitoring</div>
      <div class="card"><div class="metarow" style="align-items:center">
@@ -415,6 +519,13 @@ async function project(slug, params) {
   // no cost for the extra round-trip.
   const wantAnomalies = params && params.get("view") === "anomalies";
   summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
+  // Stash this project's cadence / pace so cadenceForm() (modal) can pre-fill
+  // its dropdowns with the current values. Lives on window because the modal
+  // template is built from a string and can't capture closures.
+  window._cadenceFor = window._cadenceFor || {};
+  window._cadenceFor[slug] = p.cadence || {};
+  window._paceFor = window._paceFor || {};
+  window._paceFor[slug] = p.pace || "custom";
   const [cls, label] = STATE[p.displayState] || STATE.off;
   const ulBanner = p.usageLimit?.blocked
     ? `<div class="banner bad">Hit Claude usage limit on ${PHASE[p.usageLimit.phase] || p.usageLimit.phase} · ${p.usageLimit.until ? "back in service " + until(p.usageLimit.until) : "until the next reset"}. Subsequent runs will keep failing until then — no need to act.</div>` : "";
@@ -432,6 +543,7 @@ async function project(slug, params) {
       <button class="btn" data-act="resume" data-slug="${p.slug}">Resume all jobs</button>
       <button class="btn" data-act="pause" data-slug="${p.slug}" data-confirm="Pause all of ${esc(p.name)}’s jobs? It will stop working autonomously until resumed.">Pause project</button>
       <button class="btn" data-act="eng-toggle" data-slug="${p.slug}" data-enabled="${p.engEnabled ? "0" : "1"}">${p.engEnabled ? "Turn off code-tidying" : "Also tidy the code"}</button>
+      <button class="btn" data-modal="cadence" data-slug="${p.slug}" title="Pace: ${esc(p.pace || "custom")}">Change schedule…</button>
       <button class="btn primary" data-modal="ticket" data-slug="${p.slug}">Tell it what to build</button>
       <button class="btn" data-embed-toggle data-slug="${p.slug}">Embed badge</button>
     </div>
