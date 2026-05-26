@@ -20,10 +20,10 @@ function tempDb(): { db: ReturnType<typeof openDb>; cleanup: () => void } {
   return { db, cleanup: () => { db.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
-test("doAction(tokens-add): mints a token, writes a control_audit row with actor_name", () => {
+test("doAction(tokens-add): mints a token, writes a control_audit row with actor_name", async () => {
   const { db, cleanup } = tempDb();
   try {
-    const r = doAction(db, "lan", "tokens-add", { name: "phone", scope: "read" }, "laptop");
+    const r = await doAction(db, "lan", "tokens-add", { name: "phone", scope: "read" }, "laptop");
     assert.equal(r.ok, true, r.message);
     // The response includes the plaintext token once.
     const payload = JSON.parse(r.output ?? "{}");
@@ -44,15 +44,15 @@ test("doAction(tokens-add): mints a token, writes a control_audit row with actor
   } finally { cleanup(); }
 });
 
-test("doAction(tokens-revoke): records the revocation in control_audit", () => {
+test("doAction(tokens-revoke): records the revocation in control_audit", async () => {
   const { db, cleanup } = tempDb();
   try {
-    const minted = doAction(db, "lan", "tokens-add", { name: "tablet", scope: "control" }, "laptop");
+    const minted = await doAction(db, "lan", "tokens-add", { name: "tablet", scope: "control" }, "laptop");
     const payload = JSON.parse(minted.output ?? "{}");
     const prefix = payload.id_prefix;
     assert.ok(prefix);
 
-    const r = doAction(db, "lan", "tokens-revoke", { id_prefix: prefix }, "laptop");
+    const r = await doAction(db, "lan", "tokens-revoke", { id_prefix: prefix }, "laptop");
     assert.equal(r.ok, true);
 
     const audits = db.prepare(
@@ -65,10 +65,10 @@ test("doAction(tokens-revoke): records the revocation in control_audit", () => {
   } finally { cleanup(); }
 });
 
-test("doAction: bad scope on tokens-add → ok:false, audit row with exit_code=1", () => {
+test("doAction: bad scope on tokens-add → ok:false, audit row with exit_code=1", async () => {
   const { db, cleanup } = tempDb();
   try {
-    const r = doAction(db, "lan", "tokens-add", { name: "x", scope: "root" }, "laptop");
+    const r = await doAction(db, "lan", "tokens-add", { name: "x", scope: "root" }, "laptop");
     assert.equal(r.ok, false);
     assert.match(r.message, /scope/i);
     const audit = db.prepare("SELECT exit_code, action FROM control_audit ORDER BY id DESC LIMIT 1").get() as any;
@@ -77,11 +77,11 @@ test("doAction: bad scope on tokens-add → ok:false, audit row with exit_code=1
   } finally { cleanup(); }
 });
 
-test("doAction: actor_name defaults to 'local' for local actor when no name passed", () => {
+test("doAction: actor_name defaults to 'local' for local actor when no name passed", async () => {
   const { db, cleanup } = tempDb();
   try {
     // Simulate a CLI/loopback call: actor=local, no explicit actorName.
-    const r = doAction(db, "local", "tokens-add", { name: "from-cli", scope: "read" });
+    const r = await doAction(db, "local", "tokens-add", { name: "from-cli", scope: "read" });
     assert.equal(r.ok, true);
     const audit = db.prepare("SELECT actor, actor_name FROM control_audit ORDER BY id DESC LIMIT 1").get() as any;
     assert.equal(audit.actor, "local");
@@ -89,9 +89,12 @@ test("doAction: actor_name defaults to 'local' for local actor when no name pass
   } finally { cleanup(); }
 });
 
-test("doAction: unknown control action throws (KNOWN_ACTIONS gate still holds)", () => {
+test("doAction: unknown control action rejects (KNOWN_ACTIONS gate still holds)", async () => {
   const { db, cleanup } = tempDb();
   try {
-    assert.throws(() => doAction(db, "lan", "rm-rf-everything", {}, "laptop"), /unknown action/);
+    await assert.rejects(
+      () => doAction(db, "lan", "rm-rf-everything", {}, "laptop"),
+      /unknown action/,
+    );
   } finally { cleanup(); }
 });

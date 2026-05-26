@@ -9,6 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import type { DB } from "./db.ts";
 import { loadConfig } from "./config.ts";
 import * as auth from "./auth.ts";
+import { cleanCheckouts } from "./infra.ts";
 
 const UID = process.getuid?.() ?? 0;
 const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
@@ -20,6 +21,7 @@ const KNOWN_ACTIONS = new Set([
   "kickstart", "pause", "resume", "keep-running", "eng-toggle",
   "pr-merge", "pr-changes", "pr-close", "create-ticket", "register",
   "tokens-add", "tokens-revoke",
+  "clean-checkouts",
 ]);
 
 /** Prefer the working-tree manifest if it still exists (so edits land where the
@@ -71,7 +73,7 @@ function audit(db: DB, actor: string, action: string, target: string, args: unkn
 
 export interface ActionResult { ok: boolean; message: string; output?: string; }
 
-export function doAction(db: DB, actor: string, action: string, body: any, actorName?: string): ActionResult {
+export async function doAction(db: DB, actor: string, action: string, body: any, actorName?: string): Promise<ActionResult> {
   if (!KNOWN_ACTIONS.has(action)) throw new Error(`unknown action '${action}'`);
   if (action === "register") return registerProject(db, body); // no existing project
   if (action === "tokens-add" || action === "tokens-revoke") return tokensAction(db, action, body, actor, actorName);
@@ -133,6 +135,21 @@ export function doAction(db: DB, actor: string, action: string, body: any, actor
       case "create-ticket": {         // "Tell it what to build"
         const url = createTicket(p, body);
         message = `Added to ${slug}'s build list — opened as ${url.trim()}`; out = url; break;
+      }
+      case "clean-checkouts": {       // janitor pass over ~/.cache/<slug>-agent-*-checkout
+        // Refuse while a job is in flight — its checkout is presumably the
+        // working tree, and `rm -rf` underneath a running process is exactly
+        // the kind of footgun this ticket exists to prevent.
+        if (isRunning(p)) { ok = false; message = "A job is running right now — try again in a minute."; break; }
+        const days = Number.isFinite(Number(body?.older_than_days))
+          ? Math.max(0, Math.min(365, Number(body.older_than_days)))
+          : 14;
+        const report = await cleanCheckouts(slug, days);
+        out = report.removed.join("\n");
+        message = report.removed.length
+          ? `Removed ${report.removed.length} stale checkout${report.removed.length === 1 ? "" : "s"} (>${days}d) for ${slug}.`
+          : `No stale checkouts older than ${days}d for ${slug}.`;
+        break;
       }
       default: throw new Error(`unknown action '${action}'`);
     }
