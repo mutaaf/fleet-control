@@ -1,7 +1,7 @@
 ---
 id: 0008
 title: Anomaly detection on run duration and cost
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-05-26
@@ -97,4 +97,10 @@ Sees a red `anomaly` badge on a run; clicks to see the candidate reason
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched `feat/0008-anomaly-detection`
+  from main. Status flipped to `in-progress`. Test scaffold lands first in
+  `tests/anomaly.test.ts`, one node:test scenario per AC checkbox; the
+  helper under test (`src/anomaly.ts`) and the new `anomaly` table follow,
+  then the `bin/fleetctl.ts backfill` wire-up, the
+  `/api/projects/:slug/anomalies` route, and the additive `web/app.js`
+  pill + run-detail badge.
