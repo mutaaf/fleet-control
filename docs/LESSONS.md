@@ -305,3 +305,44 @@ table on every pass; (3) when you need to plant a side-effecting
 file in cwd, snapshot any prior contents and restore on cleanup so
 a developer running tests on a live config doesn't lose their
 admin token.
+
+## 2026-05-26 — "no shell-string exec" static checks should grep the import, not the call site
+
+Symptom: while shipping ticket 0016 (`fleetctl doctor`) I wrote an AC11
+test that grepped `src/doctor.ts` for `\bexec\s*\(` to assert the
+module never uses the shell-string `exec()` variant — and the test
+failed because the doctor module legitimately routes every shell-out
+through `deps.exec("npx", [...])`, a method call on the injected
+dependency surface. The word-boundary regex can't tell the bare
+`exec(cmd)` import from `node:child_process` apart from
+`something.exec(cmd, [args])` on an object. Fix: grep the IMPORT
+instead — `from "node:child_process"` followed by a destructured
+`exec` or `execSync` is the precise thing the rule actually cares
+about. The method-call form is always safe because the dep is wired
+(in production) to `execFile` with an argv array. General rule for
+this repo: when statically asserting a module honours the "no shell
+strings" Hard NO, check the import surface; the call sites can use
+any name (`deps.exec`, `runner`, etc.) and the import is the single
+chokepoint where a shell-string variant could enter. Same pattern
+works for any future "this module must not import X" lint.
+
+## 2026-05-26 — defence-in-depth secret redaction at the renderer boundary
+
+Symptom: ticket 0016's AC10 demands that `fleetctl doctor` never print
+the admin token, GitHub PATs, or repo URLs in EITHER its human or JSON
+output. The natural impulse is "every check must be careful not to
+include the secret in its detail string" — and the doctor checks are
+indeed careful (the config check confirms presence without reading
+the value). But that's one careful author away from a regression: the
+next check that adds, say, a detail line containing
+`process.env.GH_TOKEN` silently leaks it. Fix: add a `redactSecrets()`
+pass at the renderer boundary that strips token-shaped substrings
+(GitHub PATs via the `gh[opusr]_…` prefix; long base64-ish runs with
+at least one letter AND one digit; GitHub HTTPS repo URLs). The AC10
+test plants all three secret shapes in the dep surface and asserts
+neither rendering contains the literals, so a future check author who
+forgets the discipline is caught by the test layer. General rule for
+this repo: any module that renders user/operator data to a terminal
+or HTTP response SHOULD pass the final string through a single
+`redactSecrets()` chokepoint at the boundary — the check authors
+remain primary, but the renderer is the silent backstop.
