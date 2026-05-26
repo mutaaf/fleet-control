@@ -129,6 +129,17 @@ tr.run:hover td { background: var(--panel); color: var(--ink); cursor: pointer; 
 
 #foot { max-width: 1040px; margin: 26px auto 0; padding: 0 20px; font-family: var(--mono); font-size: 11px; color: var(--faint); }
 
+/* Live SSE tool-call line (ticket 0002). Streams the active transcript's
+   tool_use entries directly into the project view — operators see what
+   the agent is doing right now without opening a terminal. */
+.live-now { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px;
+  padding: 8px 12px; background: var(--panel); border: 1px solid var(--line);
+  border-left: 2px solid var(--accent); border-radius: var(--r);
+  font-family: var(--mono); font-size: 12.5px; color: var(--ink); overflow: hidden; }
+.live-now .lbl { color: var(--accent); letter-spacing: .12em; text-transform: uppercase; font-size: 10.5px; }
+.live-now .faint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
+.hidden { display: none !important; }
+
 @media (max-width: 560px) {
   main { padding: 16px 14px 0; } .pname { font-size: 16px; }
   .summary { font-size: 11px; } td, th { padding: 6px 6px; }

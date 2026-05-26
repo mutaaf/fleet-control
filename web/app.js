@@ -127,7 +127,44 @@ document.addEventListener("click", (e) => {
 });
 
 let timer = null;
-const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
+let liveES = null; // live tool-call EventSource (ticket 0002)
+const stop = () => {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (liveES) { try { liveES.close(); } catch (_) { /* */ } liveES = null; }
+};
+
+/** Open an EventSource against /api/projects/:slug/stream and pipe each
+ *  parsed event into a single "Live now" line in the project view. The
+ *  server tail closes after 5 min idle or on transcript rotation; the
+ *  rotate handler re-renders the panel by triggering a route refresh. */
+function attachLiveStream(slug) {
+  if (liveES) { try { liveES.close(); } catch (_) { /* */ } liveES = null; }
+  const tok = localStorage.getItem("fleetToken") || "";
+  const qs = tok ? "?token=" + encodeURIComponent(tok) : "";
+  let es;
+  try { es = new EventSource("/api/projects/" + encodeURIComponent(slug) + "/stream" + qs); }
+  catch (_) { return; }
+  liveES = es;
+  const render = (kind, label) => {
+    const el = document.getElementById("live-now");
+    if (!el) return;
+    el.classList.remove("hidden");
+    el.innerHTML = `<span class="dot working"></span><span class="lbl">live</span> ${esc(kind)} <span class="faint">· ${esc(label)}</span>`;
+  };
+  es.addEventListener("tool-call", (ev) => {
+    try { const d = JSON.parse(ev.data); render(d.name || "tool", d.input_head || ""); } catch (_) { /* */ }
+  });
+  es.addEventListener("text", (ev) => {
+    try { const d = JSON.parse(ev.data); render("thinking", (d.text || "").slice(0, 120)); } catch (_) { /* */ }
+  });
+  es.addEventListener("idle-close", () => { try { es.close(); } catch (_) { /* */ } if (liveES === es) liveES = null; });
+  es.addEventListener("rotate", () => {
+    // A new run started — re-fetch the project view so the "running" badge
+    // and last-run summary flip over without waiting for the 5s poll.
+    setTimeout(() => { if (location.hash === "#/p/" + slug) project(slug).catch(() => {}); }, 50);
+  });
+  es.onerror = () => { /* network blip — EventSource auto-reconnects via retry: 5000 */ };
+}
 
 function telemetry(arr) {
   if (!arr || !arr.length) return "";
@@ -217,6 +254,7 @@ async function project(slug) {
     <div class="metarow"><span class="dim mono">${esc(p.repo)}</span>
       ${p.selfCancelDays != null ? `<span>${p.selfCancelDays < 0 ? "stopped" : "keeps running " + p.selfCancelDays + "d"}</span>` : ""}</div>
     ${ulBanner}${akBanner}${nowBanner(nowEv)}
+    <div id="live-now" class="live-now hidden"></div>
     <div class="actions">
       ${p.selfCancelDays != null && p.selfCancelDays <= 7 ? `<button class="btn primary" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>` : `<button class="btn" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>`}
       <button class="btn" data-act="resume" data-slug="${p.slug}">Resume all jobs</button>
@@ -231,6 +269,10 @@ async function project(slug) {
     <table><thead><tr><th>when</th><th>job</th><th>did</th><th>PR</th><th>tokens</th><th>cost</th></tr></thead>
     <tbody>${p.recent.map(runRow).join("")}</tbody></table>`;
   foot.textContent = "live · " + new Date().toLocaleTimeString();
+  // Attach the SSE tool-call tail only once per project visit; the poll
+  // refreshes the markup around it, but tearing down the EventSource on
+  // every tick would defeat the point.
+  if (!liveES) attachLiveStream(slug);
 }
 function nowBanner(ev) {
   if (!ev) return "";

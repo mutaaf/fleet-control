@@ -1,7 +1,7 @@
 ---
 id: 0002
 title: SSE live tool-call stream from active transcripts
-status: groomed
+status: shipped
 priority: P0
 area: portal
 created: 2026-05-26
@@ -80,4 +80,22 @@ is memorable.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched `feat/0002-sse-toolcall-stream`,
+  flipped status to `in-progress`. Plan: extend `src/live.ts` with a
+  `tailTranscript(slug, onEvent, opts)` helper (readline backfill + fs.watch
+  incremental, 5-min idle timeout, re-open on rotation), add
+  `GET /api/projects/:slug/stream` (text/event-stream; loopback bypass or
+  `x-fleet-token`) in `src/server.ts`, wire an `EventSource` into
+  `web/app.js`'s "Now" panel. Zero new runtime deps — node:fs + node:readline
+  + node:http only.
+- 2026-05-26 — shipped. `tailTranscript()` lives in `src/live.ts` with a
+  helper `parseTranscriptLine()` exported for direct unit testing; the
+  drain loop snapshots the active path so a rotation mid-read can't corrupt
+  offset state (caught by `tests/sse-stream.test.ts`). The server route
+  writes SSE comments (`: ping`) every 25s as a keep-alive past proxies,
+  honors loopback bypass + `x-fleet-token` (header OR `?token=` query so
+  browser `EventSource` works), and tears down the tail on both
+  `req.close` and `res.close`. The SPA wires an `EventSource` once per
+  project visit (not on every 5s poll) and re-fetches the project view on
+  `rotate` so the "running" badge flips over without waiting for the next
+  poll. All 13 tests green; typecheck + validate green.

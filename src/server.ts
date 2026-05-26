@@ -14,6 +14,7 @@ import { fleetView, projectView, runView } from "./views.ts";
 import { doAction } from "./control.ts";
 import { evalAlerts } from "./alerts.ts";
 import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
+import { tailTranscript, type TailEvent } from "./live.ts";
 
 const CONFIG_FILE = join(process.cwd(), "fleet-control.config.json");
 
@@ -36,6 +37,14 @@ function isLoopback(req: any): boolean {
 function controlAuthed(req: any): boolean {
   if (isLoopback(req)) return true; // local portal/CLI is trusted
   const t = String(req.headers["x-fleet-token"] ?? "");
+  if (t.length !== TOKEN.length) return false;
+  try { return timingSafeEqual(Buffer.from(t), Buffer.from(TOKEN)); } catch { return false; }
+}
+/** Auth for the SSE stream: loopback bypasses; remote needs x-fleet-token,
+ *  passed via header OR ?token= query (browser EventSource can't set headers). */
+function streamAuthed(req: any, url: URL): boolean {
+  if (isLoopback(req)) return true;
+  const t = String(req.headers["x-fleet-token"] ?? url.searchParams.get("token") ?? "");
   if (t.length !== TOKEN.length) return false;
   try { return timingSafeEqual(Buffer.from(t), Buffer.from(TOKEN)); } catch { return false; }
 }
@@ -94,6 +103,48 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         });
       }
       if (path === "/api/whoami") return json(res, { loopback: isLoopback(req), needsToken: !isLoopback(req) });
+      // Live SSE tool-call stream (ticket 0002). Plain text/event-stream; tails
+      // the active jsonl transcript and re-opens on rotation. Closes itself
+      // after 5 min of idle or on client disconnect. Loopback bypasses auth;
+      // remote requires x-fleet-token (header or ?token=, since browser
+      // EventSource can't set custom headers).
+      const sm = path.match(/^\/api\/projects\/([\w-]+)\/stream$/);
+      if (sm) {
+        if (!streamAuthed(req, url)) {
+          res.writeHead(401, { "content-type": "text/plain" });
+          return res.end("unauthorized");
+        }
+        const slug = sm[1];
+        const optPhase = url.searchParams.get("phase") ?? undefined;
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+          "connection": "keep-alive",
+          "x-accel-buffering": "no",
+          "access-control-allow-origin": "*",
+        });
+        // SSE retry hint + an immediate "hello" comment so the client knows
+        // the channel is alive even before any transcript bytes arrive.
+        res.write("retry: 5000\n");
+        res.write(": connected\n\n");
+        const send = (e: TailEvent) => {
+          try {
+            const payload = e.path ? { path: e.path, ...(e.data ?? {}) } : (e.data ?? {});
+            res.write(`event: ${e.type}\ndata: ${JSON.stringify(payload)}\n\n`);
+          } catch { /* peer gone; close handler will tidy up */ }
+        };
+        const ctrl = tailTranscript(cfg, slug, (e) => {
+          send(e);
+          if (e.type === "idle-close") { try { res.end(); } catch { /* */ } }
+        }, { phase: optPhase });
+        // Heartbeat comment every 25s — keeps proxies/load balancers from
+        // killing the idle TCP connection without sending a parseable event.
+        const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch { /* */ } }, 25_000);
+        const teardown = () => { clearInterval(hb); ctrl.close(); };
+        req.on("close", teardown);
+        res.on("close", teardown);
+        return;
+      }
       if (path.startsWith("/api/")) {
         maybeIngest(db, cfg);
         if (path === "/api/fleet") return json(res, fleetView(db, cfg));
