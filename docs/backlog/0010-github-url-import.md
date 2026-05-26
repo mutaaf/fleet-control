@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: One-click GitHub-URL project import
-status: groomed
+status: in-progress
 priority: P2
 area: control
 created: 2026-05-26
@@ -97,4 +97,17 @@ manually.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched `feat/0010-github-url-import`,
+  ticket flipped to `in-progress`. Plan: new `register-url` action in
+  `src/control.ts` (admin scope) with strict regex on `repo_url`, gh+git
+  shell-out via `execFile` argv arrays, delegates post-clone scaffolding
+  to existing `registerProject(path, opts)`. Failure mid-flow removes
+  partial `<projectRoots[0]>/<slug>` via the safe-rm helper from 0006.
+  SPA wizard in `web/app.js` grows a second input "Or paste a GitHub URL"
+  with a "Clone & connect" button. Bundling drift fix: 0006 file +
+  index row both flip to `shipped` in the same branch (PR #10 landed
+  but no follow-up `chore(0006)` ever ran). Tests:
+  `tests/register-url.test.ts` covers the bad-url rejection (no
+  shell-out), slug collision, gh-unreachable surfacing, partial cleanup
+  on register failure, audit row shape (no token), and the
+  "register the URL → scaffold files appear" happy path.
