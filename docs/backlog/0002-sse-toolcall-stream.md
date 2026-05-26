@@ -1,7 +1,7 @@
 ---
 id: 0002
 title: SSE live tool-call stream from active transcripts
-status: groomed
+status: in-progress
 priority: P0
 area: portal
 created: 2026-05-26
@@ -80,4 +80,11 @@ is memorable.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched `feat/0002-sse-toolcall-stream`,
+  flipped status to `in-progress`. Plan: extend `src/live.ts` with a
+  `tailTranscript(slug, onEvent, opts)` helper (readline backfill + fs.watch
+  incremental, 5-min idle timeout, re-open on rotation), add
+  `GET /api/projects/:slug/stream` (text/event-stream; loopback bypass or
+  `x-fleet-token`) in `src/server.ts`, wire an `EventSource` into
+  `web/app.js`'s "Now" panel. Zero new runtime deps — node:fs + node:readline
+  + node:http only.
