@@ -8,6 +8,7 @@ import { startServer } from "../src/server.ts";
 import { runDaemon, installDaemon, uninstallDaemon, daemonStatus } from "../src/daemon.ts";
 import { evalAlerts, openAlerts } from "../src/alerts.ts";
 import { mintToken, listTokens, revokeToken, type Scope } from "../src/auth.ts";
+import { syncPricing, pricingRows, DEFAULT_PRICING_FILE } from "../src/pricing.ts";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -149,11 +150,52 @@ function tokens() {
   console.log("usage: fleetctl tokens <add <name> --scope read|control|admin | list | revoke <id-prefix>>");
 }
 
+/** `fleetctl pricing <sync|show>` — manage the model rate table that turns
+ *  raw token counts into the cost figures the portal renders. `sync` reloads
+ *  data/anthropic-pricing.json (path overridable with --file); `show` prints
+ *  the current table including each row's last-synced timestamp. */
+function pricing() {
+  const sub = arg;
+  if (sub === "sync") {
+    const file = flag("file") ?? DEFAULT_PRICING_FILE;
+    const n = syncPricing(db, file);
+    if (n === 0) {
+      console.log(`${c.ylw}no rows synced${c.rst} ${c.dim}(missing or malformed ${file})${c.rst}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${c.grn}synced${c.rst} ${n} model${n === 1 ? "" : "s"} ${c.dim}from ${file}${c.rst}`);
+    return;
+  }
+  if (sub === "show" || sub === undefined) {
+    const rows = pricingRows(db);
+    if (!rows.length) {
+      console.log(`${c.dim}no pricing rows. run: fleetctl pricing sync${c.rst}`);
+      return;
+    }
+    console.log(`\n${c.bold}MODEL                 IN/Mtok  OUT/Mtok  CACHE-RD  CACHE-WR  SYNCED${c.rst}`);
+    console.log(c.dim + "─".repeat(72) + c.rst);
+    for (const r of rows) {
+      console.log(
+        `${r.model.padEnd(20)}  ${("$" + r.input_per_mtok.toFixed(2)).padStart(7)}  `
+        + `${("$" + r.output_per_mtok.toFixed(2)).padStart(8)}  `
+        + `${("$" + r.cache_read_per_mtok.toFixed(2)).padStart(8)}  `
+        + `${("$" + r.cache_write_per_mtok.toFixed(2)).padStart(8)}  `
+        + `${ago(r.fetched_at)}`,
+      );
+    }
+    console.log();
+    return;
+  }
+  console.log("usage: fleetctl pricing <sync [--file path] | show>");
+}
+
 switch (cmd) {
   case "backfill": backfill(); break;
   case "status": case undefined: status(); break;
   case "runs": runsFor(arg ?? ""); break;
   case "show": show(arg ?? ""); break;
+  case "pricing": pricing(); break;
   case "serve": {
     db.close(); // server opens its own handle
     const host = process.env.FLEET_HOST ?? loadConfig().host ?? "127.0.0.1";
@@ -174,6 +216,6 @@ switch (cmd) {
     break;
   }
   case "tokens": tokens(); break;
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run") db.close();

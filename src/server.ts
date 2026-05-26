@@ -14,6 +14,7 @@ import { doAction } from "./control.ts";
 import { evalAlerts } from "./alerts.ts";
 import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
 import { tailTranscript, type TailEvent } from "./live.ts";
+import { pricingRows, lastSyncedAt, syncPricing } from "./pricing.ts";
 import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
   type Scope, type TokenRecord,
@@ -91,6 +92,10 @@ export function startServer(host = "127.0.0.1", port = 7070) {
   // paired devices keep working through the upgrade. After this returns the
   // adminToken field is gone from disk (see src/auth.ts).
   migrateLegacyAdminTokenIfPresent(db, CONFIG_FILE);
+  // Ticket 0004: refresh the pricing table from data/anthropic-pricing.json
+  // on every boot. A missing file is a no-op (DEFAULT_PRICING is already
+  // seeded elsewhere), so this never crashes the server.
+  try { syncPricing(db); } catch { /* keep serving */ }
   runIngestPass(db, cfg); lastIngest = Date.now();
 
   const server = createServer((req, res) => {
@@ -172,6 +177,15 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
         if (path === "/api/fleet") return json(res, fleetView(db, cfg));
+        // Pricing table (ticket 0004). `synced_at` is the most-recent
+        // fetched_at across all rows; `stale` flips true when that's older
+        // than 24h so the SPA footer can render a warn badge.
+        if (path === "/api/pricing") {
+          const rows = pricingRows(db);
+          const synced = lastSyncedAt(db);
+          const stale = synced ? (Date.now() - new Date(synced).getTime()) > 24 * 60 * 60_000 : true;
+          return json(res, { models: rows, synced_at: synced, stale });
+        }
         const pm = path.match(/^\/api\/project\/([\w-]+)$/);
         if (pm) { const v = projectView(db, cfg, pm[1]); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
         // Typed event stream (ticket 0001). Read-only, slug-scoped, capped.

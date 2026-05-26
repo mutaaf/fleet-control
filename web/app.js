@@ -14,7 +14,32 @@ const OUTCOME = {
   "usage-limit": "blocked — Claude limit",
 };
 
-const usd = (n) => (n == null ? "—" : "$" + (+n).toFixed(2));
+// Ticket 0004: pricing-sync metadata, refreshed once per page load. We store
+// just the timestamp + stale flag here; the SPA re-renders the footer string
+// on every route change so the relative time stays current as the page
+// lingers. `stale=true` → cost figures everywhere get a ⚠ warn marker.
+let pricingMeta = { synced_at: null, stale: false, fetched: false };
+async function refreshPricingMeta() {
+  try {
+    const d = await get("/api/pricing");
+    pricingMeta = { synced_at: d.synced_at, stale: !!d.stale, fetched: true };
+  } catch { /* leave defaults — footer just won't show the line */ }
+}
+function pricingFooter() {
+  if (!pricingMeta.fetched) return "";
+  if (!pricingMeta.synced_at) return "pricing not synced yet — run: fleetctl pricing sync";
+  const warn = pricingMeta.stale ? " ⚠ pricing may be stale" : "";
+  return "pricing synced " + ago(pricingMeta.synced_at) + warn;
+}
+const usd = (n) => {
+  if (n == null) return "—";
+  const s = "$" + (+n).toFixed(2);
+  // The ⚠ glyph is inline (text, no extra DOM) so existing table layouts
+  // don't shift. The title attr surfaces the explanation on hover/long-press;
+  // we lean on the surrounding span's title where present rather than wrapping
+  // every usd() call in markup. The icon is appended only when stale.
+  return pricingMeta.stale ? s + " ⚠" : s;
+};
 const toks = (n) => (!n ? "0" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : "" + n);
 const esc = (s) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 function ago(iso) {
@@ -191,7 +216,10 @@ async function home() {
        <button class="btn" data-act="daemon" data-enabled="${data.daemonOn ? "0" : "1"}">${data.daemonOn ? "Turn off" : "Turn on"}</button>
        <span class="dim">When on, the fleet is watched and you get alerts even with this closed (a little background CPU). Off: updates only while open.</span>
      </div></div>`;
-  foot.textContent = "updated " + new Date(data.generatedAt).toLocaleTimeString() + (data.daemonOn ? " · always-on" : "");
+  const pf = pricingFooter();
+  foot.textContent = "updated " + new Date(data.generatedAt).toLocaleTimeString() + (data.daemonOn ? " · always-on" : "") + (pf ? " · " + pf : "");
+  if (pricingMeta.stale) foot.title = "Pricing may be stale (synced >24h ago). Run: fleetctl pricing sync";
+  else foot.removeAttribute("title");
 }
 function alertRow(a) {
   return `<div class="banner ${a.severity === "critical" ? "bad" : ""}" style="margin:0 0 8px">
@@ -268,7 +296,10 @@ async function project(slug) {
     <div class="eyebrow">Recent activity</div>
     <table><thead><tr><th>when</th><th>job</th><th>did</th><th>PR</th><th>tokens</th><th>cost</th></tr></thead>
     <tbody>${p.recent.map(runRow).join("")}</tbody></table>`;
-  foot.textContent = "live · " + new Date().toLocaleTimeString();
+  const pf = pricingFooter();
+  foot.textContent = "live · " + new Date().toLocaleTimeString() + (pf ? " · " + pf : "");
+  if (pricingMeta.stale) foot.title = "Pricing may be stale (synced >24h ago). Run: fleetctl pricing sync";
+  else foot.removeAttribute("title");
   // Attach the SSE tool-call tail only once per project visit; the poll
   // refreshes the markup around it, but tearing down the EventSource on
   // every tick would defeat the point.
@@ -354,4 +385,11 @@ async function route() {
   }
 }
 window.addEventListener("hashchange", route);
+// Kick off the pricing-meta fetch in parallel with the first route — the
+// home view's first paint may land before pricingFooter() has data, which
+// is fine (no line); the 5s refresh interval will pick it up on the next
+// tick. We also re-poll every 5min so a long-lived tab eventually flips
+// the stale warning when fetched_at crosses the 24h mark.
+refreshPricingMeta();
+setInterval(refreshPricingMeta, 5 * 60_000);
 route();
