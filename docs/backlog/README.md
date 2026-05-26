@@ -19,7 +19,7 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
-| 0001 | Ingest events.jsonl from each project | P0 | groomed | ingest |
+| 0001 | Ingest events.jsonl from each project | P0 | in-progress | ingest |
 | 0002 | SSE live tool-call stream from active transcripts | P0 | groomed | portal |
 | 0003 | Per-user scoped tokens with audit log | P1 | groomed | control |
 | 0004 | Live Anthropic pricing sync into pricing table | P1 | groomed | observability |
