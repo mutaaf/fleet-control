@@ -16,6 +16,7 @@ import { evalAlerts } from "./alerts.ts";
 import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
 import { tailTranscript, type TailEvent } from "./live.ts";
 import { pricingRows, lastSyncedAt, syncPricing } from "./pricing.ts";
+import { fetchPrDiff } from "./diff.ts";
 import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
   type Scope, type TokenRecord,
@@ -174,6 +175,31 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         req.on("close", teardown);
         res.on("close", teardown);
         return;
+      }
+      // Inline PR diff (ticket 0007). text/plain body — NOT JSON — so the
+      // SPA can stream it directly into a <div> after escaping. Cached
+      // server-side for 30s per (repo,number). Read scope (loopback
+      // bypasses); malformed slugs / numbers are 400 before any shell-out.
+      // Path shape: /api/prs/<owner>/<name>/<number>/diff — the ":repo"
+      // segment intentionally contains a "/" because it's owner/name.
+      const dfm = path.match(/^\/api\/prs\/([^/]+\/[^/]+)\/(\d+)\/diff$/);
+      if (dfm && req.method === "GET") {
+        const dauth = requireAuth(db, req, "read", url);
+        if (!dauth.ok) {
+          res.writeHead(dauth.status, { "content-type": "text/plain" });
+          return res.end(dauth.message);
+        }
+        return fetchPrDiff(dfm[1], dfm[2]).then((r) => {
+          res.writeHead(r.status, {
+            "content-type": "text/plain; charset=utf-8",
+            "x-diff-truncated": r.truncated ? "1" : "0",
+            "cache-control": "no-store",
+          });
+          res.end(r.body);
+        }).catch((e: any) => {
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.end(String(e?.message ?? e));
+        });
       }
       if (path.startsWith("/api/")) {
         // All read endpoints require the `read` scope (loopback bypasses).
