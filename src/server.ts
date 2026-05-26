@@ -9,7 +9,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor } from "./views.ts";
 import { doAction } from "./control.ts";
 import { evalAlerts } from "./alerts.ts";
 import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.ts";
@@ -188,6 +188,11 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         }
         const pm = path.match(/^\/api\/project\/([\w-]+)$/);
         if (pm) { const v = projectView(db, cfg, pm[1]); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
+        // 30-day cost forecast (ticket 0005). New route; no existing JSON
+        // shape to preserve. Returns null when fewer than 3 days of data
+        // exist (the view surfaces "not enough yet" instead of a number).
+        const fm = path.match(/^\/api\/projects\/([\w-]+)\/forecast$/);
+        if (fm) { const v = forecastFor(db, fm[1]); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
         // Typed event stream (ticket 0001). Read-only, slug-scoped, capped.
         const em = path.match(/^\/api\/projects\/([\w-]+)\/events$/);
         if (em) {
