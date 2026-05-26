@@ -115,3 +115,24 @@ is just "did this URL shape want this handler?" — keep it permissive on
 contents and defer real validation to a typed helper so error messages
 stay precise (400 "bad repo" vs a confusing 404). Same pattern will help
 when adding any future route that takes a GitHub identifier.
+
+## 2026-05-26 — anomaly tests need σ > 0 in the fixture, not just mean ≠ value
+
+Symptom: while shipping ticket 0008 (anomaly detection on duration/cost),
+the spec's example case "same baseline + a 15s run → no anomaly" passed
+on paper but my first fixture made it impossible to express cleanly. I
+had seeded 14 prior runs all at exactly 10000ms with ±1ms jitter so the
+population stddev was ≈ 0.5ms. With σ ≈ 0.5ms, *any* run > 10003ms is
+"~10000σ above the baseline" — both the 60s outlier (intended to fire)
+and the 15s near-baseline (intended NOT to fire) sit absurdly far outside
+the 3σ band. The detector did exactly what the spec said, but the test
+fixture didn't reflect operator reality (a real ship-phase baseline has
+multi-second spread). Cause: stddev compresses to ~0 on perfectly flat
+fake data, which makes the σ multiplier infinite for any deviation. Fix:
+the "15s within 3σ" case needs a fixture that produces realistic σ —
+I used a mix of 6s/8s/10s/12s/14s prior runs so σ ≈ 2.4s and the 3σ band
+covers ~10s ± 7s. The 60s case is still ~21σ above this wider baseline so
+the detector remains useful in BOTH scenarios. General rule for any
+threshold-style detector (forecast bands, regression alerts, drift
+detectors): the test fixture's σ must be wide enough that "within bounds"
+is geometrically meaningful, not just an artifact of a flat baseline.
