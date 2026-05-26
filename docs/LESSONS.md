@@ -33,3 +33,30 @@ inside the SCHEMA template (quote SQL identifiers with plain words instead),
 or hoist the comment outside the template. The TypeScript compiler doesn't
 catch this because `tsc --noEmit` parses the file fine — only the runtime
 type-stripper fails, so tests are the only signal.
+
+## 2026-05-26 — async streaming tails: snapshot the path before each read
+
+Symptom: the SSE tail's rotation test (`tests/sse-stream.test.ts`) passed
+when run as a standalone script but failed under `node --test` with the
+parser receiving zero events from the rotated file — only the OLD file's
+content showed up, then nothing. Cause: my `drainFrom()` closure captured a
+`path` argument, but when an `fs.watch` callback fired mid-read and a
+rotation poll also fired, the `attach(newPath)` ran in between — resetting
+`offset=0` and `currentPath=newPath`. The previous read's `stream.on("end")`
+then overwrote `offset` with the OLD file's size and the next drain read
+past EOF of the new file. Fix: in any tail that can rotate, snapshot the
+path at the start of each read (`const readingPath = currentPath`) and on
+`end`, bail out without mutating offset/partial if `readingPath !==
+currentPath`. The general lesson: a tail's "current file" state is mutable
+across awaits, so every async boundary inside the drain loop must
+re-validate which file the in-flight bytes belong to.
+
+## 2026-05-26 — node test-runner timing is jittery; poll, don't sleep
+
+Symptom: `tests/sse-stream.test.ts` passed in isolation but flaked under
+the full `tests/*.test.ts` run — backfill needed >80ms when other test
+files were also scheduling readline streams. Cause: sequential `wait(80)`
+guesses are brittle under load. Fix: helper `waitFor(predicate, maxMs)`
+that polls every 20ms up to a generous timeout, then asserts. Same
+principle as flaky web-driver tests — assert on the *condition*, not on a
+sleep length.
