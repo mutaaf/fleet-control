@@ -1,7 +1,7 @@
 ---
 id: 0019
 title: prs_merged count reads from runs not control_audit
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-05-26
@@ -82,6 +82,8 @@ control_audit row → never get counted.
 
 - 2026-05-26 — implementation-dev: flipped status to `in-progress`; opened
   branch `feat/0019-prs-merged-from-runs` off origin/main.
+- 2026-05-26 — implementation-dev: PR #39 merged to main (gating checks
+  green: `typecheck`, `validate`). Status flipped to `shipped`.
 - 2026-05-26 — implementation-dev: wired `mergedRunsByProject(db, period)`
   in `src/digest.ts` to count DISTINCT `pr_number` from shipped runs;
   `weeklyDigest()` now sources `prs_merged` (totals + per-project) from
