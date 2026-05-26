@@ -100,6 +100,9 @@ export function fleetView(db: DB, cfg: FleetConfig) {
       selfCancelDays: scDays, engEnabled: !!p.eng_enabled,
       cost: agg.cost ?? 0, cost7d: cost7.c ?? 0, runs: agg.runs ?? 0,
       jobs, telemetry, usageLimit: usage, autoKill, forecast, anomalies,
+      // cadence: full schedule (so the SPA can show "every 6h, twice daily…")
+      // and label the active pace preset when it matches a known one.
+      cadence, pace: paceLabel(cadence),
     });
   }
   // Total-fleet forecast = sum of per-project projections (null projections
@@ -140,7 +143,32 @@ export function projectView(db: DB, cfg: FleetConfig, slug: string) {
     displayState: displayState(jobs, selfCancelDays(p.self_cancel), usage),
     jobs, recent, costByPhase: byPhase, prs: projectPRs(db, p.id),
     usageLimit: usage, autoKill,
+    cadence, pace: paceLabel(cadence),
   };
+}
+
+/** Inverse of PACE_PRESETS in control.ts: given a cadence, return the matching
+ *  preset name (aggressive/steady/conservative/trickle) or "custom" when the
+ *  combination doesn't match any preset. Pure string comparison — no need to
+ *  share the constant with control.ts since the values are stable. */
+function paceLabel(cadence: Record<string, string>): string {
+  const k = (v: string | undefined, dflt: string) => (v ?? dflt).trim().replace(/\s+/g, " ");
+  const sig = [
+    k(cadence.ship_hours, ""),
+    k(cadence.ship_minute, "41"),
+    k(cadence.groom_hours, "0 6 12 18"),
+    k(cadence.groom_minute, "17"),
+    k(cadence.review_interval, "300"),
+    k(cadence.eng_hours, "3 9 15 21"),
+    k(cadence.eng_minute, "23"),
+  ].join("|");
+  const known: Record<string, string> = {
+    "|41|0 6 12 18|17|300|3 9 15 21|23": "aggressive",
+    "0 2 4 6 8 10 12 14 16 18 20 22|41|0 12|17|900|0 12|23": "steady",
+    "0 6 12 18|41|0|17|1800|0|23": "conservative",
+    "0 12|41|0|17|3600|0|23": "trickle",
+  };
+  return known[sig] ?? "custom";
 }
 
 /** 30-day cost forecast per project (ticket 0005). Reads the existing

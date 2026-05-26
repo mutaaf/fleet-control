@@ -106,6 +106,10 @@ export function nextFire(cadence: Record<string, string>, phase: string, selfCan
   };
   if (phase === "ship") {
     const min = +(cadence.ship_minute ?? 41);
+    // SHIP_HOURS is optional. When set, ship behaves like groom/eng (fires only
+    // at the listed hours). When empty, the original "every hour at :MM" path.
+    const hours = (cadence.ship_hours ?? "").trim();
+    if (hours) return at(hours.split(/\s+/).map(Number), min).toISOString();
     const t = new Date(now); t.setMinutes(min, 0, 0);
     if (t.getTime() <= now.getTime()) t.setHours(now.getHours() + 1);
     return t.toISOString();

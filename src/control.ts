@@ -28,6 +28,10 @@ const KNOWN_ACTIONS = new Set([
   // Ticket 0013: read-only share snapshots. snapshot-create freezes
   // the anonymized fleet view; snapshot-revoke kills a live link.
   "snapshot-create", "snapshot-revoke",
+  // Cadence control (this PR). set-cadence is per-(project,phase) fine
+  // control; set-pace is a named preset for one project; set-pace-fleet
+  // applies a preset across every project at once.
+  "set-cadence", "set-pace", "set-pace-fleet",
 ]);
 
 /** Strict regex for GitHub HTTPS repo URLs (ticket 0010). Owner/name must
@@ -36,6 +40,57 @@ const KNOWN_ACTIONS = new Set([
  *  suffix). Anything else — SSH, http, query strings, extra path segments,
  *  shell metas — is rejected upstream of any child process. */
 const GH_URL_RE = /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(\.git)?$/;
+
+// Cadence keys that set-cadence / set-pace may write to the manifest. Any key
+// not in this list is rejected — keeps the action from being a generic
+// manifest-editor that could clobber identity fields.
+const CADENCE_KEYS = new Set([
+  "SHIP_HOURS", "SHIP_MINUTE", "GROOM_HOURS", "GROOM_MINUTE",
+  "REVIEW_INTERVAL", "ENG_HOURS", "ENG_MINUTE",
+]);
+
+/** Four named paces. Each maps to a full cadence set so the operator can
+ * slow a project (or the whole fleet) down with one click. Aggressive is the
+ * historical default (no SHIP_HOURS → ship every hour). Steady, conservative
+ * and trickle dial things down progressively — used when a project is under
+ * rate-limit or account-suspension pressure. */
+const PACE_PRESETS: Record<string, Record<string, string>> = {
+  aggressive: {
+    SHIP_HOURS: "", SHIP_MINUTE: "41",
+    GROOM_HOURS: "0 6 12 18", GROOM_MINUTE: "17",
+    REVIEW_INTERVAL: "300",
+    ENG_HOURS: "3 9 15 21", ENG_MINUTE: "23",
+  },
+  steady: {
+    SHIP_HOURS: "0 2 4 6 8 10 12 14 16 18 20 22", SHIP_MINUTE: "41",
+    GROOM_HOURS: "0 12", GROOM_MINUTE: "17",
+    REVIEW_INTERVAL: "900",
+    ENG_HOURS: "0 12", ENG_MINUTE: "23",
+  },
+  conservative: {
+    SHIP_HOURS: "0 6 12 18", SHIP_MINUTE: "41",
+    GROOM_HOURS: "0", GROOM_MINUTE: "17",
+    REVIEW_INTERVAL: "1800",
+    ENG_HOURS: "0", ENG_MINUTE: "23",
+  },
+  trickle: {
+    SHIP_HOURS: "0 12", SHIP_MINUTE: "41",
+    GROOM_HOURS: "0", GROOM_MINUTE: "17",
+    REVIEW_INTERVAL: "3600",
+    ENG_HOURS: "0", ENG_MINUTE: "23",
+  },
+};
+
+function applyCadence(p: Proj, values: Record<string, string>): string {
+  if (isRunning(p)) throw new Error("a job is running right now — try again in a minute");
+  const mdir = manifestDirFor(p);
+  const mfile = manifestFileFor(p);
+  for (const [key, value] of Object.entries(values)) {
+    if (!CADENCE_KEYS.has(key)) continue; // ignore unknown keys silently
+    editOrAppendManifest(mfile, key, String(value));
+  }
+  return run("bash", [KIT_INSTALL, mdir]);
+}
 
 /** Prefer the working-tree manifest if it still exists (so edits land where the
  * user can `git commit` them, and install.sh has a distinct src/dst for cp).
@@ -103,6 +158,7 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
   if (action === "snapshot-create" || action === "snapshot-revoke") {
     return snapshotAction(db, action, body, actor, actorName);
   }
+  if (action === "set-pace-fleet") return setPaceFleet(db, body, actor, actorName);
   const slug = body?.slug;
   if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
   const p = project(db, slug);
@@ -161,6 +217,19 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
       case "create-ticket": {         // "Tell it what to build"
         const url = createTicket(p, body);
         message = `Added to ${slug}'s build list — opened as ${url.trim()}`; out = url; break;
+      }
+      case "set-cadence": {           // per-phase fine control over how often each agent runs
+        // body may carry any subset of CADENCE_KEYS. applyCadence ignores
+        // unknown keys; rejects when a job is currently running.
+        out = applyCadence(p, body || {});
+        message = `Schedule updated for ${slug}.`; break;
+      }
+      case "set-pace": {              // named preset (aggressive | steady | conservative | trickle)
+        const preset = String(body?.preset || "").toLowerCase();
+        const cfg = PACE_PRESETS[preset];
+        if (!cfg) throw new Error(`unknown pace '${preset}' — use aggressive, steady, conservative, or trickle`);
+        out = applyCadence(p, cfg);
+        message = `${slug} set to ${preset} pace.`; break;
       }
       case "clean-checkouts": {       // janitor pass over ~/.cache/<slug>-agent-*-checkout
         // Refuse while a job is in flight — its checkout is presumably the
@@ -488,11 +557,55 @@ async function registerFromUrl(db: DB, body: any, actor: string, actorName?: str
   }
 }
 
-/** Key-targeted line rewrite of a shell manifest (preserves comments/order). */
+/** Key-targeted line rewrite of a shell manifest (preserves comments/order).
+ *  Errors if the key is missing — used for required fields like SELF_CANCEL. */
 function editManifest(path: string, key: string, value: string): void {
   if (!existsSync(path)) throw new Error("manifest not found");
   const text = readFileSync(path, "utf8");
   const re = new RegExp(`^(${key}=)("?)([^"#\\n]*)("?)(.*)$`, "m");
   if (!re.test(text)) throw new Error(`${key} not in manifest`);
   writeFileSync(path, text.replace(re, `$1"${value}"$5`));
+}
+
+/** Same as editManifest, but appends a new line when the key isn't present.
+ *  Needed for optional cadence keys (e.g. SHIP_HOURS) that older manifests
+ *  pre-dated; set-cadence / set-pace use this so a fresh slowdown works on
+ *  any manifest regardless of vintage. */
+function editOrAppendManifest(path: string, key: string, value: string): void {
+  if (!existsSync(path)) throw new Error("manifest not found");
+  const text = readFileSync(path, "utf8");
+  const re = new RegExp(`^(${key}=)("?)([^"#\\n]*)("?)(.*)$`, "m");
+  if (re.test(text)) {
+    writeFileSync(path, text.replace(re, `$1"${value}"$5`));
+  } else {
+    const pad = text.endsWith("\n") ? "" : "\n";
+    writeFileSync(path, text + pad + `${key}="${value}"\n`);
+  }
+}
+
+/** Apply a named pace preset to every project that isn't currently running.
+ *  Returns an aggregated result so the UI can show "applied to 3 of 5 — 2 had
+ *  a job firing." Running projects are reported so the operator can retry. */
+function setPaceFleet(db: DB, body: any, actor: string, actorName?: string): ActionResult {
+  const preset = String(body?.preset || "").toLowerCase();
+  const cfg = PACE_PRESETS[preset];
+  if (!cfg) return { ok: false, message: `unknown pace '${preset}' — use aggressive, steady, conservative, or trickle` };
+  const projects = db.prepare("SELECT id,slug,namespace,manifest_path,repo_owner,repo_name,repo_url FROM project").all() as unknown as Proj[];
+  const applied: string[] = [], skipped: Array<{ slug: string; reason: string }> = [];
+  for (const p of projects) {
+    try {
+      applyCadence(p, cfg);
+      applied.push(p.slug);
+      audit(db, actor, "set-pace", `${p.slug}/*`, { preset, source: "fleet" }, 0, "ok", actorName);
+    } catch (e: any) {
+      const reason = String(e?.message ?? e).slice(0, 200);
+      skipped.push({ slug: p.slug, reason });
+      audit(db, actor, "set-pace", `${p.slug}/*`, { preset, source: "fleet" }, 1, reason, actorName);
+    }
+  }
+  const ok = skipped.length === 0;
+  const parts: string[] = [];
+  if (applied.length) parts.push(`set ${applied.length} project${applied.length === 1 ? "" : "s"} to ${preset}`);
+  if (skipped.length) parts.push(`skipped ${skipped.length} (${skipped.map((s) => s.slug).join(", ")} — try again in a minute)`);
+  return { ok, message: parts.join("; "), output: JSON.stringify({ applied, skipped }) };
 }

@@ -38,6 +38,7 @@ function parseManifest(path: string): Manifest | null {
     selfCancel: v.SELF_CANCEL ?? "",
     engEnabled: v.ENG_ENABLED === "1",
     cadence: {
+      ship_hours: v.SHIP_HOURS ?? "",                // optional; empty = every hour
       ship_minute: v.SHIP_MINUTE ?? "41",
       groom_hours: v.GROOM_HOURS ?? "0 6 12 18",
       groom_minute: v.GROOM_MINUTE ?? "17",
