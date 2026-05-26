@@ -20,6 +20,13 @@ export interface FleetConfig {
   host?: string;
   /** Server port. */
   port?: number;
+  /** ntfy.sh topic for push notifications (ticket 0009). Empty/unset →
+   *  ntfy disabled; osascript stays the only channel. */
+  ntfyTopic?: string;
+  /** Base portal URL for ntfy click-through. Defaults to the loopback SPA
+   *  hash route `http://127.0.0.1:7070/#/p/`. The project slug is
+   *  appended per notification. */
+  portalUrl?: string;
 }
 
 const DEFAULTS: FleetConfig = {

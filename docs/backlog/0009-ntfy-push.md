@@ -91,3 +91,12 @@ The kit becomes operable from anywhere, on any device, with zero infra.
   the same key as osascript, dispatch on new `anomaly` rows too, add
   `fleetctl ntfy test` CLI subcommand. Tests stub `node:https` via
   `setHttpsRequest()` injection — no global monkey-patching.
+- 2026-05-26 — implementation-dev: landed `src/ntfy.ts` (new module —
+  keeps `src/alerts.ts` from getting any wider) with `sendNtfy`,
+  `setHttpsRequest`/`resetHttpsRequest` test seam, `ntfyForAlert`,
+  `ntfyForAnomaly`, `ntfyConfigFrom`, and `ntfyTestCommand`. Wired
+  `src/alerts.ts` to fire ntfy alongside osascript per new alert row
+  AND for any anomaly created in the last 24h. Added `fleetctl ntfy
+  test` subcommand. New `ntfyTopic` + `portalUrl` fields on
+  `FleetConfig` (both optional). 12 new tests in `tests/ntfy.test.ts`
+  cover every AC checkbox; full suite 96/96 green.
