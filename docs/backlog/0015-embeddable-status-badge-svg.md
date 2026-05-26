@@ -1,7 +1,7 @@
 ---
 id: 0015
 title: Embeddable status badge SVG per project
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-05-26
@@ -145,4 +145,7 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26: branched `feat/0015-embeddable-status-badge-svg` from
+  `origin/main`. Flipped status to `in-progress`. Tests first per AC,
+  then the implementation in `src/badge.ts`, a new `GET /badge/<slug>.svg`
+  route in `src/server.ts`, and the "Embed" panel in `web/app.js`.

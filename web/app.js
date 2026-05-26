@@ -433,7 +433,9 @@ async function project(slug, params) {
       <button class="btn" data-act="pause" data-slug="${p.slug}" data-confirm="Pause all of ${esc(p.name)}’s jobs? It will stop working autonomously until resumed.">Pause project</button>
       <button class="btn" data-act="eng-toggle" data-slug="${p.slug}" data-enabled="${p.engEnabled ? "0" : "1"}">${p.engEnabled ? "Turn off code-tidying" : "Also tidy the code"}</button>
       <button class="btn primary" data-modal="ticket" data-slug="${p.slug}">Tell it what to build</button>
+      <button class="btn" data-embed-toggle data-slug="${p.slug}">Embed badge</button>
     </div>
+    ${renderEmbedPanel(p.slug)}
     ${prSection(p)}
     <div class="eyebrow">The jobs</div>
     ${p.jobs.map((j) => jobCard(j, p.slug)).join("")}
@@ -548,6 +550,65 @@ function prSection(p) {
       </div>
     </div>`).join("");
 }
+
+// ---- Embed badge panel (ticket 0015) -------------------------------------
+// Three copy-buttons (one per metric) — each stamps a markdown snippet the
+// operator can paste into a project's README. We never fetch the SVG from
+// JS; the panel is purely a clipboard-helper for the /badge/<slug>.svg
+// URL the server already serves. Using location.origin keeps the URL
+// correct regardless of host/port (loopback vs LAN at 0.0.0.0:7070).
+function renderEmbedPanel(slug) {
+  // Each metric becomes a row: label, copy-button, read-only textarea
+  // pre-populated with the markdown. The textarea is selectable so a
+  // device without clipboard-API support can still copy by hand.
+  const metrics = [
+    { id: "status", label: "Status", desc: "last run outcome" },
+    { id: "cost", label: "Cost (7d)", desc: "trailing-week spend" },
+    { id: "ship", label: "Last shipped", desc: "relative age" },
+  ];
+  const row = (m) => {
+    const md = "![fleet-control](" + location.origin + "/badge/" + slug + ".svg?metric=" + m.id + ")";
+    return `<div class="embed-row">
+      <div class="embed-label"><b>${esc(m.label)}</b> <span class="dim">${esc(m.desc)}</span></div>
+      <textarea class="embed-snippet mono" readonly data-snippet>${esc(md)}</textarea>
+      <button class="btn sm" data-metric="${esc(m.id)}" data-embed-copy>Copy</button>
+    </div>`;
+  };
+  return `<div class="embed-panel hidden" data-embed-panel data-slug="${esc(slug)}">
+    <div class="embed-head dim">Paste one of these into the project's README. The badge updates from this fleet's data; it's host-neutral so the SVG bytes won't leak your laptop's IP.</div>
+    ${metrics.map(row).join("")}
+  </div>`;
+}
+// Click handlers — toggle the panel + handle the per-row copy buttons.
+// We bind document-level so the polled re-renders of the project view
+// don't lose state. The copy uses navigator.clipboard.writeText when
+// available; a prompt() fallback lets the operator copy by hand on
+// browsers without the clipboard API (older Safari, niche setups).
+document.addEventListener("click", (e) => {
+  const toggle = e.target.closest("[data-embed-toggle]");
+  if (toggle) {
+    e.preventDefault();
+    const panel = document.querySelector("[data-embed-panel]");
+    if (panel) panel.classList.toggle("hidden");
+    return;
+  }
+  const copy = e.target.closest("[data-embed-copy]");
+  if (!copy) return;
+  e.preventDefault();
+  const row = copy.closest(".embed-row");
+  const ta = row && row.querySelector("[data-snippet]");
+  if (!ta) return;
+  const text = ta.value;
+  const onOk = () => { copy.textContent = "Copied"; setTimeout(() => (copy.textContent = "Copy"), 1200); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(onOk).catch(() => {
+      // Permission denied / non-secure context — fall through to prompt.
+      window.prompt("Copy this markdown snippet:", text);
+    });
+  } else {
+    window.prompt("Copy this markdown snippet:", text);
+  }
+});
 
 // ---- Inline PR diff (ticket 0007) ----------------------------------------
 // Click the PR card head → toggle .pr-expand and lazy-load the diff once.
