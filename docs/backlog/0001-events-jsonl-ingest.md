@@ -1,7 +1,7 @@
 ---
 id: 0001
 title: Ingest events.jsonl from each project
-status: in-progress
+status: shipped
 priority: P0
 area: ingest
 created: 2026-05-26
@@ -88,3 +88,6 @@ recognizes immediately.
   `/api/projects/:slug/events?limit=N` (slug-scoped, no auth — read-only
   read-side). "Now" panel additive: when most recent `run_started` is within
   30 min, show `phase` from the event; else keep transcript-tail fallback.
+- 2026-05-26 — implementation-dev: PR #1 merged (typecheck + validate green).
+  All 4 unit tests pass locally. Zero new runtime deps. Flipping ticket +
+  index to `shipped`.
