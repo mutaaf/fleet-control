@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: Shareable read-only fleet snapshot with anonymized slugs
-status: proposed
+status: in-progress
 priority: P2
 area: portal
 created: 2026-05-26
@@ -161,4 +161,7 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — `implementation-dev` started on branch
+  `feat/0013-shareable-fleet-snapshot`. Frontmatter and README index moved
+  to `in-progress`. Test-first work begins with `tests/snapshot.test.ts`.
+
