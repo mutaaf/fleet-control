@@ -1,7 +1,7 @@
 ---
 id: 0008
 title: Anomaly detection on run duration and cost
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-05-26
@@ -104,3 +104,7 @@ Sees a red `anomaly` badge on a run; clicks to see the candidate reason
   then the `bin/fleetctl.ts backfill` wire-up, the
   `/api/projects/:slug/anomalies` route, and the additive `web/app.js`
   pill + run-detail badge.
+- 2026-05-26 — implementation-dev: PR #17 merged with `typecheck` +
+  `validate` both green. Flipping ticket + README index row to `shipped`
+  on a separate `chore/0008-mark-shipped` branch per the convention set
+  by tickets 0001/0004/0007.

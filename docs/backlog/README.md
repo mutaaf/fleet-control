@@ -26,7 +26,7 @@ proposes new ones, `review` grades them.
 | 0005 | 30-day cost forecast per project | P1 | shipped | observability |
 | 0006 | Stale-checkout janitor with disk view | P1 | in-progress | infra |
 | 0007 | Inline PR diff with sticky action bar | P1 | shipped | portal |
-| 0008 | Anomaly detection on run duration and cost | P2 | in-progress | observability |
+| 0008 | Anomaly detection on run duration and cost | P2 | shipped | observability |
 | 0009 | ntfy push notifications for high-priority events | P2 | groomed | observability |
 | 0010 | One-click GitHub-URL project import | P2 | groomed | control |
 | 0011 | Mobile-first portal pass for home and project pages | P1 | shipped | portal |
