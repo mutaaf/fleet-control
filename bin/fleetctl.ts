@@ -12,6 +12,8 @@ import { syncPricing, pricingRows, DEFAULT_PRICING_FILE } from "../src/pricing.t
 import { flagRun } from "../src/anomaly.ts";
 import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
 import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
+import { listSnapshots } from "../src/snapshot.ts";
+import { doAction } from "../src/control.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import { homedir } from "node:os";
@@ -247,12 +249,84 @@ function digest() {
   }
 }
 
+/** `fleetctl snapshot <create <name> | list | revoke <id-prefix>>` — ticket
+ *  0013. Mints a shareable read-only snapshot (anonymized fleet view),
+ *  prints the share URL once, and lists / revokes existing ones. The
+ *  plaintext token is printed ONCE on create — same discipline as
+ *  `fleetctl tokens add`. The audit row carries only the id_prefix. */
+async function snapshot() {
+  const sub = arg;
+  if (sub === "create") {
+    const name = argv.slice(2).join(" ").trim();
+    if (!name) {
+      console.log("usage: fleetctl snapshot create <name>");
+      process.exitCode = 1; return;
+    }
+    try {
+      // Honour an explicit FLEET_BASE_URL so an operator running the
+      // server on a LAN host can mint share links their friends can
+      // actually reach. Default 127.0.0.1:7070 matches the loopback
+      // SPA's footer assumption.
+      const baseUrl = process.env.FLEET_BASE_URL;
+      const r = await doAction(db, "local", "snapshot-create",
+        baseUrl ? { name, base_url: baseUrl } : { name },
+        "local");
+      if (!r.ok) {
+        console.error(`${c.red}error:${c.rst} ${r.message}`);
+        process.exitCode = 1; return;
+      }
+      const m = JSON.parse(r.output ?? "{}") as {
+        id_prefix: string; token: string; share_url: string; name: string; expires_at: string;
+      };
+      console.log(`${c.grn}minted${c.rst} ${c.bold}${m.name}${c.rst} ${c.dim}(id ${m.id_prefix}, expires ${m.expires_at})${c.rst}`);
+      console.log(`${c.ylw}share URL (shown once — anyone with this link can view the snapshot):${c.rst}\n  ${m.share_url}`);
+    } catch (e: any) {
+      console.error(`${c.red}error:${c.rst} ${e?.message ?? e}`); process.exitCode = 1;
+    }
+    return;
+  }
+  if (sub === "list" || sub === undefined) {
+    const rows = listSnapshots(db);
+    if (!rows.length) return console.log(`${c.dim}no snapshots. mint one with: fleetctl snapshot create <name>${c.rst}`);
+    console.log(`\n${c.bold}ID-PREFIX  NAME                          CREATED          EXPIRES          STATE${c.rst}`);
+    console.log(c.dim + "─".repeat(80) + c.rst);
+    for (const r of rows) {
+      const state = r.revoked_at
+        ? c.red + "revoked" + c.rst
+        : (new Date(r.expires_at).getTime() <= Date.now() ? c.dim + "expired" + c.rst : c.grn + "active" + c.rst);
+      console.log(
+        `${r.id_prefix}   ${r.name.padEnd(28)}  ${ago(r.created_at).padEnd(14)}   ${ago(r.expires_at).padEnd(14)}   ${state}`,
+      );
+    }
+    console.log();
+    return;
+  }
+  if (sub === "revoke") {
+    const prefix = argv[2];
+    if (!prefix) {
+      console.log("usage: fleetctl snapshot revoke <id-prefix>");
+      process.exitCode = 1; return;
+    }
+    try {
+      const r = await doAction(db, "local", "snapshot-revoke", { id_prefix: prefix }, "local");
+      if (r.ok) console.log(`${c.grn}revoked${c.rst} ${prefix}`);
+      else { console.log(`${c.ylw}${r.message}${c.rst}`); process.exitCode = 1; }
+    } catch (e: any) {
+      console.error(`${c.red}error:${c.rst} ${e?.message ?? e}`); process.exitCode = 1;
+    }
+    return;
+  }
+  console.log("usage: fleetctl snapshot <create <name> | list | revoke <id-prefix>>");
+  process.exitCode = 1;
+}
+
 switch (cmd) {
   case "backfill": backfill(); break;
   case "status": case undefined: status(); break;
   case "runs": runsFor(arg ?? ""); break;
   case "show": show(arg ?? ""); break;
   case "pricing": pricing(); break;
+  case "snapshot": await snapshot(); break;
   case "serve": {
     db.close(); // server opens its own handle
     const host = process.env.FLEET_HOST ?? loadConfig().host ?? "127.0.0.1";
@@ -284,6 +358,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run") db.close();

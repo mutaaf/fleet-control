@@ -162,6 +162,23 @@ CREATE TABLE IF NOT EXISTS anomaly (
   UNIQUE(run_id, kind)
 );
 CREATE INDEX IF NOT EXISTS anomaly_created_at ON anomaly(created_at DESC);
+
+-- Shareable read-only snapshots (ticket 0013). id is the SHA-256 hex
+-- digest of the secret share token — the plaintext token is never
+-- stored, same pattern as auth_token. payload_json carries the
+-- frozen anonymized fleet view. Revocation is a timestamp, not a row
+-- delete, so an audit-trail of "this URL was killed at T" stays
+-- queryable. Expiry is a separate timestamp the GET handler compares
+-- against now() to choose 200 vs 410.
+CREATE TABLE IF NOT EXISTS snapshot (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  revoked_at   TEXT,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshot_created_at ON snapshot(created_at DESC);
 `;
 
 export type DB = DatabaseSync;

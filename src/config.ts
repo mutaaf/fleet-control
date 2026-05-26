@@ -48,6 +48,11 @@ export function loadConfig(): FleetConfig {
       Object.assign(cfg, JSON.parse(readFileSync(local, "utf8")));
     } catch { /* ignore malformed local config */ }
   }
+  // Env override for the DB path. Useful for the test suite (so a
+  // subprocess CLI invocation can point at a tmpdir DB without
+  // touching the operator's real `~/.local/state` tree) and for
+  // anyone wanting to keep their fleet history on an external disk.
+  if (process.env.FLEET_DB_PATH) cfg.dbPath = process.env.FLEET_DB_PATH;
   // Ensure the state dir exists.
   mkdirSync(join(cfg.dbPath, ".."), { recursive: true });
   return cfg;

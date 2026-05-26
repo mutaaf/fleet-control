@@ -10,6 +10,8 @@ import type { DB } from "./db.ts";
 import { loadConfig } from "./config.ts";
 import * as auth from "./auth.ts";
 import { cleanCheckouts, safeRmUnder } from "./infra.ts";
+import { createSnapshot, revokeSnapshot } from "./snapshot.ts";
+import { fleetView } from "./views.ts";
 
 const UID = process.getuid?.() ?? 0;
 const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
@@ -23,6 +25,9 @@ const KNOWN_ACTIONS = new Set([
   "register-url",
   "tokens-add", "tokens-revoke",
   "clean-checkouts",
+  // Ticket 0013: read-only share snapshots. snapshot-create freezes
+  // the anonymized fleet view; snapshot-revoke kills a live link.
+  "snapshot-create", "snapshot-revoke",
 ]);
 
 /** Strict regex for GitHub HTTPS repo URLs (ticket 0010). Owner/name must
@@ -95,6 +100,9 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
   if (action === "register") return registerProject(db, body); // no existing project
   if (action === "register-url") return registerFromUrl(db, body, actor, actorName);
   if (action === "tokens-add" || action === "tokens-revoke") return tokensAction(db, action, body, actor, actorName);
+  if (action === "snapshot-create" || action === "snapshot-revoke") {
+    return snapshotAction(db, action, body, actor, actorName);
+  }
   const slug = body?.slug;
   if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
   const p = project(db, slug);
@@ -176,6 +184,64 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
   }
   audit(db, actor, action, `${slug}/${body?.phase ?? "*"}`, body, ok ? 0 : 1, out, actorName);
   return { ok, message, output: out.slice(-400) || undefined };
+}
+
+/** API surface for the share-snapshot CLI/portal (ticket 0013).
+ *  snapshot-create returns the plaintext token + share_url ONCE; the
+ *  control_audit row carries the 8-char id_prefix only. snapshot-revoke
+ *  takes an id-prefix and flips revoked_at. Both go through the same
+ *  audit() helper as the rest of doAction so a stolen admin token's
+ *  misuse leaves an inspectable trail. */
+function snapshotAction(db: DB, action: string, body: any, actor: string, actorName?: string): ActionResult {
+  try {
+    if (action === "snapshot-create") {
+      const name = String(body?.name ?? "").trim();
+      // Resolve the fleet view: the server passes the freshly-computed
+      // one via body.fleet_view (so the snapshot freezes exactly what
+      // the operator just saw on the home page). The CLI doesn't pass
+      // one — we compute it here from the live DB + config.
+      const view = body?.fleet_view ?? fleetView(db, loadConfig());
+      const baseUrl = typeof body?.base_url === "string" ? body.base_url : undefined;
+      const m = createSnapshot(db, {
+        name,
+        fleetView: view,
+        ttl_hours: body?.ttl_hours,
+        baseUrl,
+      });
+      // Audit args carry the id_prefix + name + ttl — NEVER the plaintext
+      // token. We construct the audit args explicitly so a careless
+      // body.token smuggled in by a future caller can't leak.
+      audit(db, actor, "snapshot-create", m.id_prefix, {
+        name: m.name, id_prefix: m.id_prefix, expires_at: m.expires_at,
+      }, 0, "", actorName);
+      return {
+        ok: true,
+        message: `minted snapshot '${m.name}'`,
+        // The CLI prints token + share_url from this JSON. The server's
+        // /api/control/snapshot-create handler proxies the same JSON to
+        // the SPA so the operator's screen shows the URL once.
+        output: JSON.stringify({
+          id_prefix: m.id_prefix,
+          token: m.token,
+          share_url: m.share_url,
+          name: m.name,
+          expires_at: m.expires_at,
+        }),
+      };
+    }
+    if (action === "snapshot-revoke") {
+      const prefix = String(body?.id_prefix ?? body?.prefix ?? "");
+      const ok = revokeSnapshot(db, prefix);
+      audit(db, actor, "snapshot-revoke", prefix, { id_prefix: prefix }, ok ? 0 : 1, "", actorName);
+      return ok
+        ? { ok: true, message: `revoked snapshot ${prefix}` }
+        : { ok: false, message: `no live snapshot with prefix ${prefix}` };
+    }
+    return { ok: false, message: `unknown snapshot action '${action}'` };
+  } catch (e: any) {
+    audit(db, actor, action, String(body?.id_prefix ?? body?.name ?? "?"), { name: body?.name }, 1, String(e?.message ?? e), actorName);
+    return { ok: false, message: String(e?.message ?? e) };
+  }
 }
 
 /** API surface for the token CLI/portal. tokens-add returns the plaintext
