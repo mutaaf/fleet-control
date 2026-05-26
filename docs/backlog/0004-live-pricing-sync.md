@@ -1,7 +1,7 @@
 ---
 id: 0004
 title: Live Anthropic pricing sync into pricing table
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-26
@@ -71,4 +71,11 @@ checks for.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branch `feat/0004-live-pricing-sync`
+  opened; status flipped to `in-progress`. Plan: write failing tests
+  first (fixture JSON → `syncPricing` upserts + `fetched_at` advances →
+  `/api/pricing` shape), then add `data/anthropic-pricing.json`,
+  `syncPricing(db)` + `pricingRows(db)` in `src/pricing.ts`, idempotent
+  ALTER for `pricing.fetched_at`, `pricing sync|show` CLI subcommands,
+  `/api/pricing` route, and a footer line in `web/app.js` with a stale-
+  warning badge when `fetched_at` > 24h.
