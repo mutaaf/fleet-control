@@ -116,6 +116,28 @@ contents and defer real validation to a typed helper so error messages
 stay precise (400 "bad repo" vs a confusing 404). Same pattern will help
 when adding any future route that takes a GitHub identifier.
 
+## 2026-05-26 — in-process dedup sets need an explicit reset hook for tests
+
+Symptom: while shipping ticket 0009 (ntfy dispatch), two ntfy tests
+failed under `node --test tests/ntfy.test.ts` even though each test ran
+in isolation. The "same dedup_key fired twice → only ONE POST" case
+saw zero POSTs the second time around, and the "click URL …" case (a
+new test using the SAME dedup_key as an earlier-running case) also
+recorded zero calls. Cause: `src/ntfy.ts` keeps a module-level
+`Set<string>` of seen dedup keys so the same alert can't re-buzz the
+operator's phone every ingest tick. That set is *shared across all
+tests in the file* because the module is loaded once per process —
+each `test()` call inherited the dedup state of every prior `test()`.
+Fix: export `_resetDedupForTests()` and call it at the top of every
+test that exercises the dispatcher. The leading underscore signals
+"do not call this in production". General rule: any module that keeps
+process-lifetime state (dedup sets, caches, in-flight maps, mutex
+flags) for "we already handled this" semantics MUST expose a reset
+seam — otherwise the test suite either passes by accident on a fresh
+process or fails confusingly on re-runs. Same principle applies to
+file-scoped `Map`s and lazy singletons; if it survives between
+`test()` calls, it needs an opt-in reset.
+
 ## 2026-05-26 — anomaly tests need σ > 0 in the fixture, not just mean ≠ value
 
 Symptom: while shipping ticket 0008 (anomaly detection on duration/cost),
