@@ -9,6 +9,7 @@ import { runDaemon, installDaemon, uninstallDaemon, daemonStatus } from "../src/
 import { evalAlerts, openAlerts } from "../src/alerts.ts";
 import { mintToken, listTokens, revokeToken, type Scope } from "../src/auth.ts";
 import { syncPricing, pricingRows, DEFAULT_PRICING_FILE } from "../src/pricing.ts";
+import { flagRun } from "../src/anomaly.ts";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -39,7 +40,24 @@ function backfill() {
   const t0 = Date.now();
   process.stdout.write("ingesting transcripts… ");
   const r = runIngestPass(db, cfg);
-  console.log(`${c.grn}done${c.rst} (${r.projects} projects, ${r.runsIngested} runs touched, ${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+  // Ticket 0008: reactive anomaly flagging runs AFTER the ingest pass so
+  // cost_usd / cost_usd_computed / run_event rows are all current. We only
+  // call flagRun on runs that don't already carry a flag — the helper is
+  // idempotent (UNIQUE(run_id, kind)) but the no-op pre-check saves N
+  // round-trips per backfill on large histories.
+  let flagged = 0;
+  const candidates = db.prepare(
+    "SELECT r.id FROM run r WHERE r.started_at IS NOT NULL "
+    + "  AND NOT EXISTS (SELECT 1 FROM anomaly a WHERE a.run_id = r.id) "
+    + "  AND r.started_at >= datetime('now','-14 day')",
+  ).all() as Array<{ id: number }>;
+  for (const row of candidates) {
+    try {
+      const res = flagRun(db, row.id);
+      if (res.flagged) flagged++;
+    } catch { /* keep the backfill going on any single-run failure */ }
+  }
+  console.log(`${c.grn}done${c.rst} (${r.projects} projects, ${r.runsIngested} runs touched, ${flagged} new anomal${flagged === 1 ? "y" : "ies"}, ${((Date.now() - t0) / 1000).toFixed(1)}s)`);
   status();
 }
 

@@ -247,6 +247,22 @@ function forecastSpan(f) {
   const tip = "14d mean: " + usd(f.daily_mean_14d) + "/day · 7d mean: " + usd(f.daily_mean_7d) + "/day";
   return `<span title="${esc(tip)}"><b class="cost">${usd(f.projected_30d)}</b>/mo <span class="dim">(forecast)</span></span>`;
 }
+// Ticket 0008: anomaly pill for the home grid card. Hidden entirely when the
+// trailing-24h count is zero (most projects, most of the time). Red when
+// the latest flag is <1h old (someone should look now), amber otherwise
+// (within 24h but cooled off). Clicking the pill deep-links into the
+// project page's anomalies view.
+function anomalyPill(p) {
+  const a = p.anomalies;
+  if (!a || !a.count_24h) return "";
+  const fresh = a.latest_at && (Date.now() - new Date(a.latest_at).getTime() < 60 * 60_000);
+  const cls = fresh ? "anomaly-pill fresh" : "anomaly-pill stale";
+  const label = "Anomal" + (a.count_24h === 1 ? "y" : "ies") + " (" + a.count_24h + ")";
+  // The pill is rendered inside an <a class="card">; nested <a> isn't valid
+  // HTML, so we use a span with a click handler that bubbles to the card's
+  // href. The deep link `?view=anomalies` is preserved by route().
+  return `<span class="${cls}" data-anom-link="${esc(p.slug)}" title="${esc(a.latest_at ? "latest " + ago(a.latest_at) : "anomalies in last 24h")}">${label}</span>`;
+}
 function card(p) {
   const [cls, label] = STATE[p.displayState] || STATE.off;
   const running = p.jobs.find((j) => j.running);
@@ -266,7 +282,7 @@ function card(p) {
       ? `<div class="banner">Stops working in ${sc} day${sc === 1 ? "" : "s"} unless you keep it running.</div>` : "";
   return `<a class="card" href="#/p/${p.slug}">
     <div class="card-head"><span class="pname">${esc(p.name)}</span>
-      <span class="state"><span class="dot ${cls}"></span>${label}</span></div>
+      <span class="state"><span class="dot ${cls}"></span>${label}${anomalyPill(p)}</span></div>
     ${telemetry(p.telemetry)}
     ${nowLine || (lastAny ? `<div class="job">Last: ${OUTCOME[lastAny.outcome] || lastAny.outcome || "ran"} · ${ago(lastAny.started_at)}</div>` : "")}
     <div class="metarow">
@@ -276,6 +292,15 @@ function card(p) {
       <span class="dim">${p.runs} runs</span>
     </div>${ulBanner}${akBanner}${banner}</a>`;
 }
+// Pill clicks: stop the parent <a class="card"> navigation and route to
+// the anomalies view explicitly. data-anom-link carries the slug.
+document.addEventListener("click", (e) => {
+  const pill = e.target.closest("[data-anom-link]");
+  if (!pill) return;
+  e.preventDefault();
+  e.stopPropagation();
+  location.hash = "#/p/" + pill.dataset.anomLink + "?view=anomalies";
+});
 
 // ---- Project --------------------------------------------------------------
 // Typed-event probe (ticket 0001): if the very latest event is a run_started
@@ -291,8 +316,13 @@ async function latestRunStarted(slug) {
     return { phase: e.phase, ts: e.ts, ageMs, payload: e.payload };
   } catch { return null; }
 }
-async function project(slug) {
+async function project(slug, params) {
   const [p, nowEv] = await Promise.all([get("/api/project/" + slug), latestRunStarted(slug)]);
+  // Ticket 0008: optional "Anomalies" panel rendered when the deep link
+  // `?view=anomalies` was used (or any time there's at least one row in
+  // the trailing 50). The list is fetched lazily so a clean project pays
+  // no cost for the extra round-trip.
+  const wantAnomalies = params && params.get("view") === "anomalies";
   summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
   const [cls, label] = STATE[p.displayState] || STATE.off;
   const ulBanner = p.usageLimit?.blocked
@@ -316,6 +346,8 @@ async function project(slug) {
     ${prSection(p)}
     <div class="eyebrow">The jobs</div>
     ${p.jobs.map((j) => jobCard(j, p.slug)).join("")}
+    <div class="eyebrow">Anomalies</div>
+    <div id="anomaly-section" class="jobcard"><div class="kv dim">checking…</div></div>
     <div class="eyebrow">Disk</div>
     <div id="disk-section" class="jobcard"><div class="kv dim">checking…</div></div>
     <div class="eyebrow">Recent activity</div>
@@ -332,6 +364,33 @@ async function project(slug) {
   // Ticket 0006: per-project disk view. Fired in parallel with the rest of
   // the project render so a slow filesystem walk never blocks the page.
   loadDiskSection(slug);
+  // Ticket 0008: per-project anomalies. Same lazy pattern as disk.
+  loadAnomaliesSection(slug, wantAnomalies);
+}
+// Ticket 0008: anomaly list for the project page. Renders the trailing-50
+// rows newest-first; each row links into the run detail page where the
+// badge gives the full context. When `scrollIntoView` is true (deep-link
+// from the home pill), we scroll the section into view after render.
+async function loadAnomaliesSection(slug, scrollIntoView) {
+  const el = document.getElementById("anomaly-section");
+  if (!el) return;
+  let d;
+  try { d = await get("/api/projects/" + encodeURIComponent(slug) + "/anomalies?limit=50"); }
+  catch { el.innerHTML = `<div class="kv dim">couldn't read anomalies</div>`; return; }
+  const rows = d.anomalies || [];
+  if (!rows.length) {
+    el.innerHTML = `<div class="kv dim">no anomalies in the trailing window — runs are sitting within 3σ of baseline.</div>`;
+    return;
+  }
+  const renderRow = (a) => {
+    const mult = (a.stddev_multiplier || 0).toFixed(1);
+    const reason = a.candidate_reason ? ` <span class="faint">· ${esc(a.candidate_reason)}</span>` : "";
+    return `<div class="kv mono"><a href="#/r/${a.run_id}"><span class="lbl">${ago(a.created_at)}</span>${esc(a.phase)} · ${esc(a.kind)} ${mult}σ${reason}</a></div>`;
+  };
+  el.innerHTML = `<h3>Recent flags <span class="faint mono">${rows.length} in last 50</span></h3>${rows.map(renderRow).join("")}`;
+  if (scrollIntoView) {
+    try { el.scrollIntoView({ behavior: "smooth", block: "start" }); } catch { /* */ }
+  }
 }
 // ---- Disk view (ticket 0006) ---------------------------------------------
 // Renders bytes/checkout_count/oldest_age_days plus an expandable list of
@@ -470,10 +529,21 @@ function runRow(r) {
 }
 
 // ---- Run trace ------------------------------------------------------------
+// Ticket 0008: badge rendered above the run trace when one or more anomaly
+// rows are attached to this run. Each badge reads
+// "Anomaly: <kind> Nσ above baseline — <candidate_reason>" per the spec.
+// We render one block per anomaly row so a run flagged for both metrics
+// gets both rows surfaced.
+function anomalyBadge(a) {
+  const mult = (a.stddev_multiplier || 0).toFixed(1);
+  const reason = a.candidate_reason ? " — " + esc(a.candidate_reason) : "";
+  return `<div class="banner bad anomaly-badge"><b>Anomaly:</b> ${esc(a.kind)} ${mult}σ above baseline${reason}</div>`;
+}
 async function run(id) {
   const d = await get("/api/run/" + id);
   summary.innerHTML = `<a href="#/p/${d.project.slug}" class="dim">‹ ${esc(d.project.name)}</a>`;
   const r = d.run;
+  const anomalies = d.anomalies || [];
   app.innerHTML = `<a class="back" href="#/p/${d.project.slug}">‹ ${esc(d.project.name)}</a>
     <div class="card-head"><span class="pname">${PHASE[r.phase] || r.phase} · ${OUTCOME[r.outcome] || r.outcome || "run"}</span></div>
     <div class="metarow">
@@ -482,6 +552,7 @@ async function run(id) {
       ${r.pr_number ? `<span>PR #${r.pr_number}</span>` : ""}
       <span class="faint">in ${toks(r.input_tokens)} · out ${toks(r.output_tokens)} · cache-rd ${toks(r.cache_read_tokens)}</span>
     </div>
+    ${anomalies.map(anomalyBadge).join("")}
     ${r.summary ? `<div class="summary-box">${esc(r.summary)}</div>` : ""}
     <div class="eyebrow">What it did, step by step</div>
     <div class="trace">${d.events.length ? d.events.map(traceLine).join("") : '<span class="dim">no detailed trace for this run</span>'}</div>`;
@@ -494,13 +565,33 @@ function traceLine(e) {
 }
 
 // ---- Router ---------------------------------------------------------------
+// Hash strings carry an optional `?view=anomalies` (or any future view) —
+// strip the query off the slug before fetching the project view, and pass
+// the parsed search params into project() so it can scroll the right
+// section into view.
+function parseHash(h) {
+  const body = (h || "").replace(/^#\/?/, "");
+  const qIdx = body.indexOf("?");
+  const path = qIdx < 0 ? body : body.slice(0, qIdx);
+  const query = qIdx < 0 ? "" : body.slice(qIdx + 1);
+  const params = new URLSearchParams(query);
+  return { path, params };
+}
 async function route() {
   stop();
   const h = location.hash || "#/";
   try {
-    if (h.startsWith("#/p/")) { const s = h.slice(4); await project(s); timer = setInterval(() => project(s).catch(() => {}), 5000); }
-    else if (h.startsWith("#/r/")) { await run(h.slice(4)); }
-    else { await home(); timer = setInterval(() => home().catch(() => {}), 5000); }
+    const { path, params } = parseHash(h);
+    if (path.startsWith("p/")) {
+      const s = path.slice(2);
+      await project(s, params);
+      timer = setInterval(() => project(s, params).catch(() => {}), 5000);
+    } else if (path.startsWith("r/")) {
+      await run(path.slice(2));
+    } else {
+      await home();
+      timer = setInterval(() => home().catch(() => {}), 5000);
+    }
   } catch (e) {
     app.innerHTML = `<div class="loading">couldn’t reach the fleet server.<br><span class="dim">${esc(e.message)}</span></div>`;
   }
