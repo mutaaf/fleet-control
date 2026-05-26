@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Inline PR diff with sticky action bar
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-05-26
@@ -67,4 +67,5 @@ The screenshot of "agent PR diff + action bar in the portal" is the demo.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 (implementation-dev): branched feat/0007-inline-pr-diff;
+  moved to in-progress before the failing test pass.

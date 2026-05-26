@@ -25,7 +25,7 @@ proposes new ones, `review` grades them.
 | 0004 | Live Anthropic pricing sync into pricing table | P1 | shipped | observability |
 | 0005 | 30-day cost forecast per project | P1 | shipped | observability |
 | 0006 | Stale-checkout janitor with disk view | P1 | in-progress | infra |
-| 0007 | Inline PR diff with sticky action bar | P1 | groomed | portal |
+| 0007 | Inline PR diff with sticky action bar | P1 | in-progress | portal |
 | 0008 | Anomaly detection on run duration and cost | P2 | groomed | observability |
 | 0009 | ntfy push notifications for high-priority events | P2 | groomed | observability |
 | 0010 | One-click GitHub-URL project import | P2 | groomed | control |
