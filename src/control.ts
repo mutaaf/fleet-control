@@ -7,18 +7,40 @@ import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync, readdirSy
 import { join, dirname, basename } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import type { DB } from "./db.ts";
+import { loadConfig } from "./config.ts";
 
 const UID = process.getuid?.() ?? 0;
 const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
 const KIT_INSTALL = join(KIT, "lib", "install.sh");
 const PHASES = ["ship", "groom", "review", "eng"];
+// Actions that need a real project; everything else (register) is handled specially.
+const KNOWN_ACTIONS = new Set([
+  "kickstart", "pause", "resume", "keep-running", "eng-toggle",
+  "pr-merge", "pr-changes", "pr-close", "create-ticket", "register",
+]);
+
+/** Prefer the working-tree manifest if it still exists (so edits land where the
+ * user can `git commit` them, and install.sh has a distinct src/dst for cp).
+ * Fall back to whatever path the DB has (e.g. installed copy if the working
+ * tree was deleted). */
+function manifestDirFor(p: Proj): string {
+  const cfg = loadConfig();
+  for (const root of cfg.projectRoots) {
+    const candidate = join(root, p.slug);
+    if (existsSync(join(candidate, "agents.config.sh"))) return candidate;
+  }
+  return dirname(p.manifest_path);
+}
+function manifestFileFor(p: Proj): string {
+  return join(manifestDirFor(p), "agents.config.sh");
+}
 
 interface Proj { id: number; slug: string; namespace: string; manifest_path: string; repo_owner: string; repo_name: string; repo_url: string; }
 const VALID = (s: string, re: RegExp) => typeof s === "string" && re.test(s);
 const repoOf = (p: Proj) => `${p.repo_owner}/${p.repo_name}`;
 
 function project(db: DB, slug: string): Proj {
-  const p = db.prepare("SELECT id,slug,namespace,manifest_path,repo_owner,repo_name,repo_url FROM project WHERE slug=?").get(slug) as Proj | undefined;
+  const p = db.prepare("SELECT id,slug,namespace,manifest_path,repo_owner,repo_name,repo_url FROM project WHERE slug=?").get(slug) as unknown as Proj | undefined;
   if (!p) throw new Error(`unknown project '${slug}'`);
   return p;
 }
@@ -43,6 +65,7 @@ function audit(db: DB, actor: string, action: string, target: string, args: unkn
 export interface ActionResult { ok: boolean; message: string; output?: string; }
 
 export function doAction(db: DB, actor: string, action: string, body: any): ActionResult {
+  if (!KNOWN_ACTIONS.has(action)) throw new Error(`unknown action '${action}'`);
   if (action === "register") return registerProject(db, body); // no existing project
   const slug = body?.slug;
   if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
@@ -71,15 +94,17 @@ export function doAction(db: DB, actor: string, action: string, body: any): Acti
         if (isRunning(p)) { ok = false; message = "A job is running right now — try again in a minute."; break; }
         const d = new Date(Date.now() + days * 86_400_000);
         const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
-        editManifest(p.manifest_path, "SELF_CANCEL", ymd);
-        out = run("bash", [KIT_INSTALL, dirname(p.manifest_path)]);
+        const mdir = manifestDirFor(p);
+        editManifest(manifestFileFor(p), "SELF_CANCEL", ymd);
+        out = run("bash", [KIT_INSTALL, mdir]);
         message = `${slug} will keep running for ${days} more days.`; break;
       }
       case "eng-toggle": {            // turn the eng (tidy-the-code) queue on/off
         if (isRunning(p)) { ok = false; message = "A job is running right now — try again in a minute."; break; }
         const on = body.enabled ? "1" : "0";
-        editManifest(p.manifest_path, "ENG_ENABLED", on);
-        out = run("bash", [KIT_INSTALL, dirname(p.manifest_path)]);
+        const mdir = manifestDirFor(p);
+        editManifest(manifestFileFor(p), "ENG_ENABLED", on);
+        out = run("bash", [KIT_INSTALL, mdir]);
         message = `Code-tidying ${on === "1" ? "enabled" : "disabled"} for ${slug}.`; break;
       }
       case "pr-merge": {              // "Approve & publish" — arm auto-merge (lands when CI green)

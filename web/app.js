@@ -6,11 +6,12 @@ const foot = document.getElementById("foot");
 const PHASE = { ship: "Builds features", groom: "Comes up with ideas", review: "Checks the work", eng: "Tidies the code" };
 const STATE = {
   working: ["working", "Working"], idle: ["idle", "Idle · on"], attention: ["attention", "Needs you"],
-  expired: ["expired", "Stopped"], off: ["off", "Paused"],
+  expired: ["expired", "Stopped"], off: ["off", "Paused"], halted: ["expired", "Halted · Claude limit"],
 };
 const OUTCOME = {
   shipped: "shipped a feature", healed: "fixed the last work", "no-op": "nothing to do",
   "reviewed-ok": "checked — looks good", "reviewed-changes": "sent work back", "self-cancel": "stopped (limit)",
+  "usage-limit": "blocked — Claude limit",
 };
 
 const usd = (n) => (n == null ? "—" : "$" + (+n).toFixed(2));
@@ -168,6 +169,10 @@ function card(p) {
   const nextJob = p.jobs.filter((j) => j.next).sort((a, b) => new Date(a.next) - new Date(b.next))[0];
   const lastAny = p.jobs.map((j) => j.last).filter(Boolean).sort((a, b) => new Date(b.started_at) - new Date(a.started_at))[0];
   const sc = p.selfCancelDays;
+  const ulBanner = p.usageLimit?.blocked
+    ? `<div class="banner bad">Hit Claude usage limit · ${p.usageLimit.until ? "back in service " + until(p.usageLimit.until) : "until the next reset"}.</div>` : "";
+  const akBanner = p.autoKill && (Date.now() - new Date(p.autoKill.ts).getTime() < 15 * 60_000)
+    ? `<div class="banner">Auto-healed ${PHASE[p.autoKill.phase] || p.autoKill.phase} (was hung ${p.autoKill.mins}m) · next run will retry.</div>` : "";
   const banner = sc != null && sc < 0
     ? `<div class="banner bad">Stopped working — its safety limit passed. Open it to restart.</div>`
     : sc != null && sc <= 3
@@ -181,7 +186,7 @@ function card(p) {
       ${nextJob ? `<span>next: ${PHASE[nextJob.phase].toLowerCase()} <b>${until(nextJob.next)}</b></span>` : `<span class="dim">paused</span>`}
       <span>this week <b class="cost">${usd(p.cost7d)}</b></span>
       <span class="dim">${p.runs} runs</span>
-    </div>${banner}</a>`;
+    </div>${ulBanner}${akBanner}${banner}</a>`;
 }
 
 // ---- Project --------------------------------------------------------------
@@ -189,11 +194,16 @@ async function project(slug) {
   const p = await get("/api/project/" + slug);
   summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
   const [cls, label] = STATE[p.displayState] || STATE.off;
+  const ulBanner = p.usageLimit?.blocked
+    ? `<div class="banner bad">Hit Claude usage limit on ${PHASE[p.usageLimit.phase] || p.usageLimit.phase} · ${p.usageLimit.until ? "back in service " + until(p.usageLimit.until) : "until the next reset"}. Subsequent runs will keep failing until then — no need to act.</div>` : "";
+  const akBanner = p.autoKill && (Date.now() - new Date(p.autoKill.ts).getTime() < 60 * 60_000)
+    ? `<div class="banner">Auto-healed ${PHASE[p.autoKill.phase] || p.autoKill.phase} ${ago(p.autoKill.ts)} (was hung ${p.autoKill.mins}m) so the next scheduled run could fire.</div>` : "";
   app.innerHTML = `<a class="back" href="#/">‹ all projects</a>
     <div class="card-head" style="margin-bottom:6px"><span class="pname">${esc(p.name)}</span>
       <span class="state"><span class="dot ${cls}"></span>${label}</span></div>
     <div class="metarow"><span class="dim mono">${esc(p.repo)}</span>
       ${p.selfCancelDays != null ? `<span>${p.selfCancelDays < 0 ? "stopped" : "keeps running " + p.selfCancelDays + "d"}</span>` : ""}</div>
+    ${ulBanner}${akBanner}
     <div class="actions">
       ${p.selfCancelDays != null && p.selfCancelDays <= 7 ? `<button class="btn primary" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>` : `<button class="btn" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>`}
       <button class="btn" data-act="resume" data-slug="${p.slug}">Resume all jobs</button>

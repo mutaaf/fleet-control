@@ -118,5 +118,12 @@ export type DB = DatabaseSync;
 export function openDb(path: string): DB {
   const db = new DatabaseSync(path);
   db.exec(SCHEMA);
+  // ALTERs for older DBs (CREATE TABLE IF NOT EXISTS won't add columns to an
+  // already-existing table). Each ALTER is wrapped — duplicate column is fine.
+  for (const ddl of [
+    "ALTER TABLE run ADD COLUMN usage_limit_at TEXT",
+    "ALTER TABLE run ADD COLUMN usage_limit_until TEXT",
+    "ALTER TABLE alert ADD COLUMN auto_resolve INTEGER DEFAULT 1",
+  ]) { try { db.exec(ddl); } catch { /* already there */ } }
   return db;
 }

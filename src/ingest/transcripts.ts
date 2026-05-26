@@ -7,6 +7,7 @@ import type { FleetConfig } from "../config.ts";
 import { transcriptDirFor } from "../config.ts";
 import type { DB } from "../db.ts";
 import { computeCost } from "../pricing.ts";
+import { detectUsageLimit } from "../usage_limits.ts";
 
 const SUBS = ["checkout", "review-checkout", "eng-checkout", "groom-checkout"];
 const MAX_EVENTS = 1500;
@@ -87,6 +88,9 @@ function inferShipOrGroom(firstUser: string): string {
 
 function outcomeOf(t: string): string | null {
   if (/^SMOKE-OK/m.test(t)) return "smoke";
+  // usage-limit short-circuits — if the run died on a limit, it didn't actually
+  // ship/heal/etc., even if the text mentions those words in passing.
+  if (detectUsageLimit(t).hit) return "usage-limit";
   if (/\bSHIP\s+\d{4}/.test(t) || /shipped/i.test(t)) return "shipped";
   if (/\bHEAL\b/.test(t)) return "healed";
   if (/\bNOOP\b|no actionable|nothing to (do|ship)/i.test(t)) return "no-op";
@@ -106,14 +110,15 @@ export function ingestProjectTranscripts(db: DB, cfg: FleetConfig, projectId: nu
   const runUp = db.prepare(`
     INSERT INTO run(project_id,phase,session_id,started_at,ended_at,duration_ms,num_turns,
       input_tokens,output_tokens,cache_creation_tokens,cache_read_tokens,cost_usd_computed,cost_source,
-      model,summary,outcome,pr_number,transcript_path,source)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      model,summary,outcome,pr_number,transcript_path,source,usage_limit_at,usage_limit_until)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(project_id,phase,session_id) DO UPDATE SET
       ended_at=excluded.ended_at, duration_ms=excluded.duration_ms, num_turns=excluded.num_turns,
       input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
       cache_creation_tokens=excluded.cache_creation_tokens, cache_read_tokens=excluded.cache_read_tokens,
       cost_usd_computed=excluded.cost_usd_computed,
-      summary=excluded.summary, outcome=excluded.outcome, pr_number=excluded.pr_number, transcript_path=excluded.transcript_path`);
+      summary=excluded.summary, outcome=excluded.outcome, pr_number=excluded.pr_number, transcript_path=excluded.transcript_path,
+      usage_limit_at=excluded.usage_limit_at, usage_limit_until=excluded.usage_limit_until`);
   const runIdOf = db.prepare("SELECT id FROM run WHERE project_id=? AND phase=? AND session_id=?");
   const evDel = db.prepare("DELETE FROM run_event WHERE run_id=?");
   const evIns = db.prepare(
@@ -144,9 +149,15 @@ export function ingestProjectTranscripts(db: DB, cfg: FleetConfig, projectId: nu
         });
         const prMatch = parsed.lastAssistantText.match(/(?:PR #?|pull\/)(\d+)/);
         const prNum = prMatch ? Number(prMatch[1]) : null;
+        // Scan the assistant text + any tool_result errors for usage-limit signatures.
+        const errorBlob = parsed.events.filter((e) => e.kind === "tool_result" && e.err).map((e) => e.out ?? "").join("\n");
+        const usage = detectUsageLimit(parsed.lastAssistantText + "\n" + errorBlob);
+        const ulAt = usage.hit ? (parsed.endedAt ?? parsed.startedAt) : null;
+        const ulUntil = usage.hit ? usage.until : null;
         runUp.run(projectId, phase, parsed.sessionId, parsed.startedAt, parsed.endedAt, dur, parsed.numTurns,
           parsed.input, parsed.output, parsed.cacheCreate, parsed.cacheRead, cost, "computed",
-          parsed.model, trunc(parsed.lastAssistantText, 600), outcomeOf(parsed.lastAssistantText), prNum, path, "transcript");
+          parsed.model, trunc(parsed.lastAssistantText, 600), outcomeOf(parsed.lastAssistantText), prNum, path, "transcript",
+          ulAt, ulUntil);
         const rid = (runIdOf.get(projectId, phase, parsed.sessionId) as { id: number }).id;
         evDel.run(rid);
         for (const e of parsed.events)
