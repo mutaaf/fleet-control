@@ -85,7 +85,6 @@ const PACE_PRESETS: Record<string, Record<string, string>> = {
 };
 
 function applyCadence(p: Proj, values: Record<string, string>): string {
-  if (isRunning(p)) throw new Error("a job is running right now — try again in a minute");
   const mdir = manifestDirFor(p);
   const mfile = manifestFileFor(p);
   for (const [key, value] of Object.entries(values)) {
@@ -137,10 +136,34 @@ function run(cmd: string, args: string[]): string { return activeRunner(cmd, arg
 export function _setRunnerForTests(fn: Runner): void { activeRunner = fn; }
 export function _resetRunnerForTests(): void { activeRunner = defaultRunner; }
 function isRunning(p: Proj): boolean {
-  return PHASES.some((ph) => {
-    try { return /\bstate = running\b/.test(run("launchctl", ["print", `gui/${UID}/${label(p, ph)}`])); }
-    catch { return false; }
-  });
+  return runningPhases(p).length > 0;
+}
+
+/** Names of phases currently `state = running` under launchd, for friendlier
+ *  error messages: "ship is mid-run — apply anyway?" beats a generic block. */
+function runningPhases(p: Proj): string[] {
+  const r: string[] = [];
+  for (const ph of PHASES) {
+    try {
+      if (/\bstate = running\b/.test(run("launchctl", ["print", `gui/${UID}/${label(p, ph)}`]))) r.push(ph);
+    } catch { /* not loaded */ }
+  }
+  return r;
+}
+
+/** "running, retry with force" result shape. The SPA recognizes
+ *  `code: "running"` and prompts the operator with a confirm before retrying
+ *  the same action with `force: true`. Always include the list of phases so
+ *  the prompt can say "ship is running" rather than the vague original
+ *  "a job is running". */
+function runningResult(phases: string[]): ActionResult {
+  const list = phases.join(" + ");
+  return {
+    ok: false,
+    message: `${list} ${phases.length === 1 ? "is" : "are"} mid-run — applying now will cut the current run short.`,
+    code: "running",
+    running: phases,
+  };
 }
 function audit(db: DB, actor: string, action: string, target: string, args: unknown, exit: number, out: string, actorName?: string) {
   db.prepare("INSERT INTO control_audit(ts,actor,action,target,args_json,exit_code,stdout_tail,actor_name) VALUES(?,?,?,?,?,?,?,?)")
@@ -151,7 +174,17 @@ function audit(db: DB, actor: string, action: string, target: string, args: unkn
     );
 }
 
-export interface ActionResult { ok: boolean; message: string; output?: string; }
+export interface ActionResult {
+  ok: boolean;
+  message: string;
+  output?: string;
+  /** When `ok=false` and `code` is set, the SPA can branch on the reason
+   *  rather than parsing the human message. Today the only code is
+   *  "running" — the operator can retry the same call with `force=true`
+   *  to terminate the in-flight job and apply anyway. */
+  code?: string;
+  running?: string[];
+}
 
 export async function doAction(db: DB, actor: string, action: string, body: any, actorName?: string): Promise<ActionResult> {
   if (!KNOWN_ACTIONS.has(action)) throw new Error(`unknown action '${action}'`);
@@ -186,7 +219,10 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
       }
       case "keep-running": {          // bump SELF_CANCEL + reinstall
         const days = Math.max(1, Math.min(365, Number(body.days) || 30));
-        if (isRunning(p)) { ok = false; message = "A job is running right now — try again in a minute."; break; }
+        if (!body?.force) {
+          const phs = runningPhases(p);
+          if (phs.length) { audit(db, actor, action, `${slug}/*`, body, 1, "", actorName); return runningResult(phs); }
+        }
         const d = new Date(Date.now() + days * 86_400_000);
         const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
         const mdir = manifestDirFor(p);
@@ -195,7 +231,10 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         message = `${slug} will keep running for ${days} more days.`; break;
       }
       case "eng-toggle": {            // turn the eng (tidy-the-code) queue on/off
-        if (isRunning(p)) { ok = false; message = "A job is running right now — try again in a minute."; break; }
+        if (!body?.force) {
+          const phs = runningPhases(p);
+          if (phs.length) { audit(db, actor, action, `${slug}/*`, body, 1, "", actorName); return runningResult(phs); }
+        }
         const on = body.enabled ? "1" : "0";
         const mdir = manifestDirFor(p);
         editManifest(manifestFileFor(p), "ENG_ENABLED", on);
@@ -222,8 +261,10 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         message = `Added to ${slug}'s build list — opened as ${url.trim()}`; out = url; break;
       }
       case "set-cadence": {           // per-phase fine control over how often each agent runs
-        // body may carry any subset of CADENCE_KEYS. applyCadence ignores
-        // unknown keys; rejects when a job is currently running.
+        if (!body?.force) {
+          const phs = runningPhases(p);
+          if (phs.length) { audit(db, actor, action, `${slug}/*`, body, 1, "", actorName); return runningResult(phs); }
+        }
         out = applyCadence(p, body || {});
         message = `Schedule updated for ${slug}.`; break;
       }
@@ -231,6 +272,10 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         const preset = String(body?.preset || "").toLowerCase();
         const cfg = PACE_PRESETS[preset];
         if (!cfg) throw new Error(`unknown pace '${preset}' — use aggressive, steady, conservative, or trickle`);
+        if (!body?.force) {
+          const phs = runningPhases(p);
+          if (phs.length) { audit(db, actor, action, `${slug}/*`, body, 1, "", actorName); return runningResult(phs); }
+        }
         out = applyCadence(p, cfg);
         message = `${slug} set to ${preset} pace.`; break;
       }
@@ -239,7 +284,13 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         // The engine reads MAX_DAILY_USD via `${MAX_DAILY_USD:-}` so an
         // empty string is treated as "no cap" — we don't need a separate
         // remove path.
-        if (isRunning(p)) { ok = false; message = "A job is running right now — try again in a minute."; break; }
+        //
+        // Crucially, set-budget does NOT need to run install.sh: the cap is
+        // a plain manifest env var read at fire time, not a launchd plist
+        // setting. So this action is safe even while a job is running —
+        // the running job keeps its already-sourced env, and the next fire
+        // picks up the new cap. We just copy the working-tree manifest
+        // straight to the installed location with cpSync.
         const raw = body?.max_daily_usd;
         let cap = "";
         if (raw !== null && raw !== undefined && raw !== "") {
@@ -247,9 +298,11 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
           if (!Number.isFinite(n) || n < 0) throw new Error("max_daily_usd must be a non-negative number");
           if (n > 0) cap = (Math.round(n * 100) / 100).toString();
         }
-        const mdir = manifestDirFor(p);
-        editOrAppendManifest(manifestFileFor(p), "MAX_DAILY_USD", cap);
-        out = run("bash", [KIT_INSTALL, mdir]);
+        const mfile = manifestFileFor(p);
+        editOrAppendManifest(mfile, "MAX_DAILY_USD", cap);
+        const installed = join(homedir(), ".local", "share", "agent-fleet", "projects", p.slug, "agents.config.sh");
+        if (existsSync(dirname(installed))) cpSync(mfile, installed);
+        out = "";
         message = cap
           ? `Daily cap set to $${cap} for ${slug}.`
           : `Daily cap cleared for ${slug}.`;

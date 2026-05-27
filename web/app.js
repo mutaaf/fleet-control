@@ -84,7 +84,21 @@ async function act(action, body) {
     if (t) { localStorage.setItem("fleetToken", t.trim()); return act(action, body); }
     return;
   }
+  // "Running" guard — the server says a job is mid-run. Offer a confirm to
+  // retry with force=true, which terminates the in-flight launchd label.
+  // The operator opted in by clicking the button; we just surface the cost.
+  if (!d.ok && d.code === "running" && !body?.force) {
+    const phs = Array.isArray(d.running) ? d.running.join(" + ") : "a job";
+    const proceed = confirm(`${phs} ${Array.isArray(d.running) && d.running.length === 1 ? "is" : "are"} mid-run.\n\nApplying now will cut the current run short — any in-flight PR will be left for the next cycle to heal.\n\nApply anyway?`);
+    if (proceed) return act(action, { ...body, force: true });
+    toast("cancelled — try again once the run finishes", false);
+    return;
+  }
   toast(d.message || (d.ok ? "done" : "failed"), d.ok);
+  // Bust local caches on actions that change the data they cache. Otherwise
+  // the operator clicks "Clean checkouts" and the panel still shows the old
+  // disk usage for up to 60s.
+  if (d.ok && action === "clean-checkouts" && body?.slug) _diskCache.delete(body.slug);
   if (d.ok) setTimeout(route, 700);
 }
 document.addEventListener("click", (e) => {
@@ -582,7 +596,7 @@ async function project(slug, params) {
     <div class="eyebrow">Anomalies</div>
     <div id="anomaly-section" class="jobcard"><div class="kv dim">checking…</div></div>
     <div class="eyebrow">Disk</div>
-    <div id="disk-section" class="jobcard"><div class="kv dim">checking…</div></div>
+    <div id="disk-section" class="jobcard">${(_diskCache.get(slug) && (Date.now() - _diskCache.get(slug).ts < _DISK_TTL_MS)) ? _diskCache.get(slug).html : '<div class="kv dim">checking…</div>'}</div>
     <div class="eyebrow">Recent activity</div>
     <table><thead><tr><th>when</th><th>job</th><th>did</th><th>PR</th><th>tokens</th><th>cost</th></tr></thead>
     <tbody>${p.recent.map(runRow).join("")}</tbody></table>`;
@@ -635,18 +649,20 @@ function fmtBytes(n) {
   if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
-async function loadDiskSection(slug) {
-  const el = document.getElementById("disk-section");
-  if (!el) return;
-  let d;
-  try { d = await get("/api/projects/" + encodeURIComponent(slug) + "/disk"); }
-  catch { el.innerHTML = `<div class="kv dim">couldn't read disk usage</div>`; return; }
+// Cache disk and anomaly data per slug so the 5-second poll doesn't replace
+// the section with "checking…" every tick (the flash the operator sees). We
+// re-fetch when older than 60s, OR after a control action that changes disk
+// state (clean-checkouts) — handled by clearing the cache below.
+const _diskCache = new Map(); // slug -> { ts, html }
+const _DISK_TTL_MS = 60_000;
+
+function _renderDiskHtml(slug, d) {
   const candidates = (d.candidates || []);
   const rows = candidates.map((c) =>
     `<div class="kv mono"><span class="lbl">${c.age_days.toFixed(1)}d</span>${esc(c.path)} <span class="faint">· ${fmtBytes(c.bytes)}</span></div>`,
   ).join("");
   const hasStale = candidates.some((c) => c.age_days >= 14);
-  el.innerHTML = `
+  return `
     <h3>Cache footprint <span class="jobactions">
       <button class="btn sm${hasStale ? " primary" : ""}" data-act="clean-checkouts" data-slug="${esc(slug)}"
         data-confirm="Clean checkouts older than 14 days for ${esc(slug)}? This removes only stale agent working trees — runs.jsonl, events.jsonl, and logs/ stay put.">
@@ -655,11 +671,31 @@ async function loadDiskSection(slug) {
     <div class="metarow">
       <span>${fmtBytes(d.bytes)} on disk</span>
       <span>${d.checkout_count} checkout${d.checkout_count === 1 ? "" : "s"}</span>
-      <span>oldest <b>${d.oldest_age_days.toFixed(1)}d</b></span>
+      ${d.oldest_age_days != null ? `<span>oldest <b>${d.oldest_age_days.toFixed(1)}d</b></span>` : ""}
     </div>
-    ${candidates.length ? `<details style="margin-top:8px"><summary class="dim">show candidates</summary>${rows}</details>`
-                        : `<div class="kv dim">no checkout directories</div>`}
-  `;
+    ${candidates.length ? `<details style="margin-top:8px"><summary class="dim">show candidates</summary>${rows}</details>` : `<div class="kv dim">no checkout directories</div>`}`;
+}
+
+async function loadDiskSection(slug) {
+  const el = document.getElementById("disk-section");
+  if (!el) return;
+  const cached = _diskCache.get(slug);
+  if (cached && Date.now() - cached.ts < _DISK_TTL_MS) {
+    if (el.innerHTML !== cached.html) el.innerHTML = cached.html;
+    return;
+  }
+  let d;
+  try { d = await get("/api/projects/" + encodeURIComponent(slug) + "/disk"); }
+  catch {
+    // On error, keep showing whatever we already rendered. Only paint the
+    // fallback if we have nothing at all — otherwise the flash returns.
+    if (!cached) el.innerHTML = `<div class="kv dim">couldn't read disk usage</div>`;
+    return;
+  }
+  const html = _renderDiskHtml(slug, d);
+  _diskCache.set(slug, { ts: Date.now(), html });
+  if (el.innerHTML !== html) el.innerHTML = html;
+  return; // skip the old in-function render below — it's now in _renderDiskHtml
 }
 function nowBanner(ev) {
   if (!ev) return "";
