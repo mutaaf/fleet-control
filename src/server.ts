@@ -12,6 +12,7 @@ import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
 import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
+import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { doAction } from "./control.ts";
 import { diskUsage } from "./infra.ts";
 import { evalAlerts } from "./alerts.ts";
@@ -155,6 +156,23 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         });
       }
       if (path === "/api/whoami") return json(res, { loopback: isLoopback(req), needsToken: !isLoopback(req) });
+      // Ticket 0017: today's inbox dismiss endpoint. POST a JSON body
+      // {kind, project_slug, payload_id} to mark one item handled.
+      // Requires `read` scope (loopback bypasses) — same posture as
+      // every other read-API; the dismissal write is additive (a row
+      // in inbox_dismissal + an UPDATE on anomaly.dismissed_at for
+      // anomaly_open), so it's safe under the read scope. The path
+      // ends in /inbox/dismiss (NOT /api/control/...) so it doesn't
+      // require admin and doesn't collide with the control verb
+      // surface.
+      if (path === "/api/fleet/inbox/dismiss" && req.method === "POST") {
+        const iauth = requireAuth(db, req, "read", url);
+        if (!iauth.ok) return json(res, { ok: false, message: iauth.message }, iauth.status);
+        return readBody(req).then((body) => {
+          const r = dismissInboxItem(db, body as DismissRequest);
+          return json(res, r, r.ok ? 200 : 400);
+        });
+      }
       // Live SSE tool-call stream (ticket 0002). Plain text/event-stream; tails
       // the active jsonl transcript and re-opens on rotation. Closes itself
       // after 5 min of idle or on client disconnect. Loopback bypasses auth;
@@ -229,6 +247,12 @@ export function startServer(host = "127.0.0.1", port = 7070) {
         if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
         if (path === "/api/fleet") return json(res, fleetView(db, cfg));
+        // Ticket 0017: today's inbox. Cross-project "what needs me"
+        // aggregation over PRs / anomalies / snapshots / failed runs.
+        // Read-scope (loopback bypasses); same shape as every other
+        // GET /api/fleet/* route — net-new, no existing JSON shape to
+        // preserve.
+        if (path === "/api/fleet/inbox") return json(res, fleetInbox(db));
         // Cross-project tool-call leaderboard (ticket 0014). One JSON
         // payload composed of three SQL aggregations (tools across the
         // fleet, projects, cost-by-phase heatmap). `days` query param

@@ -193,6 +193,24 @@ CREATE TABLE IF NOT EXISTS project_pause (
   triggered_by  TEXT NOT NULL,
   detail_json   TEXT
 );
+
+-- Today's inbox dismissals (ticket 0017). Purely additive: the inbox
+-- helper unions four reads against existing tables (pr / anomaly /
+-- snapshot / run) and then LEFT-JOINs this table to filter out items
+-- the operator already dismissed. For pr_review and run_failed the
+-- dismissal lives ONLY here — no UPDATE on the source row, so the
+-- existing PR / run views stay byte-identical. For anomaly_open the
+-- inbox prefers anomaly.dismissed_at on the source row (a future
+-- column added by the ALTER below in openDb); the table still records
+-- the dismissal for the audit-trail. PK is (kind, project_slug,
+-- payload_id) so re-dismissing is a silent no-op.
+CREATE TABLE IF NOT EXISTS inbox_dismissal (
+  kind          TEXT NOT NULL,
+  project_slug  TEXT NOT NULL,
+  payload_id    TEXT NOT NULL,
+  dismissed_at  TEXT NOT NULL,
+  PRIMARY KEY (kind, project_slug, payload_id)
+);
 `;
 
 export type DB = DatabaseSync;
@@ -215,6 +233,12 @@ export function openDb(path: string): DB {
     // era pick up the column on next open; the value stays NULL until
     // the first syncPricing() call stamps it.
     "ALTER TABLE pricing ADD COLUMN fetched_at TEXT",
+    // ticket 0017: today's inbox marks anomalies dismissed in-place
+    // (the spec says "for anomaly_open this sets dismissed_at on the
+    // anomaly row"). Older DBs predate this column; the inbox helper
+    // tolerates a NULL value the same way it tolerates a missing
+    // inbox_dismissal row.
+    "ALTER TABLE anomaly ADD COLUMN dismissed_at TEXT",
   ]) { try { db.exec(ddl); } catch { /* already there */ } }
   return db;
 }
