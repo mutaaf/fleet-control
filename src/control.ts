@@ -289,8 +289,14 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         // a plain manifest env var read at fire time, not a launchd plist
         // setting. So this action is safe even while a job is running —
         // the running job keeps its already-sourced env, and the next fire
-        // picks up the new cap. We just copy the working-tree manifest
-        // straight to the installed location with cpSync.
+        // picks up the new cap.
+        //
+        // The previous implementation cpSync'd the working-tree manifest
+        // over the installed one; that clobbered other values (e.g. cadence)
+        // any time the working tree was behind origin/main. Now we edit
+        // the INSTALLED manifest directly (the one launchd reads) and only
+        // mirror the change into the working tree as a best-effort so the
+        // operator can `git commit` it if they want it pinned.
         const raw = body?.max_daily_usd;
         let cap = "";
         if (raw !== null && raw !== undefined && raw !== "") {
@@ -298,10 +304,18 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
           if (!Number.isFinite(n) || n < 0) throw new Error("max_daily_usd must be a non-negative number");
           if (n > 0) cap = (Math.round(n * 100) / 100).toString();
         }
-        const mfile = manifestFileFor(p);
-        editOrAppendManifest(mfile, "MAX_DAILY_USD", cap);
         const installed = join(homedir(), ".local", "share", "agent-fleet", "projects", p.slug, "agents.config.sh");
-        if (existsSync(dirname(installed))) cpSync(mfile, installed);
+        if (!existsSync(installed)) throw new Error(`installed manifest not found at ${installed} — run install.sh first`);
+        editOrAppendManifest(installed, "MAX_DAILY_USD", cap);
+        // Mirror into the working tree (best-effort). Skip silently when
+        // the working tree is missing OR equals the installed file (same
+        // inode) so we never write twice.
+        const wt = manifestFileFor(p);
+        try {
+          if (existsSync(wt) && readFileSync(wt, "utf8") !== readFileSync(installed, "utf8")) {
+            editOrAppendManifest(wt, "MAX_DAILY_USD", cap);
+          }
+        } catch { /* installed is the source of truth; mirror failure is fine */ }
         out = "";
         message = cap
           ? `Daily cap set to $${cap} for ${slug}.`
