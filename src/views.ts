@@ -65,6 +65,16 @@ function lastAutoKill(db: DB, slug: string): { ts: string; phase: string; mins: 
 
 export function fleetView(db: DB, cfg: FleetConfig) {
   const projects = db.prepare("SELECT * FROM project ORDER BY slug").all() as any[];
+  // Ticket 0021: prefetch every project_pause row (one row per paused
+  // project) so the per-project loop can attach a `paused` field
+  // without N+1 queries. The field stays `null` for unpaused projects
+  // — purely additive to the payload shape.
+  interface PauseRow { project_id: number; reason: string; }
+  const pauseRows = db.prepare(
+    "SELECT project_id, reason FROM project_pause",
+  ).all() as unknown as PauseRow[];
+  const pauseByProject = new Map<number, string>();
+  for (const r of pauseRows) pauseByProject.set(r.project_id, r.reason);
   const out: any[] = [];
   let totalCost = 0, totalRuns = 0;
   for (const p of projects) {
@@ -105,6 +115,9 @@ export function fleetView(db: DB, cfg: FleetConfig) {
     ).get(p.id) as { n: number; latest: string | null };
     const anomalies = { count_24h: anomalyAgg.n ?? 0, latest_at: anomalyAgg.latest ?? null };
     totalCost += agg.cost ?? 0; totalRuns += agg.runs ?? 0;
+    // Ticket 0021: paused is null | "cost_cap" | "manual". Additive —
+    // every other field above is unchanged.
+    const pausedReason = pauseByProject.get(p.id) ?? null;
     out.push({
       slug: p.slug, name: p.name, displayState: displayState(jobs, scDays, usage),
       selfCancelDays: scDays, engEnabled: !!p.eng_enabled,
@@ -117,6 +130,7 @@ export function fleetView(db: DB, cfg: FleetConfig) {
       // cadence: full schedule (so the SPA can show "every 6h, twice daily…")
       // and label the active pace preset when it matches a known one.
       cadence, pace: paceLabel(cadence),
+      paused: pausedReason,
     });
   }
   // Total-fleet forecast = sum of per-project projections (null projections

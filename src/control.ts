@@ -35,6 +35,11 @@ const KNOWN_ACTIONS = new Set([
   // Budget cap control — writes MAX_DAILY_USD to the manifest so the
   // operator doesn't have to hand-edit agents.config.sh + reinstall.
   "set-budget",
+  // Soft-budget autopause resume (ticket 0021). When the budget_guard
+  // autopaused the ship plist for hitting MAX_DAILY_USD, the operator
+  // taps Resume in the portal — that re-bootstraps the plist and clears
+  // the project_pause row.
+  "resume-paused",
 ]);
 
 /** Strict regex for GitHub HTTPS repo URLs (ticket 0010). Owner/name must
@@ -163,6 +168,36 @@ export function _setRunnerForTests(fn: Runner): void { activeRunner = fn; }
 export function _resetRunnerForTests(): void { activeRunner = defaultRunner; }
 function isRunning(p: Proj): boolean {
   return runningPhases(p).length > 0;
+}
+
+/** Pause the SHIP launchd plist for a project (ticket 0021). Shared
+ *  between the soft-budget autopause guard (src/budget_guard.ts) and any
+ *  future operator-driven pause-cost action. Uses `launchctl bootout`
+ *  with an argv array — never composes a shell string from `slug`. The
+ *  caller is responsible for inserting the project_pause row + posting
+ *  the ntfy event; this helper is purely the shell-out. Returns the
+ *  combined stdout (mostly empty in production). Throws if launchctl
+ *  itself errors — callers downgrade to a best-effort log because the
+ *  plist may already be unloaded (idempotent at the launchd layer). */
+export function pauseShipPlist(db: DB, slug: string): string {
+  if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
+  const p = project(db, slug);
+  return run("launchctl", ["bootout", `gui/${UID}/${label(p, "ship")}`]);
+}
+
+/** Resume the SHIP launchd plist for a project (ticket 0021). The
+ *  symmetric helper to pauseShipPlist — re-bootstraps via
+ *  `bash install.sh` against the INSTALLED manifest dir (the same
+ *  pathway eng-toggle uses, so the cp inside install.sh stays a no-op
+ *  via the `-ef` guard). Argv form throughout; never a shell string. */
+export function resumeShipPlist(db: DB, slug: string): string {
+  if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
+  const p = project(db, slug);
+  const installed = installedManifestFor(p);
+  if (!existsSync(installed)) {
+    throw new Error(`installed manifest not found at ${installed} — run install.sh first`);
+  }
+  return run("bash", [KIT_INSTALL, dirname(installed)]);
 }
 
 /** Names of phases currently `state = running` under launchd, for friendlier
@@ -367,6 +402,18 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         message = cap
           ? `Daily cap set to $${cap} for ${slug}.`
           : `Daily cap cleared for ${slug}.`;
+        break;
+      }
+      case "resume-paused": {         // ticket 0021: clear cost-cap pause + re-bootstrap ship plist
+        // The autopause guard (src/budget_guard.ts) sets project_pause
+        // when the daily cost rollup crosses MAX_DAILY_USD; the operator
+        // taps Resume in the portal to clear it. We re-bootstrap via
+        // bash install.sh against the INSTALLED manifest dir so a stale
+        // working tree can't clobber other fields (same posture as
+        // eng-toggle — ticket 0020).
+        out = resumeShipPlist(db, slug);
+        db.prepare("DELETE FROM project_pause WHERE project_id=?").run(p.id);
+        message = `Resumed ${slug}.`;
         break;
       }
       case "clean-checkouts": {       // janitor pass over ~/.cache/<slug>-agent-*-checkout

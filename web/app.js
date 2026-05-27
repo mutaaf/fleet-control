@@ -481,6 +481,19 @@ function anomalyPill(p) {
   // href. The deep link `?view=anomalies` is preserved by route().
   return `<span class="${cls}" data-anom-link="${esc(p.slug)}" title="${esc(a.latest_at ? "latest " + ago(a.latest_at) : "anomalies in last 24h")}">${label}</span>`;
 }
+// Ticket 0021: amber "paused·cost" pill + inline Resume button on the
+// project card. Empty when paused is null/undefined — render nothing
+// new so unchanged projects stay byte-identical. The button has a
+// data-act="resume-paused" attribute so the global delegate (the same
+// pattern eng-toggle uses) catches the click without nesting a button
+// inside the card's <a>. data-stop is read by the click delegate to
+// suppress the parent <a class="card"> navigation.
+function pausedCostPill(p) {
+  if (!p || p.paused !== "cost_cap") return "";
+  return `<span class="paused-pill cost" title="Paused because today's spend hit the daily $ cap. Tap Resume to restart.">paused·cost
+    <button class="btn xs resume-paused" data-act="resume-paused" data-slug="${esc(p.slug)}" data-stop="1">Resume</button></span>`;
+}
+
 function card(p) {
   const [cls, label] = STATE[p.displayState] || STATE.off;
   const running = p.jobs.find((j) => j.running);
@@ -500,7 +513,7 @@ function card(p) {
       ? `<div class="banner">Stops working in ${sc} day${sc === 1 ? "" : "s"} unless you keep it running.</div>` : "";
   return `<a class="card" href="#/p/${p.slug}">
     <div class="card-head"><span class="pname">${esc(p.name)}</span>
-      <span class="state"><span class="dot ${cls}"></span>${label}${anomalyPill(p)}</span></div>
+      <span class="state"><span class="dot ${cls}"></span>${label}${pausedCostPill(p)}${anomalyPill(p)}</span></div>
     ${telemetry(p.telemetry)}
     ${nowLine || (lastAny ? `<div class="job">Last: ${OUTCOME[lastAny.outcome] || lastAny.outcome || "ran"} · ${ago(lastAny.started_at)}</div>` : "")}
     <div class="metarow">

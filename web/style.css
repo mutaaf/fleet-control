@@ -84,6 +84,22 @@ a.card:hover { border-color: #3a3b34; background: var(--panel2); }
 .anomaly-pill.stale { color: var(--warn); border-color: rgba(217,138,43,.45); background: rgba(217,138,43,.08); }
 .anomaly-badge { margin-top: 14px; }
 
+/* Ticket 0021: soft daily-budget autopause pill. Same shape as
+   .anomaly-pill — sits inside .state and reads as "this project is
+   paused because today's spend hit the cap". Amber palette tied to the
+   existing --warn token so the badge SVG and the SPA pill match. The
+   inline Resume button keeps the operator one tap away from restarting
+   the ship plist. */
+.paused-pill.cost { font-family: var(--mono); font-size: 11px; padding: 1px 8px;
+  border-radius: 20px; border: 1px solid rgba(217,138,43,.55);
+  color: var(--warn); background: rgba(217,138,43,.10);
+  display: inline-flex; align-items: center; gap: 6px; }
+.paused-pill.cost .resume-paused { font-size: 11px; padding: 2px 8px;
+  border-radius: 12px; border: 1px solid rgba(217,138,43,.55);
+  color: var(--warn); background: rgba(217,138,43,.20); cursor: pointer; }
+.paused-pill.cost .resume-paused:hover { filter: brightness(1.15); }
+.btn.xs { font-size: 11px; padding: 2px 8px; line-height: 1.2; }
+
 /* job detail (now/last/next) */
 .jobcard { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; }
 .jobcard h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
