@@ -21,7 +21,7 @@ proposes new ones, `review` grades them.
 |----|-------|----------|--------|------|
 | 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | shipped | control |
 | 0021 | Soft daily budget with autopause when a project blows the cap | P1 | shipped | control |
-| 0017 | Today's inbox — cross-project "what needs me" view | P1 | groomed | portal |
+| 0017 | Today's inbox — cross-project "what needs me" view | P1 | in-progress | portal |
 | 0022 | Fleet temperature — single per-project health score on the home page | P1 | groomed | observability |
 | 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | groomed | ingest |
 | 0023 | PR card shows heal-attempts and first-fail reason inline | P2 | groomed | portal |
