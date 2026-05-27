@@ -1,7 +1,7 @@
 ---
 id: 0018
 title: Backlog-ticket → merged-commit auto-link via git log
-status: proposed
+status: groomed
 priority: P2
 area: ingest
 created: 2026-05-26
