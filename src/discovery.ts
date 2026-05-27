@@ -17,16 +17,46 @@ export interface Manifest {
   manifestPath: string;
 }
 
-/** Parse the simple KEY=value shell manifest (read-only, no sourcing). */
+/** Parse the simple KEY=value shell manifest (read-only, no sourcing).
+ *
+ *  Match bash's value semantics for the patterns we actually see in the
+ *  fleet's manifests:
+ *
+ *    KEY=value                → value
+ *    KEY=value  # comment     → value
+ *    KEY="value"              → value
+ *    KEY="value"  # comment   → value
+ *    KEY="value"# comment     → value   (no space before `#` after a closed
+ *                                        quote — what bash accepts and what
+ *                                        broke discovery once, see #43 era)
+ *    KEY='value w/ spaces'    → value w/ spaces
+ *
+ *  A previous version did `.replace(/\s+#.*$/, "")` which required whitespace
+ *  before the `#`, so `KEY="3600"# comment` parsed as `3600"# comment` and
+ *  every downstream Number() coercion produced NaN, which crashed fleetView
+ *  via `new Date(NaN).toISOString()`.
+ */
+function _parseManifestValue(raw: string): string {
+  const s = raw.trim();
+  if (s[0] === '"' || s[0] === "'") {
+    const q = s[0];
+    let end = 1;
+    while (end < s.length && s[end] !== q) end++;
+    // After the closing quote, anything (including a leading `#` with no
+    // space) is comment. We don't need to read past it.
+    return s.slice(1, end);
+  }
+  // Unquoted: stop at first whitespace or `#`.
+  return s.replace(/[\s#].*$/, "");
+}
+
 function parseManifest(path: string): Manifest | null {
   const text = readFileSync(path, "utf8");
   const v: Record<string, string> = {};
   for (const line of text.split(/\r?\n/)) {
     const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)=(.*)$/);
     if (!m) continue;
-    let val = m[2].trim().replace(/\s+#.*$/, ""); // strip trailing comment
-    val = val.replace(/^["']|["']$/g, "");
-    v[m[1]] = val;
+    v[m[1]] = _parseManifestValue(m[2]);
   }
   if (!v.SLUG || !v.REPO_URL) return null;
   return {
