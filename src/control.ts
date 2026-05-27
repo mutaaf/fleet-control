@@ -110,6 +110,32 @@ function manifestFileFor(p: Proj): string {
   return join(manifestDirFor(p), "agents.config.sh");
 }
 
+/** Path of the INSTALLED manifest — the one launchd actually reads at
+ *  fire time. Ticket 0020: control actions that bump a single field
+ *  (SELF_CANCEL, ENG_ENABLED, MAX_DAILY_USD) write here directly and
+ *  only mirror into the working tree best-effort, so a stale working
+ *  tree can't silently revert unrelated fields. */
+function installedManifestFor(p: Proj): string {
+  const cfg = loadConfig();
+  return join(cfg.installedRoot, p.slug, "agents.config.sh");
+}
+
+/** Mirror a single key=value edit from the installed manifest into the
+ *  working-tree manifest (best-effort). Skip silently when the working
+ *  tree is missing or already points at the installed file (same path
+ *  or identical bytes). The installed copy is the source of truth; the
+ *  mirror just gives the operator something to `git commit` if they
+ *  want the change pinned. */
+function mirrorIntoWorkingTree(p: Proj, installed: string, key: string, value: string): void {
+  try {
+    const wt = manifestFileFor(p);
+    if (!existsSync(wt)) return;
+    if (wt === installed) return;
+    if (readFileSync(wt, "utf8") === readFileSync(installed, "utf8")) return;
+    editOrAppendManifest(wt, key, value);
+  } catch { /* installed is the source of truth; mirror failure is fine */ }
+}
+
 interface Proj { id: number; slug: string; namespace: string; manifest_path: string; repo_owner: string; repo_name: string; repo_url: string; }
 const VALID = (s: string, re: RegExp) => typeof s === "string" && re.test(s);
 const repoOf = (p: Proj) => `${p.repo_owner}/${p.repo_name}`;
@@ -217,7 +243,18 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         for (const ph of phs) { try { out += run("launchctl", ["enable", `gui/${UID}/${label(p, ph)}`]); } catch { /* */ } }
         message = body.phase ? `Resumed ${body.phase} for ${slug}.` : `Resumed ${slug}.`; break;
       }
-      case "keep-running": {          // bump SELF_CANCEL + reinstall
+      case "keep-running": {          // bump SELF_CANCEL (ticket 0020)
+        // SELF_CANCEL is a plain env var read by `fleet_self_cancel` at
+        // fire time, NOT a launchd plist setting. So this action can
+        // (and should) skip install.sh entirely — that was the path
+        // that clobbered the installed manifest when the operator's
+        // working tree was behind origin/main.
+        //
+        // New behavior (matches the set-budget fix in PR #42):
+        //   1. Edit the INSTALLED manifest directly (the one launchd reads).
+        //   2. Mirror into the working tree best-effort so the operator
+        //      can `git commit` the bump if they want it pinned.
+        //   3. NO install.sh — SELF_CANCEL doesn't need a plist regen.
         const days = Math.max(1, Math.min(365, Number(body.days) || 30));
         if (!body?.force) {
           const phs = runningPhases(p);
@@ -225,20 +262,30 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         }
         const d = new Date(Date.now() + days * 86_400_000);
         const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
-        const mdir = manifestDirFor(p);
-        editManifest(manifestFileFor(p), "SELF_CANCEL", ymd);
-        out = run("bash", [KIT_INSTALL, mdir]);
+        const installed = installedManifestFor(p);
+        if (!existsSync(installed)) throw new Error(`installed manifest not found at ${installed} — run install.sh first`);
+        editManifest(installed, "SELF_CANCEL", ymd);
+        mirrorIntoWorkingTree(p, installed, "SELF_CANCEL", ymd);
+        out = "";
         message = `${slug} will keep running for ${days} more days.`; break;
       }
-      case "eng-toggle": {            // turn the eng (tidy-the-code) queue on/off
+      case "eng-toggle": {            // turn the eng (tidy-the-code) queue on/off (ticket 0020)
+        // ENG_ENABLED flipping requires install.sh because the eng plist
+        // appears/disappears. But we point install.sh at the INSTALLED
+        // dir, not the working tree, so the cp inside install.sh is a
+        // no-op via the `-ef` (same-file) guard. That stops the stale
+        // working tree from clobbering whatever main has since pushed
+        // (cadence pins, MAX_DAILY_USD, etc.).
         if (!body?.force) {
           const phs = runningPhases(p);
           if (phs.length) { audit(db, actor, action, `${slug}/*`, body, 1, "", actorName); return runningResult(phs); }
         }
         const on = body.enabled ? "1" : "0";
-        const mdir = manifestDirFor(p);
-        editManifest(manifestFileFor(p), "ENG_ENABLED", on);
-        out = run("bash", [KIT_INSTALL, mdir]);
+        const installed = installedManifestFor(p);
+        if (!existsSync(installed)) throw new Error(`installed manifest not found at ${installed} — run install.sh first`);
+        editManifest(installed, "ENG_ENABLED", on);
+        out = run("bash", [KIT_INSTALL, dirname(installed)]);
+        mirrorIntoWorkingTree(p, installed, "ENG_ENABLED", on);
         message = `Code-tidying ${on === "1" ? "enabled" : "disabled"} for ${slug}.`; break;
       }
       case "pr-merge": {              // "Approve & publish" — arm auto-merge (lands when CI green)

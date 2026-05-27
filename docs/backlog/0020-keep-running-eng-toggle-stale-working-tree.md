@@ -1,7 +1,7 @@
 ---
 id: 0020
 title: keep-running and eng-toggle clobber installed manifest when working tree is stale
-status: groomed
+status: shipped
 priority: P1
 area: control
 created: 2026-05-26
@@ -99,4 +99,24 @@ telling.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-27 — picked up by implementation-dev. Branch
+  `feat/0020-keep-running-eng-toggle-stale-tree`. Plan: route both
+  actions through the installed manifest (the one launchd actually reads)
+  and only mirror into the working tree best-effort, mirroring the
+  set-budget fix from PR #42. `keep-running` skips `install.sh` entirely
+  (SELF_CANCEL is a plain env var); `eng-toggle` keeps `install.sh` but
+  passes the installed manifest dir so the cp inside is a no-op via
+  the `-ef` guard. New `tests/control-staleness.test.ts` seeds a stale
+  working tree + a current installed manifest and asserts neither
+  action loses the operator's unrelated cadence edit.
+- 2026-05-27 — landed in `src/control.ts`. `keep-running` writes the
+  installed manifest directly and skips `install.sh` entirely.
+  `eng-toggle` writes the installed manifest then runs `bash install.sh
+  <installed-dir>` so the eng plist re-bootstraps cleanly while the
+  `cp` inside install.sh short-circuits via `-ef`. Both actions mirror
+  into the working tree best-effort. New helpers
+  `installedManifestFor()` + `mirrorIntoWorkingTree()` make the
+  pattern reusable. Seven tests in `tests/control-staleness.test.ts`
+  cover both happy paths, the install.sh-skip invariant, the
+  installed-dir argv invariant, the working-tree mirror, and the
+  missing-installed-manifest error.

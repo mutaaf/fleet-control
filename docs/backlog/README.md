@@ -19,7 +19,7 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
-| 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | groomed | control |
+| 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | shipped | control |
 | 0021 | Soft daily budget with autopause when a project blows the cap | P1 | groomed | control |
 | 0017 | Today's inbox — cross-project "what needs me" view | P1 | groomed | portal |
 | 0022 | Fleet temperature — single per-project health score on the home page | P1 | groomed | observability |
