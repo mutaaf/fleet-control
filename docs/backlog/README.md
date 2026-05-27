@@ -38,3 +38,4 @@ proposes new ones, `review` grades them.
 | 0012 | Weekly "what shipped" digest with wins and trends | P2 | shipped | observability |
 | 0013 | Shareable read-only fleet snapshot with anonymized slugs | P2 | shipped | portal |
 | 0019 | prs_merged count reads from runs not control_audit | P1 | shipped | portal |
+| 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | groomed | control |
