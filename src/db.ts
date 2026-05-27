@@ -179,6 +179,20 @@ CREATE TABLE IF NOT EXISTS snapshot (
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS snapshot_created_at ON snapshot(created_at DESC);
+
+-- Soft daily-budget autopause state (ticket 0021). One row per paused
+-- project (PRIMARY KEY on project_id), so re-firing the guard the same
+-- day is idempotent via INSERT OR REPLACE. reason is one of 'cost_cap'
+-- (v1 — set by the autopause guard) or 'manual' (reserved for a future
+-- ticket; v1 never writes this value). detail_json carries the figures
+-- the operator wants to see: {spent_usd, cap_usd, day}.
+CREATE TABLE IF NOT EXISTS project_pause (
+  project_id    INTEGER PRIMARY KEY REFERENCES project(id),
+  reason        TEXT NOT NULL,
+  triggered_at  TEXT NOT NULL,
+  triggered_by  TEXT NOT NULL,
+  detail_json   TEXT
+);
 `;
 
 export type DB = DatabaseSync;

@@ -144,8 +144,26 @@ interface CostRow {
  *  `unknown`. The mapping is intentionally generous on the "good"
  *  side because the agent fleet labels success runs in several
  *  flavours; the value text stays `ok` for all of them so the
- *  badge reads cleanly. */
+ *  badge reads cleanly.
+ *
+ *  Ticket 0021: when the project is cost-cap paused (project_pause
+ *  row with reason='cost_cap'), the badge shifts to the existing
+ *  amber/yellow palette token with value 'paused·cost' — same colour
+ *  the SPA pill uses so README readers see the same state. The check
+ *  is cheap (one row lookup keyed on project_id) and short-circuits
+ *  before the outcome map so a paused project that also failed a
+ *  recent run still reads as 'paused·cost'. */
 function statusBadge(db: DB, slug: string): BadgeData {
+  // Cost-cap pause short-circuit (ticket 0021). The join goes through
+  // project so an unknown slug folds into "no pause row" naturally.
+  const pause = db.prepare(
+    "SELECT pp.reason AS reason FROM project_pause pp "
+    + "JOIN project p ON p.id = pp.project_id "
+    + "WHERE p.slug=?",
+  ).get(slug) as unknown as { reason: string } | undefined;
+  if (pause && pause.reason === "cost_cap") {
+    return { label: "fleet", value: "paused·cost", color: BADGE_COLORS.yellow };
+  }
   const row = db.prepare(
     "SELECT outcome FROM run r "
     + "JOIN project p ON p.id = r.project_id "

@@ -10,6 +10,7 @@ import { loadConfig } from "./config.ts";
 import { openDb } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { evalAlerts } from "./alerts.ts";
+import { runBudgetGuards } from "./budget_guard.ts";
 
 const UID = process.getuid?.() ?? 0;
 const LABEL = "com.fleet.control.fleetd";
@@ -25,8 +26,21 @@ export async function runDaemon(intervalSec = 60): Promise<void> {
   const db = openDb(cfg.dbPath);
   console.log(`fleetd up — every ${intervalSec}s`);
   for (;;) {
-    try { runIngestPass(db, cfg); const n = evalAlerts(db, cfg, true); if (n) console.log(`${new Date().toISOString()} ${n} new alert(s)`); }
-    catch (e) { console.error("pass error:", e); }
+    try {
+      runIngestPass(db, cfg);
+      const n = evalAlerts(db, cfg, true);
+      if (n) console.log(`${new Date().toISOString()} ${n} new alert(s)`);
+      // Ticket 0021: soft daily-budget autopause runs once per ingest
+      // tick AFTER the rollup recompute. Cheap query (one row per
+      // project); fresh pauses fire launchctl bootout + one ntfy
+      // push. Idempotent across ticks via the project_pause table.
+      try {
+        const guard = await runBudgetGuards(db, new Date());
+        if (guard.paused.length) {
+          console.log(`${new Date().toISOString()} autopaused ${guard.paused.length} project(s) over budget cap`);
+        }
+      } catch (e) { console.error("budget guard error:", e); }
+    } catch (e) { console.error("pass error:", e); }
     await sleep(intervalSec);
   }
 }
