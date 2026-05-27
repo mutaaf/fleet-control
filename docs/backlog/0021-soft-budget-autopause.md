@@ -1,7 +1,7 @@
 ---
 id: 0021
 title: Soft daily budget with autopause when a project blows the cap
-status: in-progress
+status: shipped
 priority: P1
 area: control
 created: 2026-05-27
@@ -186,3 +186,4 @@ Each box maps 1:1 to a test scenario.
   Implementation order: db schema → budget_guard module → control pause/resume
   helpers → daemon hookup → views.paused field → /api/control resume-paused →
   badge amber → ntfy event → SPA pill + Resume button.
+- 2026-05-27: shipped via PR #47; status → shipped.
