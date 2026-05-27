@@ -2,7 +2,7 @@
 id: 0017
 title: Today's inbox — cross-project "what needs me" view
 status: groomed
-priority: P2
+priority: P1
 area: portal
 created: 2026-05-26
 owner: gtm-innovation

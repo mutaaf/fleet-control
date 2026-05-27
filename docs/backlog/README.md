@@ -19,11 +19,16 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
+| 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | groomed | control |
+| 0021 | Soft daily budget with autopause when a project blows the cap | P1 | groomed | control |
+| 0017 | Today's inbox — cross-project "what needs me" view | P1 | groomed | portal |
+| 0022 | Fleet temperature — single per-project health score on the home page | P1 | groomed | observability |
+| 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | groomed | ingest |
+| 0023 | PR card shows heal-attempts and first-fail reason inline | P2 | groomed | portal |
+| 0024 | First-run welcome — printed checklist after fleetctl serve cold start | P2 | proposed | infra |
 | 0014 | Cross-project tool-call leaderboard | P1 | shipped | observability |
 | 0015 | Embeddable status badge SVG per project | P1 | shipped | portal |
 | 0016 | fleetctl doctor — one-shot install + ingest diagnostic | P2 | shipped | infra |
-| 0017 | Today's inbox — cross-project "what needs me" view | P2 | groomed | portal |
-| 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | proposed | ingest |
 | 0001 | Ingest events.jsonl from each project | P0 | shipped | ingest |
 | 0002 | SSE live tool-call stream from active transcripts | P0 | shipped | portal |
 | 0003 | Per-user scoped tokens with audit log | P1 | shipped | control |
@@ -38,4 +43,3 @@ proposes new ones, `review` grades them.
 | 0012 | Weekly "what shipped" digest with wins and trends | P2 | shipped | observability |
 | 0013 | Shareable read-only fleet snapshot with anonymized slugs | P2 | shipped | portal |
 | 0019 | prs_merged count reads from runs not control_audit | P1 | shipped | portal |
-| 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | groomed | control |
