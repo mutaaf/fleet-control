@@ -265,6 +265,31 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
   font-family: var(--mono); white-space: nowrap; overflow-x: auto; }
 .embed-row .embed-snippet:focus { outline: none; border-color: var(--accent); }
 
+/* Today's inbox (ticket 0017). One actionable row per "what needs
+   me" item — sits above the project grid on the home view. Same
+   dark-panel chrome as the digest banner, but rendered as a list
+   (not a banner) so each row has its own action surface. The
+   inbox-empty case is a single line so the zero-state stays
+   visually quiet. */
+.inbox-list { display: flex; flex-direction: column; gap: 8px;
+  margin: 0 0 12px; }
+.inbox-row { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 10px 14px;
+  display: grid; grid-template-columns: 1fr auto; gap: 6px 14px;
+  align-items: center; }
+.inbox-row .inbox-meta { font-family: var(--mono); font-size: 11.5px;
+  color: var(--dim); grid-column: 1 / -1; }
+.inbox-row .inbox-meta .inbox-kind { color: var(--accent); font-weight: 600; }
+.inbox-row .inbox-title { color: var(--ink); font-size: 14px;
+  grid-column: 1; min-width: 0; overflow-wrap: anywhere; }
+.inbox-row .inbox-actions { display: flex; align-items: center; gap: 6px;
+  grid-column: 2; }
+.inbox-empty { font-family: var(--mono); font-size: 13px; color: var(--dim);
+  padding: 10px 0 16px; }
+.inbox-badge { color: var(--accent); border: 1px solid rgba(200,132,30,.4);
+  border-radius: 20px; padding: 1px 9px; }
+.inbox-badge:hover { text-decoration: underline; }
+
 /* Mobile-first portal pass (ticket 0011).
    Single phone breakpoint at 640px — covers iPhone 13 mini (375), iPhone
    14 Plus (414), and small Android handsets. The pass is layout-only:
@@ -304,4 +329,10 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
      snippet doesn't crowd a phone-sized viewport. */
   .embed-row .embed-label { flex: 1 1 100%; }
   .embed-row .embed-snippet { flex: 1 1 100%; min-width: 0; }
+  /* Ticket 0017: inbox rows stack single-column on phones. The grid
+     collapses to one auto column so the title and actions sit on
+     their own lines — keeps a 44px tap target while every row stays
+     readable at 375px without horizontal scroll. */
+  .inbox-row { grid-template-columns: 1fr; }
+  .inbox-row .inbox-actions { grid-column: 1; }
 }

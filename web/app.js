@@ -367,6 +367,98 @@ async function fetchDigest() {
   try { return await get("/api/digest/week"); } catch { return null; }
 }
 
+// Ticket 0017: today's inbox. One cross-fleet pull above the project
+// grid that answers "anything I need to do?" Errors fall through
+// silently — the home page still renders if the inbox endpoint is
+// unavailable. `renderInbox` returns "" for null/empty so we can use
+// the same string concat as `digestBanner` does.
+async function fetchInbox() {
+  try { return await get("/api/fleet/inbox"); } catch { return null; }
+}
+
+const INBOX_KIND_LABEL = {
+  pr_review: "PR awaits review",
+  anomaly_open: "Anomaly fired",
+  snapshot_expiring: "Snapshot expires soon",
+  run_failed: "Last run failed",
+};
+
+function inboxRow(item) {
+  const lbl = INBOX_KIND_LABEL[item.kind] || item.kind;
+  const slug = esc(item.project_slug);
+  const title = esc(item.title);
+  const actionLabel = esc((item.action && item.action.label) || "Open");
+  const route = (item.action && item.action.route) || "#/";
+  const isExternal = /^https?:\/\//.test(route);
+  // The "open" link uses the existing styling — external (PR URL) gets
+  // target=_blank, internal hash routes navigate in-place. The
+  // "dismiss" button posts to /api/fleet/inbox/dismiss via the global
+  // data-act delegate (added below) and the row disappears on the
+  // next 5s home() poll.
+  const openLink = isExternal
+    ? `<a class="btn sm" href="${esc(route)}" target="_blank" rel="noopener" data-stop="1">${actionLabel}</a>`
+    : `<a class="btn sm" href="${esc(route)}" data-stop="1">${actionLabel}</a>`;
+  return `<div class="inbox-row" data-inbox-row data-kind="${esc(item.kind)}" data-slug="${slug}" data-payload-id="${esc(item.payload.id)}">
+    <div class="inbox-meta">
+      <span class="inbox-kind">${esc(lbl)}</span>
+      <span class="dim">· ${slug} · ${esc(ago(new Date(Date.now() - (item.age_seconds || 0) * 1000).toISOString()))}</span>
+    </div>
+    <div class="inbox-title">${title}</div>
+    <div class="inbox-actions">
+      ${openLink}
+      <button class="btn sm" data-act="inbox-dismiss" data-kind="${esc(item.kind)}" data-slug="${slug}" data-payload-id="${esc(item.payload.id)}">Dismiss</button>
+    </div>
+  </div>`;
+}
+
+function renderInbox(data) {
+  if (!data) return "";
+  const items = data.items || [];
+  if (items.length === 0) {
+    return `<div class="eyebrow">Inbox</div>
+      <div class="inbox-empty">Inbox zero — fleet's healthy.</div>`;
+  }
+  return `<div class="eyebrow">Inbox · ${items.length} thing${items.length === 1 ? "" : "s"} need${items.length === 1 ? "s" : ""} you</div>
+    <div class="inbox-list">${items.map(inboxRow).join("")}</div>`;
+}
+
+// Dismiss handler — POST to /api/fleet/inbox/dismiss, then trigger a
+// home() refresh so the row disappears immediately. Uses the same
+// fleet-token plumbing as act() but a different path so it isn't a
+// /api/control/ verb.
+async function dismissInbox(kind, slug, payloadId) {
+  const tok = localStorage.getItem("fleetToken") || "";
+  try {
+    const r = await fetch("/api/fleet/inbox/dismiss", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(tok ? { "x-fleet-token": tok } : {}) },
+      body: JSON.stringify({ kind, project_slug: slug, payload_id: payloadId }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.ok) {
+      toast("dismissed", true);
+      // Optimistically remove the row so the operator sees an
+      // immediate effect; the next home() poll re-renders from the
+      // server response anyway.
+      const row = document.querySelector(`[data-inbox-row][data-kind="${CSS.escape(kind)}"][data-slug="${CSS.escape(slug)}"][data-payload-id="${CSS.escape(payloadId)}"]`);
+      if (row && row.parentNode) row.parentNode.removeChild(row);
+      setTimeout(route, 400);
+    } else {
+      toast(d.message || "couldn't dismiss", false);
+    }
+  } catch {
+    toast("couldn't reach the server", false);
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-act='inbox-dismiss']");
+  if (!b) return;
+  e.preventDefault();
+  e.stopPropagation();
+  dismissInbox(b.dataset.kind, b.dataset.slug, b.dataset.payloadId);
+});
+
 /** Render the "Last week" banner at the top of the home view from a
  *  /api/digest/week payload. Returns an HTML string. Tap-to-expand is
  *  handled by a document-level listener registered once at bottom of file. */
@@ -408,15 +500,20 @@ function digestBanner(d) {
 }
 
 async function home() {
-  // Fan out /api/fleet + /api/digest/week so the second round-trip doesn't
-  // delay the rest of the page. The banner is rendered above the alerts.
-  const [data, digestData] = await Promise.all([get("/api/fleet"), fetchDigest()]);
+  // Fan out /api/fleet + /api/digest/week + /api/fleet/inbox so the
+  // round-trips don't serialize. Inbox banner renders ABOVE the project
+  // grid (per ticket 0017) so the operator sees "what needs me" first.
+  const [data, digestData, inboxData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(),
+  ]);
   const alerts = data.alerts || [];
-  summary.innerHTML = `${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort · <a href="#/leaderboard" class="navlink">Compare ›</a>`;
+  const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
+  summary.innerHTML = `${inboxCount ? `<a href="#inbox" class="inbox-badge" data-inbox-badge>Inbox ${inboxCount}</a> · ` : ""}${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort · <a href="#/leaderboard" class="navlink">Compare ›</a>`;
   // Cache pace info so the "Set fleet pace" modal can show the current mix.
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
     digestBanner(digestData) +
+    renderInbox(inboxData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
     `<div class="eyebrow rowflex">Your projects <button class="btn sm" data-modal="add">+ Add a project</button></div>` + data.projects.map(card).join("") +
     `<div class="eyebrow" style="margin-top:28px">Across the fleet</div>

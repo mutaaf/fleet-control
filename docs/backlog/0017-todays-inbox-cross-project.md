@@ -1,7 +1,7 @@
 ---
 id: 0017
 title: Today's inbox — cross-project "what needs me" view
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-05-26
@@ -153,4 +153,13 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-27 [implementation-dev] picked up groomed → in-progress on
+  branch `feat/0017-todays-inbox-cross-project`. Plan: add the
+  `inbox_dismissal` table to `src/db.ts`, write `fleetInbox(db)` +
+  dismissal helpers in a new `src/inbox.ts` module (kept out of
+  `views.ts` so the home view stays small), wire two routes
+  (`GET /api/fleet/inbox`, `POST /api/fleet/inbox/dismiss`) into
+  `src/server.ts`, and render the inbox section above the project
+  grid in `web/app.js` with mobile-stacking styles in
+  `web/style.css`. Tests live in `tests/inbox.test.ts` — one per AC
+  box.
