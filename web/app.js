@@ -491,9 +491,60 @@ const INBOX_KIND_LABEL = {
   anomaly_open: "Anomaly fired",
   snapshot_expiring: "Snapshot expires soon",
   run_failed: "Last run failed",
+  // Ticket 0027: a fleet-wide pattern — the same failure signature
+  // hitting N projects within 24h.
+  fleet_correlation: "Fleet pattern",
 };
 
+// Ticket 0027: defence-in-depth secret redaction at the renderer
+// boundary (mirrors src/doctor.ts's redactSecrets — same regexes).
+// Correlation excerpts pull live `gh run view --log-failed` output,
+// which in pathological cases can include a leaked PAT in a curl
+// invocation. We strip token-shaped substrings before they land in
+// the DOM. (Per LESSONS § "defence-in-depth secret redaction at the
+// renderer boundary".)
+function redactSecrets(s) {
+  let out = String(s ?? "");
+  // GitHub PATs (ghp_, gho_, ghu_, ghs_, ghr_) followed by >=20 chars.
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  // GitHub repo URLs — same heuristic as doctor.
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  // Long base64-ish tokens (>=24 chars of [A-Za-z0-9_]).
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (m) => {
+    const hasLetter = /[A-Za-z]/.test(m);
+    const hasDigit = /\d/.test(m) || /_/.test(m);
+    return hasLetter && hasDigit ? "<redacted>" : m;
+  });
+  return out;
+}
+
+// Ticket 0027: a fleet_correlation item renders the affected project
+// slugs as inline chips and the "investigate" CTA navigates to the
+// detail view at #/correlation/<signature>. Excerpts pass through
+// redactSecrets before any HTML interpolation.
+function renderCorrelationItem(item) {
+  const payload = item.payload || {};
+  const sig = esc(payload.signature || item.payload.id);
+  const slugs = Array.isArray(payload.affected_slugs) ? payload.affected_slugs : [];
+  const chips = slugs.map((s) => `<a class="chip" href="#/p/${esc(s)}" data-stop="1">${esc(s)}</a>`).join("");
+  const title = esc(item.title);
+  const route = "#/correlation/" + encodeURIComponent(payload.signature || item.payload.id);
+  return `<div class="inbox-row" data-inbox-row data-kind="fleet_correlation" data-slug="fleet" data-payload-id="${sig}">
+    <div class="inbox-meta">
+      <span class="inbox-kind">${esc(INBOX_KIND_LABEL.fleet_correlation)}</span>
+      <span class="dim">· signature ${sig} · ${esc(ago(new Date(Date.now() - (item.age_seconds || 0) * 1000).toISOString()))}</span>
+    </div>
+    <div class="inbox-title">${title}</div>
+    <div class="inbox-chips">${chips}</div>
+    <div class="inbox-actions">
+      <a class="btn sm" href="${esc(route)}" data-stop="1">Investigate</a>
+      <button class="btn sm" data-act="inbox-dismiss" data-kind="fleet_correlation" data-slug="fleet" data-payload-id="${sig}">Dismiss</button>
+    </div>
+  </div>`;
+}
+
 function inboxRow(item) {
+  if (item.kind === "fleet_correlation") return renderCorrelationItem(item);
   const lbl = INBOX_KIND_LABEL[item.kind] || item.kind;
   const slug = esc(item.project_slug);
   const title = esc(item.title);
@@ -1300,6 +1351,49 @@ function parseHash(h) {
   const params = new URLSearchParams(query);
   return { path, params };
 }
+// Ticket 0027: fleet-correlation detail view. Pulls /api/fleet/
+// correlations, finds the matching signature, and renders the
+// affected projects + each project's first 200-char failure excerpt
+// side-by-side. Every excerpt passes through redactSecrets before
+// HTML interpolation (LESSONS § "defence-in-depth secret redaction
+// at the renderer boundary").
+async function correlation(signature) {
+  const sig = decodeURIComponent(signature || "");
+  let data;
+  try { data = await get("/api/fleet/correlations"); }
+  catch (e) {
+    app.innerHTML = `<div class="loading">couldn’t load correlations.<br><span class="dim">${esc(e.message)}</span></div>`;
+    return;
+  }
+  const list = (data && data.correlations) || [];
+  const cor = list.find((c) => c.signature === sig);
+  if (!cor) {
+    app.innerHTML = `<div class="eyebrow"><a href="#/" class="navlink">‹ Back</a></div>
+      <div class="card"><b>No active correlation</b> for signature <code>${esc(sig)}</code>.
+      <div class="dim">It may have been dismissed or aged out of the 24-hour window.</div></div>`;
+    return;
+  }
+  const slugs = Array.isArray(cor.project_slugs) ? cor.project_slugs : [];
+  const excerpt = redactSecrets(cor.sample_excerpt || "");
+  // Each affected project gets one column with its slug + the shared
+  // excerpt (the detector stores one sample per signature, not per
+  // project; this is the side-by-side surface the operator asked
+  // for). When a future ticket pulls per-project excerpts, the
+  // payload already has a place to land.
+  const cols = slugs.map((s) => `<div class="correlation-col">
+    <div class="correlation-slug"><a href="#/p/${esc(s)}">${esc(s)}</a></div>
+    <pre class="correlation-excerpt">${esc(excerpt)}</pre>
+  </div>`).join("");
+  app.innerHTML = `<div class="eyebrow"><a href="#/" class="navlink">‹ Back</a> · Fleet correlation</div>
+    <div class="card">
+      <div class="correlation-head">
+        <div class="correlation-sig">${esc(cor.signature)}</div>
+        <div class="dim">${slugs.length} projects affected · first seen ${esc(ago(cor.first_seen_at))} · last seen ${esc(ago(cor.last_seen_at))}</div>
+      </div>
+      <div class="correlation-grid">${cols}</div>
+    </div>`;
+}
+
 async function route() {
   stop();
   const h = location.hash || "#/";
@@ -1311,6 +1405,12 @@ async function route() {
       timer = setInterval(() => project(s, params).catch(() => {}), 5000);
     } else if (path.startsWith("r/")) {
       await run(path.slice(2));
+    } else if (path.startsWith("correlation/")) {
+      // Ticket 0027: fleet-correlation detail view. One-shot render
+      // — no polling timer because the operator is reading, not
+      // monitoring; the inbox refresh on the home view is the live
+      // surface.
+      await correlation(path.slice("correlation/".length));
     } else if (path === "leaderboard" || path.startsWith("leaderboard")) {
       // Ticket 0014: cross-project tool-call leaderboard. One-shot
       // render — no polling timer because the data window is fixed

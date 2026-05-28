@@ -13,6 +13,7 @@ import { recentEvents } from "./ingest/events.ts";
 import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
+import { activeCorrelations } from "./correlate.ts";
 import { doAction } from "./control.ts";
 import { diskUsage } from "./infra.ts";
 import { evalAlerts } from "./alerts.ts";
@@ -307,6 +308,14 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         // GET /api/fleet/* route — net-new, no existing JSON shape to
         // preserve.
         if (path === "/api/fleet/inbox") return json(res, fleetInbox(db));
+        // Ticket 0027: active cross-project failure correlations.
+        // Read-scope (loopback bypasses); same posture as every other
+        // GET /api/fleet/* route. Net-new — no existing JSON shape to
+        // preserve. Returns the array of active (non-dismissed)
+        // correlation rows the inbox + detail view both render.
+        if (path === "/api/fleet/correlations") {
+          return json(res, { correlations: activeCorrelations(db, new Date()) });
+        }
         // Merge streak counter + 90-day calendar heatmap (ticket 0026).
         // Read-scope (loopback bypasses); same posture as every other
         // GET /api/fleet/* route. Net-new — no existing JSON shape
