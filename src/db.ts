@@ -247,6 +247,45 @@ export function openDb(path: string): DB {
     // score = 100) so older DBs render healthy until the next ingest
     // tick repopulates the column.
     "ALTER TABLE pr ADD COLUMN gh_created_at TEXT",
+    // ticket 0027: cross-project failure correlation. The first
+    // failing check name (e.g. "typecheck") is the lookup key the
+    // ingest pass uses to call `gh run view --log-failed`; the
+    // resulting first 200 chars of the log become first_fail_excerpt.
+    // Both default NULL on legacy rows so the correlation detector
+    // simply skips them (signature derivation requires an excerpt).
+    // Why the column lives on `pr` and not a side table: every
+    // existing PR-card render path already SELECTs from pr; carrying
+    // these two columns inline keeps the cross-join overhead the
+    // detector pays at one table.
+    "ALTER TABLE pr ADD COLUMN first_fail_check TEXT",
+    "ALTER TABLE pr ADD COLUMN first_fail_excerpt TEXT",
+    // ticket 0027: the anomaly table grows one new column for
+    // correlation tagging. The existing `kind` column (NOT NULL since
+    // 0008) is reused for the new 'fleet_correlated' value — adding
+    // a parallel default-bearing column would split the kind-space
+    // across two fields and complicate every existing
+    // SELECT a.kind read in src/inbox.ts and src/anomaly.ts. Legacy
+    // rows keep their original kind ('duration' / 'cost'); new
+    // correlation rows carry kind='fleet_correlated' AND
+    // correlation_signature='TS2304' (or similar). The detector's
+    // dedup key is correlation_signature alone, so the union with
+    // the legacy kind-space is harmless.
+    "ALTER TABLE anomaly ADD COLUMN correlation_signature TEXT",
   ]) { try { db.exec(ddl); } catch { /* already there */ } }
+  // Ticket 0027: a regular (non-unique) index on
+  // (correlation_signature, created_at) makes the daemon hook's
+  // "is there already a live row for this signature?" lookup O(log
+  // n) without locking out the legitimate re-fire path. We DON'T add
+  // a hard UNIQUE constraint because correlations re-fire after a
+  // dismissal once a NEW occurrence is detected outside the
+  // dismissed window — the application-level guard in
+  // runCorrelationHook() owns idempotency within the 24h window.
+  try {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS anomaly_correlation_sig_ts "
+      + "ON anomaly(correlation_signature, created_at DESC) "
+      + "WHERE kind = 'fleet_correlated'",
+    );
+  } catch { /* index exists or older sqlite */ }
   return db;
 }

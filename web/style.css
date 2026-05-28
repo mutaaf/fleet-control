@@ -290,6 +290,32 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
   border-radius: 20px; padding: 1px 9px; }
 .inbox-badge:hover { text-decoration: underline; }
 
+/* Ticket 0027: fleet_correlation inbox row + detail view. Project
+   chips render inline under the title (one per affected slug); the
+   detail view stacks each project's failure excerpt side-by-side. */
+.inbox-row .inbox-chips { grid-column: 1 / -1;
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 2px; }
+.inbox-row .inbox-chips .chip { font-family: var(--mono); font-size: 11.5px;
+  color: var(--ink); background: rgba(255,255,255,0.04);
+  border: 1px solid var(--line); border-radius: 12px;
+  padding: 1px 9px; text-decoration: none; }
+.inbox-row .inbox-chips .chip:hover { border-color: var(--accent); color: var(--accent); }
+.correlation-head { display: flex; flex-direction: column; gap: 4px;
+  margin-bottom: 12px; }
+.correlation-sig { font-family: var(--mono); font-size: 18px;
+  color: var(--accent); font-weight: 600; }
+.correlation-grid { display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.correlation-col { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.correlation-col .correlation-slug { font-family: var(--mono); font-size: 13px;
+  color: var(--ink); font-weight: 600; }
+.correlation-col .correlation-excerpt { font-family: var(--mono); font-size: 11.5px;
+  color: var(--dim); margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 240px; overflow-y: auto; }
+
 /* Ticket 0022: per-project "fleet temperature" health dot + tooltip.
    One coloured dot prefix on each project card's head; reuses the
    existing palette tokens (--good / --warn / --bad / --paused) so a

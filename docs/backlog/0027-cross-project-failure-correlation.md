@@ -1,7 +1,7 @@
 ---
 id: 0027
 title: Cross-project failure correlation - same error in N projects fires a fleet alert
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-28
@@ -216,4 +216,20 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-28 — picked up by implementation-dev on branch
+  `feat/0027-cross-project-failure-correlation`. Status flipped to
+  in-progress.
+- 2026-05-28 — prerequisite check: ticket 0023 (which would add
+  `pr.first_fail_check`) is still `groomed`. Taking option (a) per the
+  ship prompt's guidance and adding the minimal `first_fail_check TEXT`
+  column + its population from the existing `statusCheckRollup`
+  payload in `src/ingest/prs.ts` as part of this ticket. Scope kept
+  tight — no UI surface for `first_fail_check` itself (that remains
+  0023's job). The column is derived from the same `gh pr list` JSON
+  the module already fetches (no new shell-out): the first rollup
+  entry whose conclusion matches /FAIL|ERROR|CANCEL/i wins, with its
+  `name` (or `context`) becoming `first_fail_check`. The
+  `first_fail_excerpt` is populated via a NEW `gh run view
+  --log-failed` call gated on `first_fail_check` being non-null, per
+  this ticket's AC#3. Both reuse the existing
+  `_setPrRunnerForTests` seam.

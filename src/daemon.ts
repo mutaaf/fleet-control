@@ -11,6 +11,7 @@ import { openDb } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { evalAlerts } from "./alerts.ts";
 import { runBudgetGuards } from "./budget_guard.ts";
+import { runCorrelationHook } from "./correlate.ts";
 
 const UID = process.getuid?.() ?? 0;
 const LABEL = "com.fleet.control.fleetd";
@@ -40,6 +41,18 @@ export async function runDaemon(intervalSec = 60): Promise<void> {
           console.log(`${new Date().toISOString()} autopaused ${guard.paused.length} project(s) over budget cap`);
         }
       } catch (e) { console.error("budget guard error:", e); }
+      // Ticket 0027: cross-project failure correlation. Runs after the
+      // ingest pass has refreshed the `pr` table (so first_fail_check
+      // / first_fail_excerpt are current) and after evalAlerts +
+      // budget guards so the per-project alerts don't shadow the
+      // fleet-wide pattern. Idempotent across ticks via the partial
+      // unique index on anomaly(correlation_signature) — running the
+      // hook twice in the same 24h window for the same signature is
+      // a no-op.
+      try {
+        const inserted = runCorrelationHook(db, new Date());
+        if (inserted) console.log(`${new Date().toISOString()} ${inserted} new fleet correlation(s)`);
+      } catch (e) { console.error("correlation hook error:", e); }
     } catch (e) { console.error("pass error:", e); }
     await sleep(intervalSec);
   }
