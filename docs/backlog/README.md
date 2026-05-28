@@ -20,7 +20,7 @@ proposes new ones, `review` grades them.
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
 | 0025 | fleetctl demo - one-command sandbox boots portal against seeded fixture fleet | P1 | shipped | infra |
-| 0026 | Merge streak counter and 90-day calendar heatmap on portal home | P1 | groomed | portal |
+| 0026 | Merge streak counter and 90-day calendar heatmap on portal home | P1 | in-progress | portal |
 | 0027 | Cross-project failure correlation - same error in N projects fires a fleet alert | P1 | groomed | observability |
 | 0028 | Project card shows month-to-date budget burndown with projection line | P2 | groomed | observability |
 | 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | shipped | control |
