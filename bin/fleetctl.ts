@@ -15,9 +15,10 @@ import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts
 import { listSnapshots } from "../src/snapshot.ts";
 import { doAction } from "../src/control.ts";
 import { defaultDeps, runDoctor, renderHuman, renderJson, exitCodeFor } from "../src/doctor.ts";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { loadDemoFixture, DEMO_BANNER, DEMO_DEFAULT_PORT } from "../src/demo/fixture.ts";
+import { mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join as pathJoin } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -359,6 +360,87 @@ switch (cmd) {
     }
     break;
   }
+  case "demo": {
+    // `fleetctl demo` — one-command sandbox (ticket 0025). Boots the
+    // same server path as `serve` but against an ephemeral tmpdir DB
+    // pre-seeded with the three-project demo fixture, on port 7071
+    // (deliberately NOT 7070 so a real serve isn't shadowed). All
+    // daemon side-effects are short-circuited via the demoMode flag
+    // on startServer().
+    db.close(); // server opens its own handle against the demo DB
+    const wantHost = process.env.FLEET_HOST ?? "127.0.0.1";
+    if (wantHost !== "127.0.0.1" && wantHost !== "localhost" && wantHost !== "::1") {
+      // The fixture is not a sensitive surface, but exposing it to
+      // the LAN by default makes the operator's threat model murky —
+      // and a real fleet bound to 0.0.0.0 should be the production
+      // serve, not the demo. Refuse the bind with a one-line message
+      // and a non-zero exit so a CI sandbox can't accidentally
+      // publish the demo to the network.
+      process.stderr.write("demo mode refuses non-loopback binds (got FLEET_HOST=" + wantHost + ")\n");
+      process.exit(2);
+    }
+    // Support both `--port 7071` (the existing flag()-style) and the
+    // `--port=7071` shape the ticket spec uses, since the demo
+    // subcommand is the first to advertise `--port=N` in its
+    // user-facing usage line. Other flags can stay simple.
+    const eqPort = argv.find((a) => a.startsWith("--port="))?.slice("--port=".length);
+    const portFlag = eqPort ?? flag("port");
+    const port = Number(portFlag ?? process.env.FLEET_PORT ?? DEMO_DEFAULT_PORT);
+    // Spin up a tmpdir for the ephemeral DB. We deliberately use
+    // mkdtempSync (not the operator's real ~/.local/state path) so
+    // the demo never touches the real fleet history.
+    const demoDir = mkdtempSync(pathJoin(tmpdir(), "fleet-demo-"));
+    const demoDbPath = pathJoin(demoDir, "fleet.db");
+    process.env.FLEET_DB_PATH = demoDbPath;
+    // Seed the fixture BEFORE startServer opens its handle so the
+    // first /api/fleet call answers with populated data.
+    {
+      const seedDb = openDb(demoDbPath);
+      try { loadDemoFixture(seedDb); } finally { seedDb.close(); }
+    }
+    // Print the tmpdir to stderr so curious operators can poke at it
+    // and so the SIGINT-teardown test can assert removal. Banner
+    // itself goes to stdout per AC7.
+    process.stderr.write("demo-tmp=" + demoDir + "\n");
+    const server = startServer("127.0.0.1", port, {
+      demoMode: true,
+      quietBanner: true,
+      onListening: () => {
+        // Print the banner ONLY after the socket is actually accepting
+        // connections — otherwise a fast test (or a curl pipeline) can
+        // race the listen callback and hit ECONNREFUSED before the
+        // first packet is accepted.
+        process.stdout.write(DEMO_BANNER);
+      },
+    });
+    // SIGINT teardown: close HTTP, close any incidental handle (the
+    // server owns its own DB connection internally), rm the tmpdir,
+    // exit 0. Idempotent across repeated signals — a second Ctrl-C
+    // mid-teardown is a no-op.
+    let tearingDown = false;
+    const teardown = (): void => {
+      if (tearingDown) return;
+      tearingDown = true;
+      try {
+        server.close(() => {
+          try { rmSync(demoDir, { recursive: true, force: true }); } catch { /* gone already */ }
+          process.exit(0);
+        });
+      } catch {
+        try { rmSync(demoDir, { recursive: true, force: true }); } catch { /* */ }
+        process.exit(0);
+      }
+      // Safety net: if the server.close callback never fires (a
+      // misbehaving keep-alive connection), force-exit after 500ms.
+      setTimeout(() => {
+        try { rmSync(demoDir, { recursive: true, force: true }); } catch { /* */ }
+        process.exit(0);
+      }, 500).unref();
+    };
+    process.on("SIGINT", teardown);
+    process.on("SIGTERM", teardown);
+    break;
+  }
   case "doctor": {
     // `fleetctl doctor [--json]` — one-shot install + ingest diagnostic
     // (ticket 0016). Wraps runDoctor() in a try/catch so a doctor crash
@@ -379,6 +461,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|doctor [--json]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|doctor [--json]]");
 }
-if (cmd !== "serve" && cmd !== "daemon-run") db.close();
+if (cmd !== "serve" && cmd !== "daemon-run" && cmd !== "demo") db.close();
