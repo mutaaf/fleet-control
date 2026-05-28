@@ -239,6 +239,14 @@ export function openDb(path: string): DB {
     // tolerates a NULL value the same way it tolerates a missing
     // inbox_dismissal row.
     "ALTER TABLE anomaly ADD COLUMN dismissed_at TEXT",
+    // ticket 0022: PR rows snapshot GitHub's `createdAt` field on each
+    // ingest pass so the `pr_age` health sub-score can derive a real
+    // age (hours since open) without re-querying gh per render. The
+    // value is NULL for rows ingested before this column existed; the
+    // health helper treats NULL the same as "no open agent PR" (sub
+    // score = 100) so older DBs render healthy until the next ingest
+    // tick repopulates the column.
+    "ALTER TABLE pr ADD COLUMN gh_created_at TEXT",
   ]) { try { db.exec(ddl); } catch { /* already there */ } }
   return db;
 }

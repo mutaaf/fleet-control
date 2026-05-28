@@ -703,6 +703,81 @@ function pausedCostPill(p) {
     <button class="btn xs resume-paused" data-act="resume-paused" data-slug="${esc(p.slug)}" data-stop="1">Resume</button></span>`;
 }
 
+// Ticket 0022: per-project "fleet temperature" — one coloured dot
+// prefix on the card head + a tap-toggle tooltip that fetches
+// /api/projects/:slug/health on open. The formula text is rendered
+// from the API response (not hardcoded) so the docs stay live with
+// any future change to the helper. The tooltip is keyboard-friendly
+// (<button aria-expanded>) and tap-toggle on mobile per the 0011
+// mobile-first guideline.
+function renderHealthDot(health, slug) {
+  const band = (health && health.band) || "grey";
+  const score = health && typeof health.score === "number" ? health.score : "—";
+  const title = band === "grey"
+    ? `Health: ${score} — not enough data`
+    : `Health: ${score} (${band})`;
+  return `<button type="button" class="health-dot band-${esc(band)}"`
+    + ` aria-label="${esc(title)}" title="${esc(title)}"`
+    + ` aria-expanded="false"`
+    + ` data-health-dot="${esc(slug || "")}"`
+    + ` data-stop="1"></button>`;
+}
+
+// Click delegate for the health dot — toggles a tooltip beside the
+// dot. The tooltip body is rendered from the API response so the
+// formula stays in lockstep with src/views.ts. We tear down any
+// open tooltip on outside-click so a phone tap doesn't leave stale
+// chrome behind.
+document.addEventListener("click", async (e) => {
+  const dot = e.target.closest("[data-health-dot]");
+  if (!dot) {
+    const open = document.querySelector(".health-tooltip");
+    if (open && open.parentNode) open.parentNode.removeChild(open);
+    return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  const open = document.querySelector(".health-tooltip");
+  if (open && open.parentNode) open.parentNode.removeChild(open);
+  const slug = dot.dataset.healthDot;
+  if (!slug) return;
+  dot.setAttribute("aria-expanded", "true");
+  const tip = document.createElement("div");
+  tip.className = "health-tooltip";
+  tip.setAttribute("role", "tooltip");
+  tip.textContent = "loading…";
+  dot.parentNode.appendChild(tip);
+  let d;
+  try { d = await get("/api/projects/" + encodeURIComponent(slug) + "/health"); }
+  catch {
+    tip.textContent = "couldn't load health";
+    setTimeout(() => { if (tip.parentNode) tip.parentNode.removeChild(tip); }, 2500);
+    return;
+  }
+  const subs = d.subs || {};
+  const fm = d.formula || {};
+  const subVal = (v) => (v == null ? "—" : String(v));
+  // Each row carries the score, a label, and the formula text from the
+  // API response — that's the engineering-note contract. Equal weights
+  // (25 each) are documented in the composite line.
+  const rows = [
+    ["ship_success", "Ship success"],
+    ["anomaly", "Anomalies"],
+    ["pr_age", "PR age"],
+    ["cost_trajectory", "Cost trend"],
+  ].map(([k, label]) => `<div class="health-row">
+      <span class="health-row-score">${esc(subVal(subs[k]))}</span>
+      <span class="health-row-label"><b>${esc(label)}</b> <span class="dim">${esc(fm[k] || "")}</span></span>
+    </div>`).join("");
+  tip.innerHTML = `<div class="health-head"><b>Health ${esc(String(d.score ?? "—"))}</b> · ${esc(d.band || "")} <span class="dim">· 25% each</span></div>
+    ${rows}
+    <div class="health-foot dim">${esc(fm.composite || "")}</div>`;
+  setTimeout(() => {
+    if (tip.parentNode) tip.parentNode.removeChild(tip);
+    dot.setAttribute("aria-expanded", "false");
+  }, 8000);
+});
+
 function card(p) {
   const [cls, label] = STATE[p.displayState] || STATE.off;
   const running = p.jobs.find((j) => j.running);
@@ -721,7 +796,7 @@ function card(p) {
     : sc != null && sc <= 3
       ? `<div class="banner">Stops working in ${sc} day${sc === 1 ? "" : "s"} unless you keep it running.</div>` : "";
   return `<a class="card" href="#/p/${p.slug}">
-    <div class="card-head"><span class="pname">${esc(p.name)}</span>
+    <div class="card-head">${renderHealthDot(p.health, p.slug)}<span class="pname">${esc(p.name)}</span>
       <span class="state"><span class="dot ${cls}"></span>${label}${pausedCostPill(p)}${anomalyPill(p)}</span></div>
     ${telemetry(p.telemetry)}
     ${nowLine || (lastAny ? `<div class="job">Last: ${OUTCOME[lastAny.outcome] || lastAny.outcome || "ran"} · ${ago(lastAny.started_at)}</div>` : "")}
