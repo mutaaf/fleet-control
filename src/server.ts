@@ -92,19 +92,49 @@ const json = (res: any, body: unknown, code = 200) => {
   res.end(s);
 };
 
-export function startServer(host = "127.0.0.1", port = 7070) {
+/** Optional knobs the demo subcommand (ticket 0025) passes through to
+ *  short-circuit every side-effecting boot step. When `demoMode` is
+ *  true the server: (a) skips the legacy admin-token migration (the
+ *  demo never reads the real fleet-control.config.json), (b) skips
+ *  pricing sync, (c) skips the inline runIngestPass() — leaving the
+ *  hand-authored fixture in the DB intact, and (d) flags maybeIngest()
+ *  so the periodic read-time ingest also stays a no-op. */
+export interface StartServerOpts {
+  demoMode?: boolean;
+  /** When set, suppress the default "fleet-control portal → ..." log
+   *  line printed inside the listen callback. The demo CLI (ticket
+   *  0025) sets this so it can emit its own banner exactly once,
+   *  after the socket is actually accepting connections. */
+  quietBanner?: boolean;
+  /** Fires inside the server.listen callback — i.e. after the kernel
+   *  has bound the port and accept() is live. Demo mode uses this to
+   *  print its two-line banner only when fetch() will actually
+   *  succeed. */
+  onListening?: () => void;
+}
+
+export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOpts = {}) {
   const cfg = loadConfig();
   const db = openDb(cfg.dbPath);
-  // One-shot: if the legacy adminToken still lives in the config and we have
-  // no auth_token rows, promote it to a real admin-scoped token so existing
-  // paired devices keep working through the upgrade. After this returns the
-  // adminToken field is gone from disk (see src/auth.ts).
-  migrateLegacyAdminTokenIfPresent(db, CONFIG_FILE);
-  // Ticket 0004: refresh the pricing table from data/anthropic-pricing.json
-  // on every boot. A missing file is a no-op (DEFAULT_PRICING is already
-  // seeded elsewhere), so this never crashes the server.
-  try { syncPricing(db); } catch { /* keep serving */ }
-  runIngestPass(db, cfg); lastIngest = Date.now();
+  const demoMode = opts.demoMode === true;
+  if (!demoMode) {
+    // One-shot: if the legacy adminToken still lives in the config and we have
+    // no auth_token rows, promote it to a real admin-scoped token so existing
+    // paired devices keep working through the upgrade. After this returns the
+    // adminToken field is gone from disk (see src/auth.ts).
+    migrateLegacyAdminTokenIfPresent(db, CONFIG_FILE);
+    // Ticket 0004: refresh the pricing table from data/anthropic-pricing.json
+    // on every boot. A missing file is a no-op (DEFAULT_PRICING is already
+    // seeded elsewhere), so this never crashes the server.
+    try { syncPricing(db); } catch { /* keep serving */ }
+    runIngestPass(db, cfg);
+    lastIngest = Date.now();
+  } else {
+    // Demo mode: the fixture is the source of truth. Forbid the periodic
+    // read-time ingest from firing by pinning lastIngest into the future
+    // (maybeIngest() only fires when Date.now() - lastIngest > 10s).
+    lastIngest = Number.MAX_SAFE_INTEGER;
+  }
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
@@ -379,13 +409,16 @@ export function startServer(host = "127.0.0.1", port = 7070) {
   });
 
   server.listen(port, host, () => {
-    console.log(`fleet-control portal → http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
-    if (host === "0.0.0.0") {
-      // We deliberately never log a token here — mint one with
-      //   `fleetctl tokens add <device-name> --scope <read|control|admin>`
-      // which prints it ONCE so it's only on the operator's screen.
-      console.log(`  LAN access enabled. Mint a token with: fleetctl tokens add <device-name> --scope read`);
+    if (!opts.quietBanner) {
+      console.log(`fleet-control portal → http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
+      if (host === "0.0.0.0") {
+        // We deliberately never log a token here — mint one with
+        //   `fleetctl tokens add <device-name> --scope <read|control|admin>`
+        // which prints it ONCE so it's only on the operator's screen.
+        console.log(`  LAN access enabled. Mint a token with: fleetctl tokens add <device-name> --scope read`);
+      }
     }
+    try { opts.onListening?.(); } catch { /* never let a banner crash the server */ }
   });
   return server;
 }
