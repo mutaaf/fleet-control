@@ -1,7 +1,7 @@
 ---
 id: 0024
 title: First-run welcome — printed checklist after fleetctl serve cold start
-status: proposed
+status: groomed
 priority: P2
 area: infra
 created: 2026-05-27
