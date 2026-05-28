@@ -1,7 +1,7 @@
 ---
 id: 0022
 title: Fleet temperature — single per-project health score on the home page
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-27
@@ -168,3 +168,6 @@ Each box maps 1:1 to a test scenario.
   the `gh_created_at` ALTER + ingest field, the new route, and the
   vanilla SPA dot/tooltip. PERF tests gate on `process.env.PERF==="1"`
   per the ticket.
+- 2026-05-28 — shipped via PR #56 (merge commit f326e9c). All 26 new
+  health tests pass (27 with PERF=1); zero net new failures vs the
+  pre-change baseline; tsc clean; backlog index in sync.
