@@ -1,7 +1,7 @@
 ---
 id: 0025
 title: fleetctl demo - one-command sandbox boots portal against seeded fixture fleet
-status: in-progress
+status: shipped
 priority: P1
 area: infra
 created: 2026-05-28
@@ -195,3 +195,13 @@ against this list before writing code.
   a `demo` subcommand to `bin/fleetctl.ts` that picks a tmpdir DB, plants
   an empty-roots config, calls `startServer(host, port, {demoMode: true})`,
   and tears everything down on SIGINT.
+- 2026-05-28: shipped via PR #52. 15 tests, all green; typecheck + validate
+  both pass; zero new runtime deps. The CLI handler picks an ephemeral
+  tmpdir DB, seeds the three-project fixture, and binds 127.0.0.1:7071 by
+  default (refuses 0.0.0.0 with an explicit message). startServer gained a
+  `demoMode` flag that short-circuits the inline ingest pass and pins the
+  read-time ingest tick, plus `quietBanner` + `onListening` knobs so the
+  CLI emits the two-line banner exactly once after the socket is accepting
+  connections. Open question for future tickets: the welcome checklist
+  (0024) could hint at `fleetctl demo` on first run; the snapshot anonymizer
+  (0013) could feed the demo fixture's slug-mangler.
