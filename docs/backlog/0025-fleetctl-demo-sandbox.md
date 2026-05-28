@@ -1,7 +1,7 @@
 ---
 id: 0025
 title: fleetctl demo - one-command sandbox boots portal against seeded fixture fleet
-status: groomed
+status: in-progress
 priority: P1
 area: infra
 created: 2026-05-28
@@ -187,4 +187,11 @@ against this list before writing code.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-28: implementation-dev started on `feat/0025-fleetctl-demo-sandbox`.
+  Plan: add `src/demo/fixture.ts` with hand-authored TS constants for three
+  projects + 30 days of runs + PRs + anomalies (all timestamps relative to
+  load-time); thread an `opts.demoMode` flag through `startServer()` and the
+  daemon tick so no ingest/launchctl/gh side-effects fire in demo mode; add
+  a `demo` subcommand to `bin/fleetctl.ts` that picks a tmpdir DB, plants
+  an empty-roots config, calls `startServer(host, port, {demoMode: true})`,
+  and tears everything down on SIGINT.
