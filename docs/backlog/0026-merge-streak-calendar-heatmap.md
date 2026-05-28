@@ -1,7 +1,7 @@
 ---
 id: 0026
 title: Merge streak counter and 90-day calendar heatmap on portal home
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-05-28
@@ -173,4 +173,16 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-28 — picked up by implementation-dev. Branch
+  `feat/0026-merge-streak-calendar-heatmap`. Tests-first per AC box:
+  `tests/streak.test.ts` with one scenario per checkbox (band buckets,
+  streak walk, day-boundary attribution, merged-PR count, unrecovered
+  failure, route + scope, SPA renderer, perf, empty-state, deps + JSON
+  shape). Implementation: new `fleetStreak(db, opts)` in `src/views.ts`
+  (one `GROUP BY date(started_at)` over `run`, one `GROUP BY
+  date(merged_at)` over `pr`, one JS walk for the streak), new
+  `GET /api/fleet/streak` route in `src/server.ts` behind the existing
+  `read` scope, new `renderStreak(data)` + `renderHeatmap(cells)` in
+  `web/app.js`, one `.heatmap` selector group in `web/style.css`
+  reusing `--good`/`--warn`/`--bad`/`--faint` tokens. No new runtime
+  deps, no schema migration.

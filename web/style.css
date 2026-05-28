@@ -290,6 +290,45 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
   border-radius: 20px; padding: 1px 9px; }
 .inbox-badge:hover { text-decoration: underline; }
 
+/* Ticket 0026: merge streak counter + 90-day calendar heatmap. Sits
+   ABOVE the inbox on home. The streak line is one bold integer + a
+   "last red day" trailing note. The heatmap is a 13-week × 7-day
+   grid (91 cells: 90 data + 1 trailing placeholder so the visual
+   stays square). Cells reuse the existing palette: --good tints
+   for the merge bands, --bad for the red streak-breaker, --faint
+   for empty. Cell size is 12px on desktop / 14px on mobile (touch
+   target floor) — the whole grid is < 200px wide so a 375px
+   viewport never overflows. */
+.streak-banner { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 12px 14px; margin: 0 0 12px; }
+.streak-row { font-size: 14px; color: var(--ink); margin: 2px 0 10px;
+  font-family: var(--mono); }
+.streak-line .streak-days { color: var(--good); font-size: 18px;
+  font-weight: 700; font-variant-numeric: tabular-nums; }
+.heatmap { display: grid; grid-template-columns: repeat(13, 12px);
+  grid-template-rows: repeat(7, 12px); grid-auto-flow: column;
+  gap: 3px; margin: 8px 0 4px;
+  /* Keep the grid inside the panel without forcing a horizontal scroll
+     even on the narrowest phone — the 13×12 + 12×3 = 192px footprint
+     fits well inside a 375px viewport with the 14px padding above. */ }
+.heatmap-cell { width: 12px; height: 12px; padding: 0; border: 0;
+  border-radius: 2px; background: var(--panel2); cursor: pointer;
+  /* `appearance: none` strips Safari/Firefox's <button> default
+     chrome so the grid reads as a flat heatmap. */
+  -webkit-appearance: none; appearance: none; transition: filter .12s; }
+.heatmap-cell:hover { filter: brightness(1.4); }
+.heatmap-cell:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.heatmap-cell.band-empty { background: var(--panel2); }
+.heatmap-cell.band-low { background: rgba(91,140,90,.35); }
+.heatmap-cell.band-med { background: rgba(91,140,90,.65); }
+.heatmap-cell.band-high { background: var(--good); }
+.heatmap-cell.band-red { background: var(--bad); }
+.heatmap-cell.band-placeholder { background: transparent; cursor: default; }
+.heatmap-tooltip { font-family: var(--mono); font-size: 11.5px;
+  color: var(--ink); background: #1c1d19; border: 1px solid var(--line);
+  border-radius: var(--r); padding: 4px 8px; margin-top: 6px;
+  display: inline-block; }
+
 /* Mobile-first portal pass (ticket 0011).
    Single phone breakpoint at 640px — covers iPhone 13 mini (375), iPhone
    14 Plus (414), and small Android handsets. The pass is layout-only:
@@ -335,4 +374,9 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
      readable at 375px without horizontal scroll. */
   .inbox-row { grid-template-columns: 1fr; }
   .inbox-row .inbox-actions { grid-column: 1; }
+  /* Ticket 0026: heatmap cells lift to 14px on phones for a sturdier
+     tap target. 13 × 14 + 12 × 3 = 218px — still well under 375px. */
+  .heatmap { grid-template-columns: repeat(13, 14px);
+    grid-template-rows: repeat(7, 14px); }
+  .heatmap-cell { width: 14px; height: 14px; }
 }

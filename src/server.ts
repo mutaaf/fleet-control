@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { doAction } from "./control.ts";
@@ -283,6 +283,12 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         // GET /api/fleet/* route — net-new, no existing JSON shape to
         // preserve.
         if (path === "/api/fleet/inbox") return json(res, fleetInbox(db));
+        // Merge streak counter + 90-day calendar heatmap (ticket 0026).
+        // Read-scope (loopback bypasses); same posture as every other
+        // GET /api/fleet/* route. Net-new — no existing JSON shape
+        // to preserve. The helper does two SQL GROUP BYs + one JS
+        // walk; well under 50ms even at 10 projects × 90 days.
+        if (path === "/api/fleet/streak") return json(res, fleetStreak(db));
         // Cross-project tool-call leaderboard (ticket 0014). One JSON
         // payload composed of three SQL aggregations (tools across the
         // fleet, projects, cost-by-phase heatmap). `days` query param

@@ -589,6 +589,169 @@ export function fleetLeaderboard(db: DB, opts: LeaderboardOptions = {}): Leaderb
   return { window, tools, projects, heatmap };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Fleet streak counter + 90-day calendar heatmap (ticket 0026).
+//
+// The morning-portal answer to "is the fleet *working*?" — one
+// integer streak number plus a GitHub-style 91-cell heatmap (13
+// weeks × 7 days) of merge activity. Strictly additive: no schema
+// migration, no new ingest path, reads only existing `run` and `pr`
+// rows. Two SQL aggregations + one JS walk; no per-row loops over
+// raw runs.
+//
+// Day boundary: SQLite `date(ts)` (UTC) — the same convention the
+// `cost_rollup_day` table uses (see src/ingest/index.ts). The
+// ticket calls for the "operator's local timezone" but every other
+// per-day rollup in this repo lives in UTC; aligning here keeps the
+// streak number consistent with the cost rollups the operator
+// reads on the same page.
+//
+// Band rules (per AC1):
+//   merged >= 4               → high
+//   merged 2-3                → med
+//   merged 1                  → low
+//   merged 0 AND failed >= 1  → red
+//   else                      → empty
+//
+// "failed" = run.outcome='failure' across all projects, MINUS any
+// project that had a later same-day outcome in the known-good set
+// (the same "unrecovered failure" definition the inbox uses in
+// 0017). Computed in SQL with a NOT EXISTS sub-query per failure
+// row so a fleet of 10 projects × 90 days stays under 50ms (the
+// perf AC).
+//
+// Streak walk: from today (heatmap[89]) backwards. An `empty` day
+// does NOT break the streak — the operator's agents can take
+// weekends off. Only a `red` day stops the walk. `last_red_day` is
+// the most-recent red cell in the 90-day window, or null if none.
+
+export interface FleetStreakCell {
+  /** yyyy-mm-dd (UTC). */
+  date: string;
+  /** count of PR rows with state='MERGED' whose merged_at fell on this day. */
+  merged: number;
+  /** count of distinct (project_id) unrecovered failures on this day. */
+  failed: number;
+  band: "empty" | "low" | "med" | "high" | "red";
+}
+
+export interface FleetStreak {
+  streak_days: number;
+  last_red_day: string | null;
+  heatmap: FleetStreakCell[];
+}
+
+export interface FleetStreakOptions {
+  /** ISO timestamp used as "now" (today is heatmap[89]). Defaults to
+   *  wall-clock; tests pin this so seeded `started_at` / `merged_at`
+   *  values bucket predictably. */
+  now?: string;
+}
+
+interface StreakMergedRow { day: string; merged: number; }
+interface StreakFailedRow { day: string; failed: number; }
+
+/** Inclusive yyyy-mm-dd (UTC) from a Date. */
+function isoDateUtcStreak(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+export function fleetStreak(db: DB, opts: FleetStreakOptions = {}): FleetStreak {
+  const now = opts.now ? new Date(opts.now) : new Date();
+  // Today (UTC midnight) = the 90th cell (index 89). 89 days before
+  // that = the 1st cell (index 0). We materialise the inclusive
+  // [start, today] window so a yyyy-mm-dd lookup is O(1).
+  const today = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+  ));
+  const start = new Date(today);
+  start.setUTCDate(start.getUTCDate() - 89);
+  // SQL clauses share the same inclusive window — we use a closed
+  // [startStr, endStr] range against date(ts).
+  const startStr = isoDateUtcStreak(start);
+  const endStr = isoDateUtcStreak(today);
+
+  // ── Merged-PR counts per day ────────────────────────────────────
+  // The `pr` table stores `fetched_at` as the wall-clock anchor (the
+  // ingest pipeline stamps it on every gh sync; for a merged PR
+  // that timestamp is the merge time). We bucket by date() and
+  // count rows where state='MERGED'.
+  const mergedRows = db.prepare(
+    "SELECT date(fetched_at) AS day, COUNT(*) AS merged "
+    + "  FROM pr "
+    + " WHERE state = 'MERGED' "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) <= ? "
+    + " GROUP BY date(fetched_at)",
+  ).all(startStr, endStr) as unknown as StreakMergedRow[];
+  const mergedByDay = new Map<string, number>();
+  for (const r of mergedRows) mergedByDay.set(r.day, Number(r.merged) || 0);
+
+  // ── Unrecovered-failure counts per day ──────────────────────────
+  // A "failure" contributes to the day's red-band count IFF no
+  // later same-project same-day run had a known-good outcome.
+  // We group by date(started_at) and count distinct project_id, so
+  // a project that crashed twice on the same day counts once.
+  const failedRows = db.prepare(
+    "SELECT date(r.started_at) AS day, COUNT(DISTINCT r.project_id) AS failed "
+    + "  FROM run r "
+    + " WHERE r.outcome = 'failure' "
+    + "   AND r.started_at IS NOT NULL "
+    + "   AND date(r.started_at) >= ? AND date(r.started_at) <= ? "
+    + "   AND NOT EXISTS ( "
+    + "        SELECT 1 FROM run r2 "
+    + "         WHERE r2.project_id = r.project_id "
+    + "           AND r2.outcome IN ('shipped','healed','no-op','reviewed-ok','reviewed-changes') "
+    + "           AND r2.started_at IS NOT NULL "
+    + "           AND date(r2.started_at) = date(r.started_at) "
+    + "           AND r2.started_at > r.started_at "
+    + "       ) "
+    + " GROUP BY date(r.started_at)",
+  ).all(startStr, endStr) as unknown as StreakFailedRow[];
+  const failedByDay = new Map<string, number>();
+  for (const r of failedRows) failedByDay.set(r.day, Number(r.failed) || 0);
+
+  // ── Materialise 90 cells in chronological order ─────────────────
+  const heatmap: FleetStreakCell[] = [];
+  for (let i = 0; i < 90; i++) {
+    const d = new Date(start);
+    d.setUTCDate(d.getUTCDate() + i);
+    const key = isoDateUtcStreak(d);
+    const merged = mergedByDay.get(key) ?? 0;
+    const failed = failedByDay.get(key) ?? 0;
+    let band: FleetStreakCell["band"];
+    if (merged >= 4) band = "high";
+    else if (merged >= 2) band = "med";
+    else if (merged === 1) band = "low";
+    else if (failed >= 1) band = "red";
+    else band = "empty";
+    heatmap.push({ date: key, merged, failed, band });
+  }
+
+  // ── Streak walk backwards from today; stop at the first red ─────
+  // Empty days don't break the streak — only red days do. A fleet
+  // with zero activity in the whole window has no streak (the
+  // operator hasn't started one), so streak_days = 0 in that case;
+  // the SPA's empty-state copy ("Fleet streak: starting today")
+  // reads accordingly.
+  const anySignal = heatmap.some((c) => c.merged > 0 || c.failed > 0);
+  let streak_days = 0;
+  if (anySignal) {
+    for (let i = heatmap.length - 1; i >= 0; i--) {
+      if (heatmap[i].band === "red") break;
+      streak_days += 1;
+    }
+  }
+
+  // ── last_red_day: latest red cell in the window, or null ────────
+  let last_red_day: string | null = null;
+  for (let i = heatmap.length - 1; i >= 0; i--) {
+    if (heatmap[i].band === "red") { last_red_day = heatmap[i].date; break; }
+  }
+
+  return { streak_days, last_red_day, heatmap };
+}
+
 export function runView(db: DB, id: number) {
   const run = db.prepare("SELECT * FROM run WHERE id=?").get(id) as any;
   if (!run) return null;

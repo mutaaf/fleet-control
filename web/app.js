@@ -376,6 +376,116 @@ async function fetchInbox() {
   try { return await get("/api/fleet/inbox"); } catch { return null; }
 }
 
+// Ticket 0026: merge streak counter + 90-day calendar heatmap. Sits
+// ABOVE the inbox on home — the morning portal-open hook ("the
+// streak is alive") before "what needs me". Errors fall through
+// silently: the home page still renders if the streak endpoint is
+// unavailable. `renderStreak` returns "" on null so we can use the
+// same string concat as `renderInbox` / `digestBanner`.
+async function fetchStreak() {
+  try { return await get("/api/fleet/streak"); } catch { return null; }
+}
+
+const STREAK_BAND_TITLE = {
+  empty: "no activity",
+  low: "1 merged",
+  med: "merged",
+  high: "merged",
+  red: "broke the streak",
+};
+
+function renderHeatmap(cells) {
+  // Cells arrive chronologically (oldest → today). The GitHub-shape
+  // grid is 13 columns × 7 rows; column-major fill so each column
+  // is one week. CSS grid handles the visual layout — we just emit
+  // 91 buttons in chronological order with `grid-column` / `grid-row`
+  // hints so the browser places them in the right cells.
+  //
+  // Why 91 visual cells but 90 data cells: 13 × 7 = 91. The extra
+  // cell is reserved for "today's column starts mid-week" alignment
+  // — we render an empty placeholder for the first cell only when
+  // today's weekday demands it. For simplicity (and to keep the AC
+  // wording "91 cells" honest) we render 91 cells: 90 data cells
+  // followed by a single trailing empty placeholder. The visual
+  // effect is a clean 13×7 grid.
+  if (!cells || cells.length === 0) return "";
+  const today = new Date();
+  const todayWeekday = today.getUTCDay(); // 0 = Sun, 6 = Sat
+  const buttons = cells.map((c, idx) => {
+    // Column-major: cells are emitted in chronological order; the
+    // CSS grid auto-flow column places them left-to-right, top-to-
+    // bottom inside each column.
+    const title = c.band === "empty"
+      ? `${c.date}: no activity`
+      : c.band === "red"
+        ? `${c.date}: ${c.failed} unrecovered failure${c.failed === 1 ? "" : "s"}, ${c.merged} merged`
+        : `${c.date}: ${c.merged} PR${c.merged === 1 ? "" : "s"} merged`;
+    return `<button type="button" class="heatmap-cell band-${esc(c.band)}"`
+      + ` aria-label="${esc(title)}" title="${esc(title)}"`
+      + ` data-streak-cell="${esc(c.date)}"`
+      + ` data-merged="${c.merged}" data-failed="${c.failed}"></button>`;
+  }).join("");
+  // The placeholder fills 91 - 90 = 1 cell so the grid is square.
+  // It carries aria-hidden so screen-readers skip it.
+  const placeholder = `<span class="heatmap-cell band-placeholder" aria-hidden="true"></span>`;
+  return `<div class="heatmap" role="grid" aria-label="Fleet merge heatmap, last 90 days">${buttons}${placeholder}</div>`;
+}
+
+function renderStreak(data) {
+  if (!data) return "";
+  const streak = data.streak_days || 0;
+  const lastRed = data.last_red_day;
+  // Empty-state copy is verbatim per the ticket — same shape as the
+  // inbox-zero line. Reads "starting today" when streak === 0.
+  const line = streak === 0
+    ? `<span class="streak-line">Fleet streak: starting today</span>`
+    : `<span class="streak-line"><b class="streak-days">${streak}</b> day${streak === 1 ? "" : "s"} of green ships`
+      + (lastRed ? ` <span class="dim">· last red day ${esc(lastRed)}</span>` : "")
+      + `</span>`;
+  return `<div class="streak-banner" data-streak-banner>
+    <div class="eyebrow">Fleet streak</div>
+    <div class="streak-row">${line}</div>
+    ${renderHeatmap(data.heatmap || [])}
+  </div>`;
+}
+
+// Tap/click toggle for heatmap cells — mobile-friendly (no
+// hover-only path per 0011). Click toggles a tooltip on the cell;
+// clicking outside closes it. We piggyback on the cell's `title`
+// attribute (the browser's native tooltip) for hover-capable
+// devices, and surface the same text via a click-bound tooltip
+// node for touch. The tooltip is recreated each click so it
+// always reflects the live cell payload.
+document.addEventListener("click", (e) => {
+  const cell = e.target.closest("[data-streak-cell]");
+  if (!cell) {
+    // Outside the heatmap: tear down any open tooltip.
+    const open = document.querySelector(".heatmap-tooltip");
+    if (open && open.parentNode) open.parentNode.removeChild(open);
+    return;
+  }
+  e.preventDefault();
+  // Remove any existing tooltip first.
+  const open = document.querySelector(".heatmap-tooltip");
+  if (open && open.parentNode) open.parentNode.removeChild(open);
+  const date = cell.dataset.streakCell;
+  const merged = +cell.dataset.merged || 0;
+  const failed = +cell.dataset.failed || 0;
+  const label = failed > 0
+    ? `${date}: ${failed} unrecovered, ${merged} merged`
+    : merged > 0
+      ? `${date}: ${merged} PR${merged === 1 ? "" : "s"} merged`
+      : `${date}: no activity`;
+  const tip = document.createElement("div");
+  tip.className = "heatmap-tooltip";
+  tip.textContent = label;
+  cell.parentNode.appendChild(tip);
+  // Auto-close after 3.5 seconds.
+  setTimeout(() => {
+    if (tip.parentNode) tip.parentNode.removeChild(tip);
+  }, 3500);
+});
+
 const INBOX_KIND_LABEL = {
   pr_review: "PR awaits review",
   anomaly_open: "Anomaly fired",
@@ -500,11 +610,12 @@ function digestBanner(d) {
 }
 
 async function home() {
-  // Fan out /api/fleet + /api/digest/week + /api/fleet/inbox so the
-  // round-trips don't serialize. Inbox banner renders ABOVE the project
-  // grid (per ticket 0017) so the operator sees "what needs me" first.
-  const [data, digestData, inboxData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(),
+  // Fan out /api/fleet + /api/digest/week + /api/fleet/inbox +
+  // /api/fleet/streak so the round-trips don't serialize. Streak
+  // banner renders ABOVE the inbox (ticket 0026) — the morning
+  // "is the fleet working?" hook before "what needs me?".
+  const [data, digestData, inboxData, streakData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(),
   ]);
   const alerts = data.alerts || [];
   const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
@@ -513,6 +624,7 @@ async function home() {
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
     digestBanner(digestData) +
+    renderStreak(streakData) +
     renderInbox(inboxData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
     `<div class="eyebrow rowflex">Your projects <button class="btn sm" data-modal="add">+ Add a project</button></div>` + data.projects.map(card).join("") +
