@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { doAction } from "./control.ts";
@@ -276,7 +276,31 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         const rauth = requireAuth(db, req, "read", url);
         if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
-        if (path === "/api/fleet") return json(res, fleetView(db, cfg));
+        if (path === "/api/fleet") {
+          const v = fleetView(db, cfg);
+          // Ticket 0022: ?sort=health re-orders the project grid
+          // ascending by health.score (worst first) so the operator's
+          // eye lands on the project that needs them. The default
+          // ordering (slug ASC, set by fleetView) is unchanged when
+          // the query param is absent.
+          if (url.searchParams.get("sort") === "health") {
+            v.projects = [...v.projects].sort((a: any, b: any) =>
+              (a.health?.score ?? 0) - (b.health?.score ?? 0));
+          }
+          return json(res, v);
+        }
+        // Ticket 0022: per-project health detail. Reads `read` scope
+        // (loopback bypasses), same posture as every other GET
+        // /api/projects/:slug/* route. Returns the full
+        // {score, band, subs, generated_at, formula} payload — the
+        // SPA tooltip renders the formula text from this response so
+        // the docs stay live.
+        const hm = path.match(/^\/api\/projects\/([\w-]+)\/health$/);
+        if (hm) {
+          const pid = projectIdBySlug(db, hm[1]);
+          if (pid == null) return json(res, { error: "not found" }, 404);
+          return json(res, projectHealth(db, pid));
+        }
         // Ticket 0017: today's inbox. Cross-project "what needs me"
         // aggregation over PRs / anomalies / snapshots / failed runs.
         // Read-scope (loopback bypasses); same shape as every other

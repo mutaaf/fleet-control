@@ -118,6 +118,14 @@ export function fleetView(db: DB, cfg: FleetConfig) {
     // Ticket 0021: paused is null | "cost_cap" | "manual". Additive —
     // every other field above is unchanged.
     const pausedReason = pauseByProject.get(p.id) ?? null;
+    // Ticket 0022: per-project health rollup, inlined as {score, band}.
+    // The detailed sub-scores + generated_at live on the per-project
+    // route (/api/projects/:slug/health) so the home payload stays
+    // small. We slice the full helper output here to keep the contract
+    // explicit — adding new fields to projectHealth() never inflates
+    // the home payload by accident.
+    const full = projectHealth(db, p.id);
+    const healthSlim = { score: full.score, band: full.band };
     out.push({
       slug: p.slug, name: p.name, displayState: displayState(jobs, scDays, usage),
       selfCancelDays: scDays, engEnabled: !!p.eng_enabled,
@@ -131,6 +139,7 @@ export function fleetView(db: DB, cfg: FleetConfig) {
       // and label the active pace preset when it matches a known one.
       cadence, pace: paceLabel(cadence),
       paused: pausedReason,
+      health: healthSlim,
     });
   }
   // Total-fleet forecast = sum of per-project projections (null projections
@@ -750,6 +759,260 @@ export function fleetStreak(db: DB, opts: FleetStreakOptions = {}): FleetStreak 
   }
 
   return { streak_days, last_red_day, heatmap };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Per-project "fleet temperature" health score (ticket 0022).
+//
+// One 0-100 number per project: rounded mean of four equally-weighted
+// sub-scores. Each sub-score is a pure SQL aggregation against the
+// existing tables (run, anomaly, pr, cost_rollup_day) — no per-row
+// loops in JS. Composition is deterministic so the SPA can render the
+// formula text from the API response and the autonomous reviewer can
+// audit it.
+//
+// Band rules (per the user story):
+//   score >= 80                              → green
+//   50 <= score < 80                         → amber
+//   score < 50                               → red
+//   ship_success is NULL (no ship runs yet)  → grey (overall band)
+//   project is paused (per ticket 0021)      → grey (overall band)
+//
+// Sub-score formulas (kept in lockstep with HEALTH_FORMULA_TEXT below
+// so the tooltip's docstring matches the implementation):
+//   ship_success     = (shipped / total) × 100 over the last 20 non-smoke
+//                      ship runs; NULL when there are zero runs
+//   anomaly          = 100 - min(100, 10 × open_anomalies_last_7d)
+//   pr_age           = 100 (no PR / <6h), 80 (<24h), 50 (<72h), 20 (>=72h)
+//                      sourced from the oldest open agent PR's
+//                      gh_created_at column
+//   cost_trajectory  = 100 - min(100, 100 × max(0, (recent7 - prior7) /
+//                      max(prior7, 0.01))) over cost_rollup_day
+//
+// Module-level cache: 5s TTL keyed by project_id, with a build counter
+// (LESSONS pattern from ticket 0012). The window is small enough that
+// the home grid render's per-card call doesn't refetch on the polled
+// 5s tick, but large enough that operators always see fresh numbers
+// after a real ingest pass.
+
+export interface ProjectHealth {
+  score: number;
+  band: "green" | "amber" | "red" | "grey";
+  subs: {
+    ship_success: number | null;
+    anomaly: number;
+    pr_age: number;
+    cost_trajectory: number;
+  };
+  generated_at: string;
+  /** Human-readable formula text per sub-score, rendered by the SPA
+   *  tooltip so the docs stay live. Engineering note from the ticket:
+   *  the SPA must NOT hardcode this. */
+  formula: {
+    ship_success: string;
+    anomaly: string;
+    pr_age: string;
+    cost_trajectory: string;
+    composite: string;
+  };
+}
+
+const HEALTH_FORMULA_TEXT = {
+  ship_success: "fraction of the last 20 ship runs that shipped, ×100 (null when no runs yet)",
+  anomaly: "100 - min(100, 10 × open anomalies in last 7d)",
+  pr_age: "100 (no PR / <6h), 80 (<24h), 50 (<72h), 20 (≥72h) — oldest open agent PR",
+  cost_trajectory: "100 - min(100, 100 × max(0, (last-7d-avg − prior-7d-avg) / prior-7d-avg))",
+  composite: "rounded mean of the four sub-scores (equal weights: 25 each)",
+};
+
+interface ShipAggRow { shipped: number; total: number; }
+interface AnomalyAggRow { open: number; }
+interface PrAgeAggRow { oldest_created_at: string | null; }
+interface CostWindowRow { recent7: number | null; prior7: number | null; }
+interface PauseProbeRow { c: number; }
+
+// Module-level cache (LESSONS pattern: a reset seam + a build counter
+// so tests can assert cache-hit semantics without stubbing SQL).
+const HEALTH_TTL_MS = 5_000;
+const healthCache = new Map<number, { ts: number; value: ProjectHealth }>();
+let healthBuildCounter = 0;
+
+/** Reset the per-process health cache. Tests MUST call this between
+ *  scenarios so a prior test's cached value doesn't leak. Production
+ *  code never calls this. */
+export function _resetHealthCacheForTests(): void {
+  healthCache.clear();
+  healthBuildCounter = 0;
+}
+
+/** Read-only build counter — increments by 1 on every cache miss
+ *  (i.e. every actual SQL computation). Tests assert `delta === 1` on
+ *  the first call and `delta === 0` on the second to prove the cache
+ *  fired without stubbing the DB. */
+export function _getHealthCacheBuildsForTests(): number {
+  return healthBuildCounter;
+}
+
+function bandFor(score: number): "green" | "amber" | "red" {
+  if (score >= 80) return "green";
+  if (score >= 50) return "amber";
+  return "red";
+}
+
+function shipSuccess(db: DB, projectId: number): number | null {
+  // Last 20 non-smoke ship runs. Outcome=='shipped' counts as success.
+  // We aggregate inside a subquery so the LIMIT applies to the source set
+  // before COUNT — same pattern as the existing telemetry fetch in
+  // fleetView. Returns null when zero rows match (band → grey).
+  const row = db.prepare(
+    "SELECT COUNT(*) AS total, "
+    + "  SUM(CASE WHEN outcome = 'shipped' THEN 1 ELSE 0 END) AS shipped "
+    + "FROM (SELECT outcome FROM run "
+    + "      WHERE project_id = ? AND phase = 'ship' AND outcome IS NOT 'smoke' "
+    + "      ORDER BY started_at DESC LIMIT 20) sub",
+  ).get(projectId) as unknown as ShipAggRow | undefined;
+  if (!row || !row.total) return null;
+  return Math.round((Number(row.shipped) || 0) * 100 / row.total);
+}
+
+function anomalyScore(db: DB, projectId: number, now: Date): number {
+  // Count `anomaly` rows joined to the project's runs where
+  // dismissed_at IS NULL and created_at fell in the trailing 7-day
+  // window. Saturates at 10 to bound the deduction at 100 points.
+  const cutoff = new Date(now.getTime() - 7 * 86400_000).toISOString();
+  const row = db.prepare(
+    "SELECT COUNT(*) AS open "
+    + "  FROM anomaly a JOIN run r ON r.id = a.run_id "
+    + " WHERE r.project_id = ? "
+    + "   AND a.dismissed_at IS NULL "
+    + "   AND a.created_at >= ?",
+  ).get(projectId, cutoff) as unknown as AnomalyAggRow | undefined;
+  const open = Number(row?.open ?? 0);
+  return 100 - Math.min(100, 10 * open);
+}
+
+function prAgeScore(db: DB, projectId: number, now: Date): number {
+  // Oldest open agent PR's gh_created_at. NULL when no agent PRs are
+  // open → score 100 (healthy). The is_agent column is already populated
+  // by the ingester via the AGENT_RE regex.
+  const row = db.prepare(
+    "SELECT MIN(gh_created_at) AS oldest_created_at "
+    + "  FROM pr "
+    + " WHERE project_id = ? AND is_agent = 1 AND state = 'open' "
+    + "   AND gh_created_at IS NOT NULL",
+  ).get(projectId) as unknown as PrAgeAggRow | undefined;
+  if (!row || !row.oldest_created_at) return 100;
+  const ageHours = (now.getTime() - new Date(row.oldest_created_at).getTime()) / 3600_000;
+  if (ageHours < 6) return 100;
+  if (ageHours < 24) return 80;
+  if (ageHours < 72) return 50;
+  return 20;
+}
+
+function costTrajectoryScore(db: DB, projectId: number, now: Date): number {
+  // Two windows: last 7 days (today-7..today-1) and prior 7 days
+  // (today-14..today-8). SUM per window, then divide by 7 to get a
+  // mean. A flat or downward trajectory → 100; saturates at 0 when the
+  // recent mean is double the prior mean. With NULL prior_avg (no data)
+  // we surface 100 — same default as the pr_age "no PR" branch.
+  const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const t1 = new Date(today); t1.setUTCDate(t1.getUTCDate() - 7);
+  const t2 = new Date(today); t2.setUTCDate(t2.getUTCDate() - 14);
+  const day = (d: Date) => d.toISOString().slice(0, 10);
+  const todayStr = day(today);
+  const t1Str = day(t1);
+  const t2Str = day(t2);
+  const row = db.prepare(
+    "SELECT "
+    + "  SUM(CASE WHEN day >= ? AND day < ? THEN COALESCE(cost_usd,0) ELSE 0 END) AS recent7, "
+    + "  SUM(CASE WHEN day >= ? AND day < ? THEN COALESCE(cost_usd,0) ELSE 0 END) AS prior7 "
+    + "  FROM cost_rollup_day WHERE project_id = ?",
+  ).get(t1Str, todayStr, t2Str, t1Str, projectId) as unknown as CostWindowRow | undefined;
+  const recent7 = Number(row?.recent7 ?? 0);
+  const prior7 = Number(row?.prior7 ?? 0);
+  // No prior spend → no signal → default to 100. Avoids dividing by zero
+  // and avoids flagging brand-new projects.
+  if (prior7 <= 0) return 100;
+  const recentAvg = recent7 / 7;
+  const priorAvg = prior7 / 7;
+  const denom = Math.max(priorAvg, 0.01);
+  const deduction = Math.max(0, 100 * (recentAvg - priorAvg) / denom);
+  return Math.round(100 - Math.min(100, deduction));
+}
+
+function isPaused(db: DB, projectId: number): boolean {
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c FROM project_pause WHERE project_id = ?",
+  ).get(projectId) as unknown as PauseProbeRow | undefined;
+  return Number(row?.c ?? 0) > 0;
+}
+
+/** Compute the four sub-scores + composite for one project. Pure SQL
+ *  inside; no shell-out, no network, no transcript I/O. Memoised for
+ *  HEALTH_TTL_MS so the home grid's per-card call doesn't fan out N
+ *  identical queries on the 5s SPA poll. */
+export function projectHealth(db: DB, projectId: number, now: Date = new Date()): ProjectHealth {
+  const cached = healthCache.get(projectId);
+  if (cached && Date.now() - cached.ts < HEALTH_TTL_MS) return cached.value;
+  healthBuildCounter += 1;
+
+  const ship = shipSuccess(db, projectId);
+  const anomaly = anomalyScore(db, projectId, now);
+  const pr_age = prAgeScore(db, projectId, now);
+  const cost_trajectory = costTrajectoryScore(db, projectId, now);
+
+  // Composite: rounded mean of the four. ship_success contributes 0 to
+  // the deduction when it's null (we just drop it from the average so a
+  // brand-new project doesn't get a fake red). Either way the band is
+  // overridden to grey below — the score is still useful for the
+  // ?sort=health ordering.
+  const parts: number[] = [];
+  if (ship != null) parts.push(ship);
+  parts.push(anomaly, pr_age, cost_trajectory);
+  const score = Math.round(parts.reduce((s, x) => s + x, 0) / parts.length);
+
+  let band: ProjectHealth["band"];
+  if (ship == null || isPaused(db, projectId)) band = "grey";
+  else band = bandFor(score);
+
+  const value: ProjectHealth = {
+    score,
+    band,
+    subs: { ship_success: ship, anomaly, pr_age, cost_trajectory },
+    generated_at: now.toISOString(),
+    formula: HEALTH_FORMULA_TEXT,
+  };
+  healthCache.set(projectId, { ts: Date.now(), value });
+  return value;
+}
+
+/** Slim per-project listing for the home grid: slug, name, and the
+ *  {score, band} health summary only. The full `subs` + formula are
+ *  available via /api/projects/:slug/health so the home payload stays
+ *  small (every byte counts on a phone). */
+export interface ListedProject {
+  slug: string;
+  name: string;
+  health: { score: number; band: ProjectHealth["band"] };
+}
+
+interface ProjectListRow { id: number; slug: string; name: string | null; }
+
+export function listProjects(db: DB): ListedProject[] {
+  const rows = db.prepare(
+    "SELECT id, slug, name FROM project ORDER BY slug",
+  ).all() as unknown as ProjectListRow[];
+  return rows.map((r) => {
+    const h = projectHealth(db, r.id);
+    return { slug: r.slug, name: r.name ?? r.slug, health: { score: h.score, band: h.band } };
+  });
+}
+
+/** Lookup a project_id by slug; null when the slug is unknown. Exposed
+ *  so the server route can keep its handler tight. */
+export function projectIdBySlug(db: DB, slug: string): number | null {
+  const row = db.prepare("SELECT id FROM project WHERE slug = ?").get(slug) as { id: number } | undefined;
+  return row ? row.id : null;
 }
 
 export function runView(db: DB, id: number) {

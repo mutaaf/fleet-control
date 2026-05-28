@@ -1,7 +1,7 @@
 ---
 id: 0022
 title: Fleet temperature — single per-project health score on the home page
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-27
@@ -159,4 +159,12 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-28 — picked up by implementation-dev. Branch
+  `feat/0022-fleet-temperature`. Plan: failing tests first
+  (`tests/health.test.ts` for the pure helper + ingest column, augment
+  `tests/badge-route.test.ts`-style harness for the new
+  `/api/projects/:slug/health` route, JSDOM-free DOM assertions for the
+  SPA dot + tooltip). Then implement `projectHealth()` in `src/views.ts`,
+  the `gh_created_at` ALTER + ingest field, the new route, and the
+  vanilla SPA dot/tooltip. PERF tests gate on `process.env.PERF==="1"`
+  per the ticket.
