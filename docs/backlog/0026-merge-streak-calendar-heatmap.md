@@ -1,7 +1,7 @@
 ---
 id: 0026
 title: Merge streak counter and 90-day calendar heatmap on portal home
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-05-28
