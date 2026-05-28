@@ -19,13 +19,17 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
+| 0025 | fleetctl demo - one-command sandbox boots portal against seeded fixture fleet | P1 | groomed | infra |
+| 0026 | Merge streak counter and 90-day calendar heatmap on portal home | P1 | groomed | portal |
+| 0027 | Cross-project failure correlation - same error in N projects fires a fleet alert | P1 | groomed | observability |
+| 0028 | Project card shows month-to-date budget burndown with projection line | P2 | groomed | observability |
 | 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | shipped | control |
 | 0021 | Soft daily budget with autopause when a project blows the cap | P1 | shipped | control |
 | 0017 | Today's inbox — cross-project "what needs me" view | P1 | shipped | portal |
 | 0022 | Fleet temperature — single per-project health score on the home page | P1 | groomed | observability |
 | 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | groomed | ingest |
 | 0023 | PR card shows heal-attempts and first-fail reason inline | P2 | groomed | portal |
-| 0024 | First-run welcome — printed checklist after fleetctl serve cold start | P2 | proposed | infra |
+| 0024 | First-run welcome — printed checklist after fleetctl serve cold start | P2 | groomed | infra |
 | 0014 | Cross-project tool-call leaderboard | P1 | shipped | observability |
 | 0015 | Embeddable status badge SVG per project | P1 | shipped | portal |
 | 0016 | fleetctl doctor — one-shot install + ingest diagnostic | P2 | shipped | infra |
