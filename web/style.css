@@ -461,4 +461,38 @@ svg.burndown { width: 60px; height: 32px; flex: 0 0 60px; display: block; }
 @media (max-width: 600px) {
   svg.burndown { width: 40px; height: 24px; flex: 0 0 40px; }
   .burndown { gap: 6px; font-size: 10.5px; }
+  /* Ticket 0023: under 600px the PR-card head wraps so the heal chip
+     and the existing #N · checks span fall below the title rather
+     than truncate. Same intent as the inbox-row stack-on-phone rule
+     (ticket 0017). The "first failed:" link gets its own line via
+     the .pr-firstfail-row container the SPA emits; we just ensure
+     flex-wrap is on so a long check name doesn't push it off-screen. */
+  .pr-card .pr-head { flex-wrap: wrap; }
+  .pr-card .pr-head .state { display: block; margin-top: 4px; }
+  .pr-firstfail-row { flex-wrap: wrap; }
+  .heal-chip { white-space: nowrap; }
 }
+
+/* Ticket 0023: heal-attempts chip + "first failed: <name>" link on
+   the PR card head. The chip sits inline beside the existing
+   "✗ checks failing" string; the first-fail link drops on its own row
+   beneath the head so a long check name doesn't squeeze the title.
+   Colours: neutral (faint) under the cap, amber at or over the
+   AGENTS.md cap so the operator's eye lands on PRs that are one
+   failure away from escalation. Same chip vocabulary as the existing
+   .anomaly-pill / .paused-pill on the home page so the SPA stays
+   visually cohesive. */
+.heal-chip { display: inline-block; font-family: var(--mono);
+  font-size: 11px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--faint);
+  background: rgba(255,255,255,.02); margin-left: 6px;
+  vertical-align: middle; }
+.heal-chip.amber { color: var(--warn);
+  border-color: rgba(217,138,43,.45); background: rgba(217,138,43,.08); }
+
+.pr-firstfail-row { display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 6px; font-family: var(--mono); font-size: 11.5px; }
+.pr-first-fail { color: var(--accent); text-decoration: none;
+  border-bottom: 1px dotted var(--accent); }
+.pr-first-fail:hover { color: var(--accent); filter: brightness(1.15); }
+.pr-first-fail.dim { color: var(--dim); border-bottom-color: var(--dim); }

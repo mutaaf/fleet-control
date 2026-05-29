@@ -1120,16 +1120,62 @@ function nowBanner(ev) {
   const phaseName = PHASE[ev.phase] || ev.phase || "An agent";
   return `<div class="banner">● ${esc(phaseName)} is running now — started ${ago(ev.ts)}.</div>`;
 }
+// Ticket 0023: inline heal-attempts chip. Renders nothing when
+// heal_attempts is 0 so healthy PRs stay byte-identical with prior
+// versions. Amber when n >= max (the AGENTS.md-mandated heal cap is
+// 2, surfaced via the second arg so a future per-project cap could
+// pass a different value). The chip is a span (no nested <a>, since
+// the parent .pr-card already wraps the head in a clickable region).
+function renderHealChip(n, max) {
+  if (!n || n <= 0) return "";
+  const cls = n >= max ? "heal-chip amber" : "heal-chip";
+  const title = n >= max
+    ? `Heal attempts: ${n} of ${max} (cap reached — next failure escalates)`
+    : `Heal attempts: ${n} of ${max}`;
+  return `<span class="${cls}" title="${esc(title)}">heal ${n}/${max}</span>`;
+}
+
+// Ticket 0023: "first failed: <name>" link → the PR's GitHub Actions
+// tab. The link target is derived from pr.url (the PR's HTML URL)
+// by suffixing `/checks` — gh's standard Checks tab on a pull
+// request. Empty when first_fail_check is nullish. The check name
+// passes through redactSecrets per LESSONS § secret redaction at the
+// renderer boundary; the URL itself is also redacted defensively
+// (a future leaked PAT in a webhook URL would otherwise survive).
+function renderFirstFailLink(pr) {
+  const name = pr && pr.first_fail_check;
+  if (!name) return "";
+  const safeName = esc(redactSecrets(String(name)));
+  // pr.url is the canonical PR HTML URL (https://github.com/o/r/pull/N).
+  // The Checks tab lives at <url>/checks. When pr.url is missing we
+  // fall back to an inert span so the operator still sees the label.
+  const url = pr.url ? redactSecrets(String(pr.url)) + "/checks" : "";
+  if (!url) {
+    return `<span class="pr-first-fail dim">first failed: ${safeName}</span>`;
+  }
+  return `<a class="pr-first-fail" href="${esc(url)}" target="_blank"`
+    + ` rel="noopener" onclick="event.stopPropagation()">first failed: ${safeName}</a>`;
+}
+
 function prSection(p) {
   const prs = (p.prs || []).filter((x) => x.is_agent);
   if (!prs.length) return "";
   const ci = { green: "✓ checks pass", red: "✗ checks failing", pending: "checks running…", none: "" };
-  return `<div class="eyebrow">Finished work waiting for you</div>` + prs.map((pr) => `
+  // Heal cap from AGENTS.md (Hard NOs §3 — "Never exceed 2 heal
+  // attempts on one PR"). The chip surfaces this implicitly via
+  // "heal X/2" so the operator sees the budget without having to
+  // remember the number.
+  const HEAL_MAX = 2;
+  return `<div class="eyebrow">Finished work waiting for you</div>` + prs.map((pr) => {
+    const healChip = renderHealChip(pr.heal_attempts || 0, HEAL_MAX);
+    const firstFailLink = renderFirstFailLink(pr);
+    return `
     <div class="card pr-card" data-pr-card data-slug="${esc(p.slug)}" data-repo="${esc(p.repo)}" data-number="${pr.number}" data-url="${esc(pr.url || "")}">
       <div class="card-head pr-head" data-pr-toggle>
         <span class="pname" style="font-size:15px">${esc(pr.title)}</span>
-        <span class="state dim mono">#${pr.number} · ${ci[pr.ci_state] || ""} <span class="pr-caret">▸</span></span>
+        <span class="state dim mono">#${pr.number} · ${ci[pr.ci_state] || ""}${healChip ? " " + healChip : ""} <span class="pr-caret">▸</span></span>
       </div>
+      ${firstFailLink ? `<div class="pr-firstfail-row">${firstFailLink}</div>` : ""}
       <div class="metarow" style="margin-top:8px">
         <span class="faint mono">+${pr.additions} −${pr.deletions}</span>
         ${pr.url ? `<a class="btn sm" href="${esc(pr.url)}" target="_blank" onclick="event.stopPropagation()">View on GitHub</a>` : ""}
@@ -1142,7 +1188,8 @@ function prSection(p) {
           <button class="btn sm" data-act="pr-close" data-slug="${p.slug}" data-number="${pr.number}" data-confirm="Discard #${pr.number}? This closes the work.">Discard</button>
         </div>
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
 
 // ---- Embed badge panel (ticket 0015) -------------------------------------
