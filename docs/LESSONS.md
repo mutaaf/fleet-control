@@ -414,3 +414,28 @@ gating checks (typecheck + validate). The ship agent's
 "distinguish CI red from CI absent" rule extends here: distinguish
 "test red in MY change" from "test red for reasons that predate
 my change" — fix the first, document the second and move on.
+
+## 2026-05-29 — when a CLI subcommand adds boot output, take ownership of the listen banner
+
+Symptom: while shipping ticket 0024 (first-run welcome printed by
+`fleetctl serve`) my first cut wired `firstRun()` into the existing
+`startServer({ onListening })` hook without setting `quietBanner: true`
+— so a cold-start run printed `fleet-control portal → http://127.0.0.1:7070`
+FIRST (from inside `server.listen`'s default callback) and the
+12-line welcome AFTERWARDS. Subsequent runs printed the legacy banner
+PLUS my new one-line `fleet-control serving on ...` quiet form — two
+lines saying the same thing, in opposite styles. Cause: `startServer`'s
+listen callback is a multiplexer — it prints its own line by default
+AND invokes the caller's `onListening`. Any CLI subcommand that wants
+to own boot output must opt out of the default banner explicitly via
+`quietBanner: true` (the same flag the demo subcommand from ticket
+0025 already uses for the same reason). Fix: set `quietBanner: true`
+in the serve case and have the CLI re-emit the legacy `fleet-control
+portal → ...` line ITSELF when `--no-welcome` is passed (so existing
+scrapers and operator muscle memory still see exactly one banner).
+General rule for this repo: any new CLI subcommand that intends to
+emit a boot banner MUST pass `quietBanner: true` to `startServer` and
+own the full boot stdout — otherwise the operator gets two banners
+that race the kernel's listen callback in unpredictable order. Same
+trap will bite future subcommands (`fleetctl serve --json-logs`,
+`fleetctl serve --quiet`, etc.) that want to control startup output.
