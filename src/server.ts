@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
@@ -373,6 +373,18 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           return diskUsage(dm[1])
             .then((r) => json(res, r))
             .catch((e: any) => json(res, { error: String(e?.message ?? e) }, 500));
+        }
+        // Ticket 0018: backlog-ticket ship report. Aggregates the
+        // ticket_commit_link rows for one 4-digit ticket id; the SPA
+        // renders a "Shipped as PR #N · K commits · +X / -Y across Z
+        // files" panel beneath the acceptance criteria. Net-new — no
+        // existing JSON shape to preserve. Returns 404 when no
+        // commits link to the ticket so the SPA can render nothing
+        // for proposed / groomed / in-progress tickets.
+        const shipm = path.match(/^\/api\/backlog\/(\d{4})\/ship-report$/);
+        if (shipm) {
+          const rep = ticketShipReport(db, shipm[1]);
+          return rep ? json(res, rep) : json(res, { error: "not found" }, 404);
         }
         // Anomalies for a project (ticket 0008). Default N=10, hard cap 50.
         // 200 with `{anomalies: []}` for an unknown slug — same shape as

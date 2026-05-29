@@ -1197,6 +1197,97 @@ export function projectIdBySlug(db: DB, slug: string): number | null {
   return row ? row.id : null;
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Backlog-ticket → merged-commit auto-link report (ticket 0018).
+//
+// Aggregates the ticket_commit_link rows for one ticket id into a
+// single payload the SPA renders as "Shipped as PR #N (merged ...) ·
+// K commits · +X / -Y across Z files". Returns null when no commits
+// link to the ticket — the route handler 404s on null so the SPA can
+// render nothing for proposed/groomed/in-progress tickets.
+//
+// Pure SQL (a SELECT then a SUM aggregate). Uses `as unknown as RowT[]`
+// for the typed `.all()` per LESSONS § "node:sqlite's .all() needs
+// `as unknown as T[]`".
+// ────────────────────────────────────────────────────────────────────
+
+export interface TicketShipCommit {
+  commit_sha: string;
+  commit_date: string;
+  author: string;
+  message_subject: string;
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+  project_slug: string;
+  pr_number: number | null;
+}
+
+export interface TicketShipReport {
+  commits: TicketShipCommit[];
+  pr_number: number | null;
+  total_insertions: number;
+  total_deletions: number;
+  total_files_changed: number;
+  first_commit_date: string;
+  last_commit_date: string;
+}
+
+interface TicketLinkRow {
+  commit_sha: string;
+  commit_date: string;
+  author: string;
+  message_subject: string;
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+  project_slug: string;
+  pr_number: number | null;
+}
+
+/** Aggregate every ticket_commit_link row for `ticket_id` into a single
+ *  ship-report payload. Returns null when no rows link to the ticket. */
+export function ticketShipReport(db: DB, ticket_id: string): TicketShipReport | null {
+  const rows = db.prepare(
+    "SELECT commit_sha, commit_date, author, message_subject,"
+    + " files_changed, insertions, deletions, project_slug, pr_number"
+    + " FROM ticket_commit_link WHERE ticket_id = ? ORDER BY commit_date ASC",
+  ).all(ticket_id) as unknown as TicketLinkRow[];
+  if (!rows.length) return null;
+
+  // pr_number bubble-up: take the first non-null pr_number among the
+  // commits (multiple commits on the same ticket typically share one PR;
+  // the rare "ticket touched across two PRs" case takes the earliest
+  // and the SPA can still link to the others via the commit list).
+  let prNumber: number | null = null;
+  let totalIns = 0, totalDel = 0, totalFiles = 0;
+  for (const r of rows) {
+    totalIns += Number(r.insertions) || 0;
+    totalDel += Number(r.deletions) || 0;
+    totalFiles += Number(r.files_changed) || 0;
+    if (prNumber == null && r.pr_number != null) prNumber = Number(r.pr_number);
+  }
+  return {
+    commits: rows.map((r) => ({
+      commit_sha: r.commit_sha,
+      commit_date: r.commit_date,
+      author: r.author,
+      message_subject: r.message_subject,
+      files_changed: Number(r.files_changed) || 0,
+      insertions: Number(r.insertions) || 0,
+      deletions: Number(r.deletions) || 0,
+      project_slug: r.project_slug,
+      pr_number: r.pr_number == null ? null : Number(r.pr_number),
+    })),
+    pr_number: prNumber,
+    total_insertions: totalIns,
+    total_deletions: totalDel,
+    total_files_changed: totalFiles,
+    first_commit_date: rows[0].commit_date,
+    last_commit_date: rows[rows.length - 1].commit_date,
+  };
+}
+
 export function runView(db: DB, id: number) {
   const run = db.prepare("SELECT * FROM run WHERE id=?").get(id) as any;
   if (!run) return null;
