@@ -1,7 +1,7 @@
 ---
 id: 0027
 title: Cross-project failure correlation - same error in N projects fires a fleet alert
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-28
@@ -233,3 +233,6 @@ Each box maps 1:1 to a test scenario.
   --log-failed` call gated on `first_fail_check` being non-null, per
   this ticket's AC#3. Both reuse the existing
   `_setPrRunnerForTests` seam.
+- 2026-05-28 — PR #58 opened, both gating checks (`typecheck`,
+  `validate`) green, auto-merged into main. Status flipped to
+  `shipped`.

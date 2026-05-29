@@ -346,3 +346,35 @@ this repo: any module that renders user/operator data to a terminal
 or HTTP response SHOULD pass the final string through a single
 `redactSecrets()` chokepoint at the boundary — the check authors
 remain primary, but the renderer is the silent backstop.
+
+## 2026-05-28 — re-fire-after-dismiss needs an aging window, not a partial UNIQUE index
+
+Symptom: while shipping ticket 0027 (cross-project failure
+correlation) I wired a `CREATE UNIQUE INDEX IF NOT EXISTS ON
+anomaly(correlation_signature) WHERE kind='fleet_correlated'` to
+guarantee `runCorrelationHook` was idempotent within a 24h window —
+two ticks in a row insert one row, perfect. AC9 then exercised
+"dismiss the correlation, advance 25h, seed a fresh outbreak, the
+inbox must re-surface a new row." It didn't: the partial UNIQUE
+swallowed the second INSERT because the dismissed row was still
+present, so `activeCorrelations`' LEFT JOIN saw a dismissed row
+and nothing fresh. Cause: a hard UNIQUE constraint conflates two
+separate questions — "is this a duplicate WITHIN the dedup window"
+and "is this a duplicate FOR ALL TIME" — and the second answer is
+wrong for any signal that the operator legitimately wants to be
+re-alerted about after they've acknowledged the previous instance.
+Fix: drop the partial UNIQUE for a non-unique index on
+`(correlation_signature, created_at)` and move idempotency into
+the application — the hook does a "is there a row WHERE
+created_at >= now - 24h?" lookup before INSERT. The 24h aging is
+the natural re-fire boundary: a dismissed row falls out of the
+window after 24h, the next tick finds no live row, and a fresh
+INSERT lands. General rule for this repo: any "fire once per
+event family" detector where the OPERATOR can dismiss and the
+EVENT can recur needs an aging-window dedup, not a UNIQUE
+constraint. Reach for SQL UNIQUE only when "duplicate" means
+"identical for all time" (e.g. `auth_token.id` = hash of the
+plaintext — re-minting the same plaintext is genuinely a bug).
+Pair with a LEFT JOIN onto `inbox_dismissal` so the dismissed row
+is invisibly suppressed inside its window without blocking the
+next legitimate fire after the window closes.
