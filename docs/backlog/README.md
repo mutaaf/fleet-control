@@ -29,7 +29,7 @@ proposes new ones, `review` grades them.
 | 0022 | Fleet temperature — single per-project health score on the home page | P1 | shipped | observability |
 | 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | shipped | ingest |
 | 0023 | PR card shows heal-attempts and first-fail reason inline | P2 | shipped | portal |
-| 0024 | First-run welcome — printed checklist after fleetctl serve cold start | P2 | groomed | infra |
+| 0024 | First-run welcome — printed checklist after fleetctl serve cold start | P2 | in-progress | infra |
 | 0014 | Cross-project tool-call leaderboard | P1 | shipped | observability |
 | 0015 | Embeddable status badge SVG per project | P1 | shipped | portal |
 | 0016 | fleetctl doctor — one-shot install + ingest diagnostic | P2 | shipped | infra |
