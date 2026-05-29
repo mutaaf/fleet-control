@@ -378,3 +378,39 @@ plaintext — re-minting the same plaintext is genuinely a bug).
 Pair with a LEFT JOIN onto `inbox_dismissal` so the dismissed row
 is invisibly suppressed inside its window without blocking the
 next legitimate fire after the window closes.
+
+## 2026-05-29 — time-pinned tests must NOT derive seed timestamps from `new Date()`
+
+Symptom: while shipping ticket 0018 I ran `node --test tests/*.test.ts`
+to confirm no regressions and saw `tests/prs-merged.test.ts` (5/7
+failing) and `tests/digest.test.ts` (multiple failing) reporting
+`prs_merged: 0` against a fixture that seeded 3 shipped runs. The
+same two test files failed identically against `main` with my
+changes stashed, so the regression wasn't mine. Cause: both files
+pin the digest "now" anchor as a string constant
+(`NOW_ANCHOR = "2026-05-26T12:00:00.000Z"`) but build their seed
+timestamps with a helper that reads `new Date()`:
+`daysAgoIso(N) { const d = new Date(); d.setUTCDate(... - N); ... }`.
+On the day the test was authored (2026-05-26) those two clocks
+agreed. By 2026-05-29 the wall clock had moved three days past the
+anchor — so `daysAgoIso(1)` returned a row dated 2026-05-28 (which
+falls AFTER the 2026-05-26 anchor's seven-day window
+[2026-05-19, 2026-05-26]) and the digest correctly counted zero
+shipped runs in window. The detector is right; the fixture is the
+bug. The CI typecheck gate doesn't catch this because the file
+compiles fine, and the `validate` gate only runs
+`scripts/check-backlog.mjs` — no tests. So the failures sit
+indefinitely on main until a human runs the suite. Fix when next
+touching these files: take a `now: NOW_ANCHOR` (or any pin) option
+through the seed helper and use `new Date(opts.now)` as the
+arithmetic base. General rule for this repo: any test that pins a
+fixed `now` anchor MUST anchor its seed timestamps to that same
+value — never `new Date()` — or the test becomes a time-bomb that
+breaks weeks after the author committed. Same trap will bite any
+future window-scoped digest, leaderboard, streak, or burndown
+test. Pre-existing failures discovered in the wild are fine to
+leave in place under one condition: they MUST NOT be one of the
+gating checks (typecheck + validate). The ship agent's
+"distinguish CI red from CI absent" rule extends here: distinguish
+"test red in MY change" from "test red for reasons that predate
+my change" — fix the first, document the second and move on.
