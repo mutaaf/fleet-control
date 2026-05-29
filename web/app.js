@@ -1464,6 +1464,56 @@ async function correlation(signature) {
     </div>`;
 }
 
+// ---- Backlog ticket detail view (ticket 0018) ----------------------------
+// One-shot view that renders the "Shipped as PR #N · K commits · +X / -Y
+// across Z files" panel from the new /api/backlog/:id/ship-report
+// endpoint. For shipped tickets only — the endpoint 404s on tickets with
+// no linked commits, in which case we render nothing under the heading
+// (operator clicked through from a proposed/groomed ticket). Each commit
+// hash links to the GitHub commit page when a repo_url is known on the
+// ticket payload, otherwise the SHA renders inline.
+function renderShipReport(rep) {
+  if (!rep) return "";
+  const commits = (rep.commits || []).map((c) => {
+    const shaShort = String(c.commit_sha || "").slice(0, 12);
+    const subject = esc(c.message_subject || "");
+    return `<li class="ship-commit"><code class="mono">${esc(shaShort)}</code> `
+      + `<span class="dim">· ${esc(c.author || "")} · ${esc(ago(c.commit_date))}</span> `
+      + `· ${subject}</li>`;
+  }).join("");
+  const pr = rep.pr_number != null
+    ? `PR #${esc(String(rep.pr_number))} `
+    : "";
+  const headline = `${pr}· <b>${rep.commits.length}</b> commit${rep.commits.length === 1 ? "" : "s"}`
+    + ` · <b>+${esc(String(rep.total_insertions))}</b> / <b>−${esc(String(rep.total_deletions))}</b>`
+    + ` across <b>${esc(String(rep.total_files_changed))}</b> file${rep.total_files_changed === 1 ? "" : "s"}`;
+  return `<div class="ship-report">
+    <div class="eyebrow">Shipped as</div>
+    <div class="ship-headline">${headline}</div>
+    <ul class="ship-commits">${commits}</ul>
+  </div>`;
+}
+
+async function backlog(id) {
+  summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
+  const tid = String(id || "").match(/^\d{4}$/) ? id : "";
+  if (!tid) {
+    app.innerHTML = `<div class="loading">unknown ticket id: <code class="mono">${esc(String(id))}</code></div>`;
+    return;
+  }
+  let rep = null;
+  try {
+    const r = await fetch("/api/backlog/" + encodeURIComponent(tid) + "/ship-report");
+    if (r.ok) rep = await r.json();
+    // 404 leaves rep=null so the "Shipped as" section renders nothing
+    // (proposed / groomed / in-progress tickets fall here).
+  } catch { /* network blip — render the empty page */ }
+  app.innerHTML = `<a class="back" href="#/">‹ all projects</a>
+    <div class="card-head"><span class="pname">Ticket ${esc(tid)}</span></div>
+    ${renderShipReport(rep)}`;
+  foot.textContent = "";
+}
+
 async function route() {
   stop();
   const h = location.hash || "#/";
@@ -1475,6 +1525,12 @@ async function route() {
       timer = setInterval(() => project(s, params).catch(() => {}), 5000);
     } else if (path.startsWith("r/")) {
       await run(path.slice(2));
+    } else if (path.startsWith("t/")) {
+      // Ticket 0018: backlog ticket detail page with the "Shipped as"
+      // auto-link panel. One-shot render — no polling timer because
+      // the data is the merged-commit history, which only changes
+      // when a new PR lands (the next home() tick will pick it up).
+      await backlog(path.slice(2));
     } else if (path.startsWith("correlation/")) {
       // Ticket 0027: fleet-correlation detail view. One-shot render
       // — no polling timer because the operator is reading, not

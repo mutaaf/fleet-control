@@ -211,6 +211,32 @@ CREATE TABLE IF NOT EXISTS inbox_dismissal (
   dismissed_at  TEXT NOT NULL,
   PRIMARY KEY (kind, project_slug, payload_id)
 );
+
+-- Backlog-ticket to merged-commit auto-link (ticket 0018). One row per
+-- (project_slug, commit_sha, ticket_id) tuple. Populated by the daemon
+-- hook in src/ingest/git_ticket_links.ts which shells out to git log
+-- with a sinceRef..HEAD range plus --shortstat and parses each commit
+-- subject for a 4-digit ticket id. Idempotent on re-insert (PK
+-- collision = no duplicate row); pr_number is enriched at insert time
+-- when the ticket id appears inside a known pr.branch. ALL identifiers
+-- are quoted as plain words inside this SCHEMA template — per
+-- LESSONS § no backticks inside template-literal SQL strings, a stray
+-- backtick here would break node v25 type-stripping and the whole
+-- module would fail to load.
+CREATE TABLE IF NOT EXISTS ticket_commit_link (
+  ticket_id       TEXT NOT NULL,
+  project_slug    TEXT NOT NULL,
+  commit_sha      TEXT NOT NULL,
+  commit_date     TEXT NOT NULL,
+  author          TEXT NOT NULL,
+  message_subject TEXT NOT NULL,
+  files_changed   INTEGER NOT NULL,
+  insertions      INTEGER NOT NULL,
+  deletions       INTEGER NOT NULL,
+  pr_number       INTEGER,
+  PRIMARY KEY (project_slug, commit_sha, ticket_id)
+);
+CREATE INDEX IF NOT EXISTS ticket_commit_link_ticket ON ticket_commit_link(ticket_id);
 `;
 
 export type DB = DatabaseSync;
