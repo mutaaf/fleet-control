@@ -1,7 +1,7 @@
 ---
 id: 0028
 title: Project card shows month-to-date budget burndown with projection line
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-05-28
@@ -198,4 +198,11 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-29 [implementation-dev]: status -> in-progress. Branch
+  feat/0028-project-card-budget-burndown opened off main. Implementing
+  `projectBurndown(db, projectId, now)` in src/views.ts, extending
+  `listProjects` with the burndown summary, wiring
+  `GET /api/projects/:slug/burndown` in src/server.ts, and rendering
+  the inline SVG sparkline in web/app.js. Tests seed runs (not direct
+  rollup inserts) per the LESSON; the AC8 SPA tests are text-level
+  over web/app.js and web/style.css.

@@ -439,3 +439,26 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
     grid-template-rows: repeat(7, 14px); }
   .heatmap-cell { width: 14px; height: 14px; }
 }
+
+/* Ticket 0028: month-to-date budget burndown sparkline on each
+   project card. Desktop is 60x32 px; phones (<600px viewport)
+   shrink to 40x24 per the AC. The wrapper is inline-flex so the
+   "$X of $Y cap MTD" label sits to the right of the SVG without
+   forcing a line break on desktop; on phones the label drops to
+   its own line below the SVG. */
+.burndown { display: inline-flex; align-items: center; gap: 8px;
+  margin-top: 6px; font-family: var(--mono); font-size: 11px; }
+svg.burndown { width: 60px; height: 32px; flex: 0 0 60px; display: block; }
+.burndown-cap { stroke: var(--faint); stroke-width: 1; fill: none; }
+.burndown-projected { stroke: var(--dim); stroke-width: 1; fill: none; }
+.burndown-dot.band-green { fill: var(--good); }
+.burndown-dot.band-amber { fill: var(--warn); }
+.burndown-dot.band-red   { fill: var(--bad); }
+.burndown-label { white-space: nowrap; }
+.burndown-empty { margin-top: 6px; font-family: var(--mono);
+  font-size: 11px; }
+
+@media (max-width: 600px) {
+  svg.burndown { width: 40px; height: 24px; flex: 0 0 40px; }
+  .burndown { gap: 6px; font-size: 10.5px; }
+}
