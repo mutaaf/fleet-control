@@ -1,7 +1,7 @@
 ---
 id: 0024
 title: First-run welcome — printed checklist after fleetctl serve cold start
-status: groomed
+status: in-progress
 priority: P2
 area: infra
 created: 2026-05-27
@@ -165,4 +165,8 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-29 — picked up by implementation-dev. Status → `in-progress`.
+  Will land `src/welcome.ts` (pure render + injectable filesystem deps),
+  wire it into `bin/fleetctl.ts serve` after `server.listen`, and exercise
+  every AC via `tests/welcome.test.ts` (snapshot + sentinel round-trip +
+  CLI subprocess test per the FLEET_DB_PATH / FLEET_HOME env seam).
