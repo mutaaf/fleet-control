@@ -16,7 +16,8 @@ import { listSnapshots } from "../src/snapshot.ts";
 import { doAction } from "../src/control.ts";
 import { defaultDeps, runDoctor, renderHuman, renderJson, exitCodeFor } from "../src/doctor.ts";
 import { loadDemoFixture, DEMO_BANNER, DEMO_DEFAULT_PORT } from "../src/demo/fixture.ts";
-import { mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { firstRun, sentinelPathFor, type WelcomeOpts, type WelcomeDeps } from "../src/welcome.ts";
+import { mkdirSync, writeFileSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync as fsWriteFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import { homedir, tmpdir } from "node:os";
 
@@ -331,8 +332,73 @@ switch (cmd) {
   case "snapshot": await snapshot(); break;
   case "serve": {
     db.close(); // server opens its own handle
-    const host = process.env.FLEET_HOST ?? loadConfig().host ?? "127.0.0.1";
-    startServer(host, Number(process.env.FLEET_PORT ?? 7070));
+    const serveCfg = loadConfig();
+    const host = process.env.FLEET_HOST ?? serveCfg.host ?? "127.0.0.1";
+    const port = Number(process.env.FLEET_PORT ?? 7070);
+    // Ticket 0024 — first-run welcome. `--welcome` forces, `--no-welcome`
+    // suppresses. We resolve everything we need (sentinel path, project
+    // list, token source) BEFORE startServer fires onListening so the
+    // callback stays a thin trigger.
+    const forceWelcome = argv.includes("--welcome");
+    const suppressWelcome = argv.includes("--no-welcome");
+    const sentinelPath = sentinelPathFor(process.env);
+    // Re-open a short-lived handle ONLY to read project slugs for step 3.
+    // Using the same DB the server is about to open is fine because
+    // sqlite serialises writers and this is a read-only SELECT.
+    let projectSlugs: string[] = [];
+    let cfgAdminToken = "";
+    try {
+      const peekDb = openDb(serveCfg.dbPath);
+      try {
+        const rows = peekDb.prepare("SELECT slug FROM project ORDER BY slug LIMIT 4").all() as Array<{ slug: string }>;
+        projectSlugs = rows.map((r) => r.slug);
+      } finally { peekDb.close(); }
+    } catch { /* fresh install — no project table yet, render the register hint */ }
+    try {
+      const cfgFile = pathJoin(process.cwd(), "fleet-control.config.json");
+      if (existsSync(cfgFile)) {
+        const raw = JSON.parse(readFileSync(cfgFile, "utf8")) as Record<string, unknown>;
+        if (typeof raw.adminToken === "string") cfgAdminToken = raw.adminToken;
+      }
+    } catch { /* config absent — auth.ts will mint one on first serve */ }
+    const welcomeOpts: WelcomeOpts = {
+      token: cfgAdminToken,
+      host,
+      port,
+      configPath: pathJoin(process.cwd(), "fleet-control.config.json"),
+      tokenSource: cfgAdminToken ? "config" : "new",
+      color: process.stdout.isTTY === true,
+      projects: projectSlugs,
+      sentinelPath,
+    };
+    const welcomeDeps: WelcomeDeps = {
+      fileExists: (p) => { try { return existsSync(p); } catch { return false; } },
+      writeFile: (p, body) => fsWriteFileSync(p, body),
+      mkdir: (p) => mkdirSync(p, { recursive: true }),
+      log: (line) => process.stdout.write(line + "\n"),
+      warn: (line) => process.stderr.write(line + "\n"),
+    };
+    // Suppress the server's stock "fleet-control portal → ..." banner so
+    // the welcome (or, on subsequent runs, its one-line quiet form) is
+    // the sole stdout artifact at boot. When `--no-welcome` is set we
+    // re-emit a minimal line ourselves so a daemon-style operator still
+    // sees confirmation that serve actually listened.
+    startServer(host, port, {
+      quietBanner: true,
+      onListening: () => {
+        try {
+          firstRun(welcomeOpts, welcomeDeps, {
+            force: forceWelcome,
+            suppress: suppressWelcome,
+          });
+          if (suppressWelcome) {
+            // Mirror the legacy banner so existing scrapers don't break.
+            const shown = host === "0.0.0.0" ? "localhost" : host;
+            process.stdout.write(`fleet-control portal → http://${shown}:${port}\n`);
+          }
+        } catch { /* never let a welcome render crash the server */ }
+      },
+    });
     break; // keep process alive (http server is listening)
   }
   case "daemon-run": { db.close(); runDaemon(Number(arg) || 60); break; } // launchd entry (long-running)
