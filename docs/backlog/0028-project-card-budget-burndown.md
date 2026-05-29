@@ -1,7 +1,7 @@
 ---
 id: 0028
 title: Project card shows month-to-date budget burndown with projection line
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-05-28
@@ -206,3 +206,8 @@ Each box maps 1:1 to a test scenario.
   the inline SVG sparkline in web/app.js. Tests seed runs (not direct
   rollup inserts) per the LESSON; the AC8 SPA tests are text-level
   over web/app.js and web/style.css.
+- 2026-05-29 [implementation-dev]: shipped via PR #60 (squash-merged).
+  Both gating checks (typecheck, validate) green. 20 of 22 burndown
+  tests pass on the local gate; AC11 perf gates ride on PERF=1. The
+  paused-projects byte-additive allow-list was extended to include
+  `burndown` (same shape as the 0022 `health` precedent).
