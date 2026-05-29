@@ -28,7 +28,7 @@ proposes new ones, `review` grades them.
 | 0017 | Today's inbox — cross-project "what needs me" view | P1 | shipped | portal |
 | 0022 | Fleet temperature — single per-project health score on the home page | P1 | shipped | observability |
 | 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | shipped | ingest |
-| 0023 | PR card shows heal-attempts and first-fail reason inline | P2 | groomed | portal |
+| 0023 | PR card shows heal-attempts and first-fail reason inline | P2 | in-progress | portal |
 | 0024 | First-run welcome — printed checklist after fleetctl serve cold start | P2 | groomed | infra |
 | 0014 | Cross-project tool-call leaderboard | P1 | shipped | observability |
 | 0015 | Embeddable status badge SVG per project | P1 | shipped | portal |
