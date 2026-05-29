@@ -31,24 +31,71 @@ function ciState(rollup: any[]): string {
   return "green";
 }
 
-// Ticket 0027: surface the first failing check name (e.g. "typecheck")
-// from the rollup so the correlation pass has a stable lookup key for
-// `gh run view --log-failed`. We pick the first rollup entry whose
-// conclusion matches /FAIL|ERROR|CANCEL/i — same shape as the ciState
-// classifier above. Returns null when no rollup entry failed. (When
-// ticket 0023 lands its own first_fail_check derivation it will
-// replace this helper; for now we own the column.)
-function firstFailingCheck(rollup: any[]): string | null {
+// Ticket 0023: surface the FIRST failing check (sorted by startedAt
+// ascending) so the operator's PR-card "first failed: <name>" link
+// always points at the root-cause check, not whichever entry happened
+// to land first in gh's array. Sort is stable: entries without a
+// startedAt keep their original array position relative to one
+// another, which preserves the legacy-context fallback shape ticket
+// 0027 relied on. Exported for direct unit-test coverage per the
+// ticket's "small parsing helpers; both should be exported" note.
+//
+// Returns null when no rollup entry failed.
+export function pickFirstFailingCheckName(rollup: unknown): string | null {
   if (!Array.isArray(rollup)) return null;
-  for (const c of rollup) {
-    const s = String(c?.conclusion ?? c?.status ?? "");
+  if (rollup.length === 0) return null;
+  // Decorate-sort-undecorate: capture each entry's original index so
+  // entries without a startedAt sort stably by their array position.
+  const decorated = rollup.map((c, i) => ({ c, i }));
+  decorated.sort((a, b) => {
+    const ta = String((a.c as any)?.startedAt ?? "");
+    const tb = String((b.c as any)?.startedAt ?? "");
+    // When either side is missing a timestamp the comparison falls
+    // back to the original index — so a payload with NO startedAt
+    // anywhere just yields array order.
+    if (!ta && !tb) return a.i - b.i;
+    if (!ta) return 1;
+    if (!tb) return -1;
+    if (ta === tb) return a.i - b.i;
+    return ta < tb ? -1 : 1;
+  });
+  for (const { c } of decorated) {
+    const s = String((c as any)?.conclusion ?? (c as any)?.status ?? "");
     if (/FAIL|ERROR|CANCEL/i.test(s)) {
       // gh emits the check name under `name` (check_run) or `context`
       // (legacy status check). databaseId / workflowName are fallbacks.
-      return String(c?.name ?? c?.context ?? c?.workflowName ?? "ci");
+      return String((c as any)?.name ?? (c as any)?.context
+        ?? (c as any)?.workflowName ?? "ci");
     }
   }
   return null;
+}
+
+// Ticket 0023: count `heal:`-prefixed commits on the PR. The agent
+// loop's AGENTS.md-mandated convention is that every heal commit's
+// first-line headline starts with `heal:` at column zero
+// (case-insensitive). Anything else — a trailing mention, a scoped
+// `feat(heal):`, a leading-whitespace `  heal:` — is NOT a heal
+// commit and must not inflate the count. Exported for direct unit
+// coverage; the ingest pass calls it once per PR row.
+//
+// Inputs accept either gh's `messageHeadline` shape OR a plain string
+// (we tolerate `{messageHeadline}` objects per the gh `--json commits`
+// schema and fall back to a string read for ergonomic test callers).
+export function countHealCommits(commits: unknown): number {
+  if (!Array.isArray(commits)) return 0;
+  let n = 0;
+  for (const raw of commits) {
+    const headline = typeof raw === "string"
+      ? raw
+      : String((raw as any)?.messageHeadline ?? "");
+    // First line only: gh splits headline from body, but a string
+    // caller might pass the joined message — only the first
+    // newline-delimited line counts.
+    const firstLine = headline.split("\n", 1)[0] ?? "";
+    if (/^heal:/i.test(firstLine)) n += 1;
+  }
+  return n;
 }
 
 // Ticket 0027: pull the first 200 chars of the failing check's log via
@@ -98,8 +145,13 @@ export function ingestProjectPRs(db: DB, projectId: number, repo: string): void 
     // schema's new gh_created_at column (added in src/db.ts) gets
     // populated on every ingest pass. The extra field is additive on
     // the gh JSON shape — no callers consume the gh stdout directly.
+    // Ticket 0023: also fetch `commits` so we can count heal-prefixed
+    // headlines via countHealCommits() and persist heal_attempts. gh
+    // returns one entry per commit with a `messageHeadline` (first
+    // line of the commit message) and a `messageBody` — we only need
+    // the headline.
     const out = activeRunner("gh", ["pr", "list", "--repo", repo, "--state", "open", "--limit", "40",
-      "--json", "number,title,headRefName,mergeStateStatus,statusCheckRollup,additions,deletions,author,url,createdAt"]);
+      "--json", "number,title,headRefName,mergeStateStatus,statusCheckRollup,additions,deletions,author,url,createdAt,commits"]);
     rows = JSON.parse(out);
   } catch { return; } // no gh/auth/network → keep last cache
 
@@ -108,24 +160,41 @@ export function ingestProjectPRs(db: DB, projectId: number, repo: string): void 
   const up = db.prepare(
     "INSERT INTO pr(project_id,number,title,branch,state,ci_state,merge_state,is_agent,"
     + "additions,deletions,author,url,fetched_at,gh_created_at,"
-    + "first_fail_check,first_fail_excerpt) "
-    + "VALUES(?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?)",
+    + "first_fail_check,first_fail_excerpt,heal_attempts) "
+    + "VALUES(?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?,?)",
   );
   for (const p of rows) {
-    // Ticket 0027: derive first_fail_check from the rollup we already
-    // have, then (when it's non-null) pull the first 200 chars of the
-    // failing log via the runner seam. Both columns stay NULL when
-    // the rollup carries no failing check — the correlation pass
-    // skips NULL excerpts entirely.
-    const firstFail = firstFailingCheck(p.statusCheckRollup);
+    // Ticket 0023 + 0027: derive first_fail_check via the
+    // startedAt-ascending picker (was: array order), then (when
+    // non-null) pull the first 200 chars of the failing log via the
+    // runner seam. Both excerpt-side columns stay NULL when the
+    // rollup carries no failing check — the correlation pass skips
+    // NULL excerpts entirely.
+    //
+    // heal_attempts is sourced from the commits payload via
+    // countHealCommits — `heal:` at column zero, case-insensitive,
+    // first-line-only. NULL-safe: defaults to 0 when gh omits the
+    // commits field (no caller hits that branch in production but the
+    // helper tolerates it).
+    const firstFail = pickFirstFailingCheckName(p.statusCheckRollup);
     const excerpt = firstFail ? fetchFirstFailExcerpt(repo, p.number) : null;
+    const heals = countHealCommits(p.commits);
     up.run(projectId, p.number, p.title, p.headRefName, ciState(p.statusCheckRollup),
       p.mergeStateStatus ?? null, AGENT_RE.test(p.headRefName) ? 1 : 0,
       p.additions ?? 0, p.deletions ?? 0, p.author?.login ?? null, p.url ?? null, now,
-      p.createdAt ?? null, firstFail, excerpt);
+      p.createdAt ?? null, firstFail, excerpt, heals);
   }
 }
 
 export function projectPRs(db: DB, projectId: number) {
-  return db.prepare("SELECT number,title,branch,ci_state,merge_state,is_agent,additions,deletions,author,url FROM pr WHERE project_id=? ORDER BY is_agent DESC, number DESC").all(projectId);
+  // Ticket 0023: additively returns heal_attempts + first_fail_check
+  // so the PR card renderer can surface "heal X/2" and "first failed:
+  // <name>" without a second round-trip. Existing fields keep their
+  // names and types — this is purely additive on the JSON shape
+  // (the SPA's fetcher tolerates extra keys).
+  return db.prepare(
+    "SELECT number,title,branch,ci_state,merge_state,is_agent,additions,deletions,"
+    + "author,url,heal_attempts,first_fail_check "
+    + "FROM pr WHERE project_id=? ORDER BY is_agent DESC, number DESC",
+  ).all(projectId);
 }

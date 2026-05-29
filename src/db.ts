@@ -285,6 +285,18 @@ export function openDb(path: string): DB {
     // detector pays at one table.
     "ALTER TABLE pr ADD COLUMN first_fail_check TEXT",
     "ALTER TABLE pr ADD COLUMN first_fail_excerpt TEXT",
+    // ticket 0023: heal-attempts count surfaced inline on each PR
+    // card so the operator can see "heal 2/2" without remembering to
+    // grep the commit log. Populated by ingestProjectPRs from gh's
+    // `commits` payload (counted via countHealCommits — only the
+    // first line of each commit's messageHeadline is inspected, and
+    // only a case-insensitive `heal:` prefix at column zero counts).
+    // Default 0 keeps legacy rows (and any PR with zero heal commits)
+    // safely numeric for the SPA's `pr.heal_attempts > 0` chip-render
+    // guard — a NULL would render the chip on every legacy row. Per
+    // LESSONS § no backticks inside template-literal SQL strings, the
+    // identifier stays plain (no quoting needed for a single word).
+    "ALTER TABLE pr ADD COLUMN heal_attempts INTEGER DEFAULT 0",
     // ticket 0027: the anomaly table grows one new column for
     // correlation tagging. The existing `kind` column (NOT NULL since
     // 0008) is reused for the new 'fleet_correlated' value — adding

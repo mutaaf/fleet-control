@@ -1,7 +1,7 @@
 ---
 id: 0023
 title: PR card shows heal-attempts and first-fail reason inline
-status: groomed
+status: in-progress
 priority: P2
 area: portal
 created: 2026-05-27
@@ -147,4 +147,13 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-29 (implementation-dev): Picked up on branch
+  `feat/0023-pr-card-heal-and-first-fail`. `first_fail_check` column on
+  the `pr` table already exists (added by ticket 0027), so the schema
+  migration AC reduces to verifying the column is present and adding
+  the new `heal_attempts INTEGER DEFAULT 0` column. Ingest gains a
+  `commits` field on the `gh pr list --json` payload + a small
+  `countHealCommits()` helper that counts `heal:`-prefixed message
+  headlines (case-insensitive, first-line only). `projectPRs()` grows
+  two additive fields. SPA renders the chip + first-failed link with
+  defence-in-depth `redactSecrets()` at the boundary.
