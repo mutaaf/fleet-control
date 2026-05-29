@@ -1,7 +1,7 @@
 ---
 id: 0023
 title: PR card shows heal-attempts and first-fail reason inline
-status: in-progress
+status: shipped
 priority: P2
 area: portal
 created: 2026-05-27
@@ -157,3 +157,9 @@ Each box maps 1:1 to a test scenario.
   headlines (case-insensitive, first-line only). `projectPRs()` grows
   two additive fields. SPA renders the chip + first-failed link with
   defence-in-depth `redactSecrets()` at the boundary.
+- 2026-05-29 (implementation-dev): Shipped via PR #65. Both gating
+  checks (`typecheck` + `validate`) green; auto-merge squashed onto
+  main. The `pickFirstFailingCheckName()` rewrite (startedAt-ascending
+  sort, was: array order) replaced the inline `firstFailingCheck()`
+  helper ticket 0027 owned — both call sites are now the one exported
+  helper.
