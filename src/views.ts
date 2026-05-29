@@ -126,6 +126,16 @@ export function fleetView(db: DB, cfg: FleetConfig) {
     // the home payload by accident.
     const full = projectHealth(db, p.id);
     const healthSlim = { score: full.score, band: full.band };
+    // Ticket 0028: per-project burndown summary, inlined on the home
+    // payload so the card's coloured today-dot renders without a second
+    // fetch. The full `days[]` series is fetched lazily via
+    // /api/projects/:slug/burndown on card tap.
+    const bd = projectBurndown(db, p.id);
+    const burndownSummary: BurndownSummary = {
+      projected_eom_usd: bd.projected_eom_usd,
+      cap_eom_usd: bd.cap_eom_usd,
+      band: bd.band,
+    };
     out.push({
       slug: p.slug, name: p.name, displayState: displayState(jobs, scDays, usage),
       selfCancelDays: scDays, engEnabled: !!p.eng_enabled,
@@ -140,6 +150,7 @@ export function fleetView(db: DB, cfg: FleetConfig) {
       cadence, pace: paceLabel(cadence),
       paused: pausedReason,
       health: healthSlim,
+      burndown: burndownSummary,
     });
   }
   // Total-fleet forecast = sum of per-project projections (null projections
@@ -986,14 +997,16 @@ export function projectHealth(db: DB, projectId: number, now: Date = new Date())
   return value;
 }
 
-/** Slim per-project listing for the home grid: slug, name, and the
- *  {score, band} health summary only. The full `subs` + formula are
- *  available via /api/projects/:slug/health so the home payload stays
- *  small (every byte counts on a phone). */
+/** Slim per-project listing for the home grid: slug, name, the
+ *  {score, band} health summary, and the {projected_eom_usd,
+ *  cap_eom_usd, band} burndown summary (ticket 0028). The full
+ *  burndown `days[]` series + per-day cap details are available via
+ *  /api/projects/:slug/burndown so the home payload stays small. */
 export interface ListedProject {
   slug: string;
   name: string;
   health: { score: number; band: ProjectHealth["band"] };
+  burndown: BurndownSummary;
 }
 
 interface ProjectListRow { id: number; slug: string; name: string | null; }
@@ -1004,8 +1017,177 @@ export function listProjects(db: DB): ListedProject[] {
   ).all() as unknown as ProjectListRow[];
   return rows.map((r) => {
     const h = projectHealth(db, r.id);
-    return { slug: r.slug, name: r.name ?? r.slug, health: { score: h.score, band: h.band } };
+    const b = projectBurndown(db, r.id);
+    return {
+      slug: r.slug,
+      name: r.name ?? r.slug,
+      health: { score: h.score, band: h.band },
+      burndown: {
+        projected_eom_usd: b.projected_eom_usd,
+        cap_eom_usd: b.cap_eom_usd,
+        band: b.band,
+      },
+    };
   });
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Month-to-date budget burndown per project card (ticket 0028).
+//
+// Pure SQL window aggregation against `cost_rollup_day` filtered to the
+// current local UTC month. The helper is read-only (no inserts, no
+// shell-out) and matches the autopause's cap path: `cadence_json.
+// max_daily_usd`. Empty cost data → days: [], cap-less project →
+// cap_per_day_usd: null + band: "green".
+//
+// Per docs/LESSONS.md:
+//   - `as unknown as RowT[]` for typed `.all()` (node:sqlite cast lesson).
+//   - Tests seed via `run` rows + recomputeRollups() (cost_rollup_day
+//     re-derives on every ingest pass; direct seeds get wiped).
+//
+// Band rules (matches the AC spec):
+//   red    = cumulative_today_usd > cap_per_day_usd × day_of_month
+//   amber  = not red AND projected_eom_usd > cap_eom_usd × 0.8
+//   green  = otherwise (or cap unset)
+// ────────────────────────────────────────────────────────────────────
+
+export interface BurndownDay {
+  day_of_month: number;
+  cumulative_usd: number;
+}
+
+export type BurndownBand = "green" | "amber" | "red";
+
+export interface ProjectBurndown {
+  days: BurndownDay[];
+  cap_per_day_usd: number | null;
+  cap_eom_usd: number | null;
+  projected_eom_usd: number;
+  band: BurndownBand;
+}
+
+/** Slim summary the home payload inlines on each project row. The full
+ *  `days[]` series is fetched lazily via /api/projects/:slug/burndown. */
+export interface BurndownSummary {
+  projected_eom_usd: number;
+  cap_eom_usd: number | null;
+  band: BurndownBand;
+}
+
+interface BurndownRollupRow {
+  day: string;
+  cost_usd: number | null;
+}
+
+interface ProjectCadenceRow {
+  cadence_json: string | null;
+}
+
+/** Parse `max_daily_usd` from a project's cadence_json — SAME logic as
+ *  src/budget_guard.ts:parseCap so the autopause cap and the burndown
+ *  cap can never disagree. Kept inline here to avoid widening the
+ *  budget_guard.ts surface (its exports are scoped to the guard
+ *  pipeline). */
+function parseDailyCap(cadenceJson: string | null): number | null {
+  if (!cadenceJson) return null;
+  try {
+    const obj = JSON.parse(cadenceJson) as Record<string, unknown>;
+    const raw = obj.max_daily_usd;
+    if (raw == null || raw === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n;
+  } catch {
+    return null;
+  }
+}
+
+/** Days in `now`'s UTC month (28..31). */
+function daysInUtcMonth(now: Date): number {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0))
+    .getUTCDate();
+}
+
+/** First day of `now`'s UTC month, yyyy-mm-dd. The cost_rollup_day
+ *  table stores `day` as `date(started_at)` (SQLite UTC date), so we
+ *  match that frame here for the JOIN. */
+function monthStartIso(now: Date): string {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+    .toISOString().slice(0, 10);
+}
+
+/** Compute the month-to-date burndown for one project. `now` is the
+ *  wall-clock anchor (tests pin it; production passes `new Date()`). */
+export function projectBurndown(
+  db: DB, projectId: number, now: Date = new Date(),
+): ProjectBurndown {
+  const monthStart = monthStartIso(now);
+  const today = now.toISOString().slice(0, 10);
+  const dayOfMonth = now.getUTCDate();
+  const eomDays = daysInUtcMonth(now);
+
+  // Per-day totals across all phases for the current month, day 1..today
+  // inclusive. SUM aggregates the {ship,groom,review,eng} rows down to a
+  // single per-day spend. The windowed running sum (SUM(...) OVER) is
+  // computed inside SQLite — supported since 3.25 (node:sqlite ships
+  // 3.45+), and it's the single source of truth the AC asks for.
+  const dayRows = db.prepare(
+    "SELECT day, "
+    + "  SUM(SUM(COALESCE(cost_usd, 0))) OVER (ORDER BY day) AS cost_usd "
+    + "FROM cost_rollup_day "
+    + "WHERE project_id = ? AND day >= ? AND day <= ? "
+    + "GROUP BY day ORDER BY day ASC",
+  ).all(projectId, monthStart, today) as unknown as BurndownRollupRow[];
+
+  // Map yyyy-mm-dd → day-of-month + running cumulative. We could derive
+  // day-of-month with SQL but keeping it JS-side avoids strftime
+  // gymnastics and stays readable.
+  const days: BurndownDay[] = dayRows.map((r) => {
+    const dom = Number(r.day.slice(8, 10));
+    return { day_of_month: dom, cumulative_usd: Number(r.cost_usd ?? 0) };
+  });
+
+  // Cap reads from the SAME path the autopause guard uses (ticket 0021).
+  const cadenceRow = db.prepare(
+    "SELECT cadence_json FROM project WHERE id = ?",
+  ).get(projectId) as unknown as ProjectCadenceRow | undefined;
+  const capPerDay = parseDailyCap(cadenceRow?.cadence_json ?? null);
+  const capEom = capPerDay != null ? capPerDay * eomDays : null;
+
+  // Projection: cumulative_today + trailing_7d_avg × days_remaining.
+  // When fewer than 7 days are available, average over what we have.
+  const cumulativeToday = days.length > 0 ? days[days.length - 1].cumulative_usd : 0;
+  const trailing = days.slice(-7);
+  // The cumulative series is a running sum — recover per-day deltas to
+  // average them correctly.
+  let trailingTotal = 0;
+  for (let i = 0; i < trailing.length; i++) {
+    const prev = i === 0
+      ? (days.length > trailing.length ? days[days.length - trailing.length - 1].cumulative_usd : 0)
+      : trailing[i - 1].cumulative_usd;
+    trailingTotal += trailing[i].cumulative_usd - prev;
+  }
+  const trailingAvg = trailing.length > 0 ? trailingTotal / trailing.length : 0;
+  const daysRemaining = Math.max(0, eomDays - dayOfMonth);
+  const projectedEom = cumulativeToday + trailingAvg * daysRemaining;
+
+  // Band:
+  //   red   = cumulative_today > cap_per_day × day_of_month (already over the line)
+  //   amber = not red AND projected_eom > cap_eom × 0.8
+  //   green = otherwise (also the only band when cap is unset)
+  let band: BurndownBand = "green";
+  if (capPerDay != null && capEom != null) {
+    if (cumulativeToday > capPerDay * dayOfMonth) band = "red";
+    else if (projectedEom > capEom * 0.8) band = "amber";
+  }
+
+  return {
+    days,
+    cap_per_day_usd: capPerDay,
+    cap_eom_usd: capEom,
+    projected_eom_usd: projectedEom,
+    band,
+  };
 }
 
 /** Lookup a project_id by slug; null when the slug is unknown. Exposed

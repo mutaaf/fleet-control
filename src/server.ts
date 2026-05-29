@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
@@ -352,6 +352,19 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         // exist (the view surfaces "not enough yet" instead of a number).
         const fm = path.match(/^\/api\/projects\/([\w-]+)\/forecast$/);
         if (fm) { const v = forecastFor(db, fm[1]); return v ? json(res, v) : json(res, { error: "not found" }, 404); }
+        // Ticket 0028: month-to-date budget burndown for the project
+        // card's inline sparkline. Reads `read` scope (loopback
+        // bypasses); same posture as every other GET
+        // /api/projects/:slug/* route. Net-new — no existing JSON
+        // shape to preserve. Returns the full {days, cap_per_day_usd,
+        // cap_eom_usd, projected_eom_usd, band} payload; the SPA
+        // fetches it lazily on card tap.
+        const bdm = path.match(/^\/api\/projects\/([\w-]+)\/burndown$/);
+        if (bdm) {
+          const pid = projectIdBySlug(db, bdm[1]);
+          if (pid == null) return json(res, { error: "not found" }, 404);
+          return json(res, projectBurndown(db, pid));
+        }
         // Disk usage + stale-checkout candidates (ticket 0006). 200 with an
         // all-zeros payload for an unknown slug — the SPA's expandable
         // section just shows "0 GB · no candidates" rather than a 404.

@@ -148,14 +148,15 @@ test("AC7: fleetView project payload is otherwise byte-equivalent to pre-ticket 
         "cadence", "pace",
       ]);
       const seen = Object.keys(p);
-      // Ticket 0022 also adds a `health` summary {score, band} per
-      // project — additive, same posture as `paused`. The 0021 test
-      // pins the pre-ticket keys; we extend the allow-list to cover
-      // the 0022 addition so both stay byte-additive.
+      // Ticket 0022 added `health` {score, band}; ticket 0028 added
+      // `burndown` {projected_eom_usd, cap_eom_usd, band}. Both are
+      // additive, same posture as 0021's `paused`. The 0021 test pins
+      // the pre-ticket keys; the allow-list grows by one entry per
+      // additive ticket so future widenings stay explicit.
       for (const k of seen) {
         assert.ok(
-          PRE_TICKET_KEYS.has(k) || k === "paused" || k === "health",
-          `unexpected new field on project item: ${k} — only 'paused' and 'health' may be added`,
+          PRE_TICKET_KEYS.has(k) || k === "paused" || k === "health" || k === "burndown",
+          `unexpected new field on project item: ${k} — only 'paused', 'health', and 'burndown' may be added`,
         );
       }
       for (const k of PRE_TICKET_KEYS) {

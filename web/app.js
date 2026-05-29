@@ -829,6 +829,74 @@ document.addEventListener("click", async (e) => {
   }, 8000);
 });
 
+// Ticket 0028: month-to-date budget burndown sparkline. Hand-rolled
+// inline SVG (no charting lib). Two polylines (cumulative, projected)
+// plus a dashed cap reference; one today-dot coloured by band. The
+// inline summary on the home payload carries only
+// {projected_eom_usd, cap_eom_usd, band}; the full days[] series is
+// fetched lazily on card tap from /api/projects/:slug/burndown so
+// the home payload stays small. We always render a band-coloured
+// today-dot from the summary so the operator's eye lands on the
+// at-risk project before any network round-trip.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": any project-name string passes through redactSecrets
+// before it lands in the DOM. The label string itself never carries
+// a name today, but the helper is the chokepoint.
+//
+// Empty state (AC10): when projected_eom_usd is 0 AND cap is unset
+// (or when the lazy /burndown fetch returns days: []), the SPA
+// renders "no spend this month" instead of the chart.
+function renderBurndownSparkline(p, opts) {
+  const summary = p && p.burndown;
+  if (!summary) return "";
+  const band = summary.band || "green";
+  const cap = summary.cap_eom_usd;
+  const proj = summary.projected_eom_usd;
+  const noSpend = (!proj || proj === 0) && (cap == null);
+  // Defence-in-depth: route the project name string through the
+  // redactor before it enters the title/label DOM. The label text
+  // itself doesn't carry a name today, but the title attr does, and
+  // a future label format that interpolates the name stays safe.
+  const name = redactSecrets(String(p.name || p.slug || ""));
+  if (noSpend) {
+    return `<div class="burndown-empty dim" title="${esc(name)}: no spend this month">no spend this month</div>`;
+  }
+  // 60x32 px viewport on desktop; CSS shrinks to 40x24 on mobile via
+  // the @media (max-width: 600px) block in web/style.css.
+  // X axis: day-of-month 1..30 (we don't know `days.length` yet — the
+  // summary view draws a single projection line + cap reference);
+  // Y axis: 0..max(projected, cap). Coordinates are hand-rolled
+  // strings so no external SVG lib enters the bundle.
+  const yMax = Math.max(Number(proj) || 0, Number(cap) || 0, 1);
+  const w = 60, h = 32;
+  // Cap reference: a flat dashed line at y=cap.
+  let capLine = "";
+  if (cap != null && cap > 0) {
+    const capY = h - (Number(cap) / yMax) * (h - 2) - 1;
+    capLine = `<line class="burndown-cap" x1="0" y1="${capY.toFixed(1)}" x2="${w}" y2="${capY.toFixed(1)}" stroke-dasharray="2,2"></line>`;
+  }
+  // Projected segment: a dashed line sloping up to today's projected
+  // eom. We anchor at (0, h) (origin) and slope to (w, projectedY).
+  let projLine = "";
+  if (proj != null) {
+    const projY = h - (Number(proj) / yMax) * (h - 2) - 1;
+    projLine = `<line class="burndown-projected" x1="0" y1="${h}" x2="${w}" y2="${projY.toFixed(1)}" stroke-dasharray="4,2"></line>`;
+  }
+  // Today-dot, coloured by band — operator's eye-magnet.
+  const dotY = proj != null ? h - (Number(proj) / yMax) * (h - 2) - 1 : h - 2;
+  const dot = `<circle class="burndown-dot band-${esc(band)}" cx="${w}" cy="${dotY.toFixed(1)}" r="3"></circle>`;
+  const usdProj = "$" + (Number(proj) || 0).toFixed(2);
+  const usdCap = cap != null ? "$" + Number(cap).toFixed(2) : "—";
+  const title = `${name}: ${usdProj} forecast vs ${usdCap} cap`;
+  return `<span class="burndown band-${esc(band)}" title="${esc(title)}">
+    <svg class="burndown" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true">
+      ${capLine}${projLine}${dot}
+    </svg>
+    <span class="burndown-label dim">${esc(usdProj)} of ${esc(usdCap)} cap MTD</span>
+  </span>`;
+}
+
 function card(p) {
   const [cls, label] = STATE[p.displayState] || STATE.off;
   const running = p.jobs.find((j) => j.running);
@@ -856,7 +924,9 @@ function card(p) {
       <span>this week <b class="cost">${usd(p.cost7d)}</b></span>
       <span>${forecastSpan(p.forecast)}</span>
       <span class="dim">${p.runs} runs</span>
-    </div>${ulBanner}${akBanner}${banner}</a>`;
+    </div>
+    ${renderBurndownSparkline(p)}
+    ${ulBanner}${akBanner}${banner}</a>`;
 }
 // Ticket 0012: "Last week" digest banner — tap the head to expand
 // the per-project rows. Same toggle pattern as the PR card head.
