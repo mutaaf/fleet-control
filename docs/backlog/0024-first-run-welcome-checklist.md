@@ -1,7 +1,7 @@
 ---
 id: 0024
 title: First-run welcome — printed checklist after fleetctl serve cold start
-status: in-progress
+status: shipped
 priority: P2
 area: infra
 created: 2026-05-27
@@ -170,3 +170,7 @@ Each box maps 1:1 to a test scenario.
   wire it into `bin/fleetctl.ts serve` after `server.listen`, and exercise
   every AC via `tests/welcome.test.ts` (snapshot + sentinel round-trip +
   CLI subprocess test per the FLEET_DB_PATH / FLEET_HOME env seam).
+- 2026-05-29 — shipped via PR #67. typecheck + validate green; full
+  welcome test suite green (21/21). Pre-existing time-pinned failures in
+  prs-merged/digest/leaderboard/correlate persist on main (see
+  LESSONS.md § 2026-05-29) and are unrelated to this change.
