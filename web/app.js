@@ -1129,6 +1129,8 @@ async function project(slug, params) {
     </div>
     ${renderEmbedPanel(p.slug)}
     ${prSection(p)}
+    <div class="eyebrow">Where the tokens went (last 7d)</div>
+    <div id="tool-mix-section" class="jobcard"><div class="kv dim">checking…</div></div>
     <div class="eyebrow">The jobs</div>
     ${p.jobs.map((j) => jobCard(j, p.slug)).join("")}
     <div class="eyebrow">Anomalies</div>
@@ -1151,7 +1153,137 @@ async function project(slug, params) {
   loadDiskSection(slug);
   // Ticket 0008: per-project anomalies. Same lazy pattern as disk.
   loadAnomaliesSection(slug, wantAnomalies);
+  // Ticket 0031: per-project tool-mix sparkline (where this project's
+  // tokens actually went). Lazy fetch — keeps /api/project/:slug
+  // additive-only and the home payload small.
+  loadToolMixSection(slug);
 }
+
+// ---- Tool-mix sparkline (ticket 0031) ------------------------------------
+// Renders a 280x36 stacked horizontal bar (200x28 on phones via CSS)
+// showing which tools consumed THIS project's tokens over the trailing
+// 7 days, plus a wrapping legend underneath. Hover (desktop) / tap
+// (mobile) on a segment surfaces "<name> — N calls — Xs" in an inline
+// tooltip inside the container.
+//
+// Empty state (no tool_use events in window): renders "no tool activity
+// this week" with no SVG, no broken layout.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible label (tool name, count, seconds)
+// passes through redactSecrets before insertion. Tool names are bounded
+// by the Claude SDK but the defensive pass is the silent backstop.
+function renderToolMixBar(data) {
+  const tools = (data && data.tools) || [];
+  const total = (data && data.total_invocations) || 0;
+  // Empty branch FIRST — no SVG, no NaN, no broken layout.
+  if (total === 0 || tools.length === 0) {
+    return `<div class="project-tool-mix" data-testid="project-tool-mix">
+      <div class="tool-mix-empty dim">no tool activity this week</div>
+    </div>`;
+  }
+  // Desktop: 280x36 px (CSS shrinks to 200x28 below 600px). Width is
+  // share-proportional; no minimum-width fudge — a 1%-share tool gets
+  // a sliver, which is the honest reading.
+  const W = 280, H = 36;
+  // Build segments. CSS variables `--tool-bash`, `--tool-edit`, etc.
+  // pick the colour per named tool; unknown tools fall back to
+  // `--tool-other` (neutral grey).
+  const NAMED = new Set(["Bash", "Edit", "Read", "Glob", "Grep", "Write", "WebFetch"]);
+  let x = 0;
+  const rects = tools.map((t, i) => {
+    const w = t.share * W;
+    const tk = NAMED.has(t.name) ? t.name.toLowerCase() : "other";
+    const safe = redactSecrets(String(t.name || ""));
+    const rect = `<rect class="tool-mix-segment seg-${esc(tk)}" data-tool="${esc(safe)}" data-idx="${i}" x="${x.toFixed(2)}" y="0" width="${w.toFixed(2)}" height="${H}"></rect>`;
+    x += w;
+    return rect;
+  }).join("");
+  // Legend chips wrap below the bar; share is whole-percent rounded.
+  const chips = tools.map((t) => {
+    const tk = NAMED.has(t.name) ? t.name.toLowerCase() : "other";
+    const safe = esc(redactSecrets(String(t.name || "")));
+    const pct = Math.round(t.share * 100);
+    return `<span class="tool-mix-chip"><span class="tool-mix-swatch swatch-${esc(tk)}"></span>${safe} ${pct}%</span>`;
+  }).join("");
+  // Tooltip is a sibling <div> positioned absolutely INSIDE the
+  // container so it never escapes the card (no portal/overlay).
+  // Default tooltip text: the head tool.
+  const head = tools[0];
+  const headName = esc(redactSecrets(String(head.name || "")));
+  const headTip = `${headName} — ${head.invocations} calls — ${(Number(head.total_seconds) || 0).toFixed(1)}s`;
+  return `<div class="project-tool-mix" data-testid="project-tool-mix">
+    <svg class="tool-mix-bar" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" preserveAspectRatio="none" role="img" aria-label="tool mix">
+      ${rects}
+    </svg>
+    <div class="tool-mix-legend">${chips}</div>
+    <div class="tool-mix-tooltip" data-default="${esc(headTip)}">${esc(headTip)}</div>
+  </div>`;
+}
+
+async function loadToolMixSection(slug) {
+  const el = document.getElementById("tool-mix-section");
+  if (!el) return;
+  let d;
+  try { d = await get("/api/projects/" + encodeURIComponent(slug) + "/tool-mix"); }
+  catch { el.innerHTML = `<div class="kv dim">couldn't read tool mix</div>`; return; }
+  el.innerHTML = renderToolMixBar(d);
+  // Stash the response on the container so the hover/tap delegate can
+  // surface per-segment invocations + seconds without re-parsing the
+  // chip text. Lives on the DOM node so it follows the markup's
+  // lifecycle — gone when the next project route discards the section.
+  const container = el.querySelector(".project-tool-mix");
+  if (container) container._toolMixData = d;
+}
+
+// Hover/tap delegate for the tool-mix sparkline (ticket 0031). One
+// listener at the document root finds the segment, updates the
+// sibling tooltip's textContent to "<name> — N calls — Xs", and
+// restores the head tool on mouseleave. Tap-to-show on mobile uses
+// the same path — `touchstart` synthesizes a `mouseenter`-equivalent
+// click on iOS Safari, so the delegate fires on tap too.
+document.addEventListener("mouseover", (e) => {
+  const seg = e.target.closest && e.target.closest(".tool-mix-segment");
+  if (!seg) return;
+  const container = seg.closest(".project-tool-mix");
+  if (!container) return;
+  const tip = container.querySelector(".tool-mix-tooltip");
+  if (!tip) return;
+  const name = seg.getAttribute("data-tool") || "";
+  // Read the live data off the legend chip in the same DOM position.
+  const idx = Number(seg.getAttribute("data-idx") || 0);
+  const chip = container.querySelectorAll(".tool-mix-chip")[idx];
+  // Pull invocations + seconds from the segment's geometry-independent
+  // data attrs (we re-render the section on every project poll so the
+  // text content matches the current fetch).
+  // The chip carries the rounded percent only; for the calls/seconds
+  // figures we look them up from a stashed data blob.
+  const blob = container._toolMixData;
+  let calls = 0, secs = 0;
+  if (blob && Array.isArray(blob.tools) && blob.tools[idx]) {
+    calls = blob.tools[idx].invocations;
+    secs = Number(blob.tools[idx].total_seconds) || 0;
+  } else if (chip) {
+    // Fallback — chip carries the visible "<name> X%" string; we can't
+    // recover N calls / seconds from it. Show the head-tool default.
+    tip.textContent = tip.getAttribute("data-default") || "";
+    return;
+  }
+  tip.textContent = `${name} — ${calls} calls — ${secs.toFixed(1)}s`;
+});
+document.addEventListener("mouseout", (e) => {
+  const seg = e.target.closest && e.target.closest(".tool-mix-segment");
+  if (!seg) return;
+  const container = seg.closest(".project-tool-mix");
+  if (!container) return;
+  const tip = container.querySelector(".tool-mix-tooltip");
+  if (!tip) return;
+  tip.textContent = tip.getAttribute("data-default") || "";
+});
+// Mobile tap: same handler shape, but stash the data blob first so the
+// delegate above can read it. We patch loadToolMixSection to stash on
+// the container after render.
+
 // Ticket 0008: anomaly list for the project page. Renders the trailing-50
 // rows newest-first; each row links into the run detail page where the
 // badge gives the full context. When `scrollIntoView` is true (deep-link
