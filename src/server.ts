@@ -74,7 +74,19 @@ function readBody(req: any): Promise<any> {
 }
 
 const WEB = join(fileURLToPath(import.meta.url), "..", "..", "web");
-const MIME: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" };
+// Ticket 0029: PWA shell — add MIME types for the manifest (a JSON variant
+// that browsers recognise via `application/manifest+json`) and PNG icons.
+// The `application/javascript` mapping covers the service worker — Chrome
+// accepts `text/javascript` too, but Safari's stricter SW loader prefers
+// `application/javascript`, so we use the explicit form.
+const MIME: Record<string, string> = {
+  ".html": "text/html",
+  ".js": "application/javascript",
+  ".css": "text/css",
+  ".svg": "image/svg+xml",
+  ".webmanifest": "application/manifest+json",
+  ".png": "image/png",
+};
 
 // Refresh history at most every 10s on read (cheap; live state is always fresh).
 let lastIngest = 0;
@@ -465,7 +477,17 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       let file = path === "/" ? "index.html" : path.replace(/^\//, "");
       const full = join(WEB, file);
       if (!full.startsWith(WEB) || !existsSync(full)) { res.writeHead(404); return res.end("not found"); }
-      res.writeHead(200, { "content-type": MIME[extname(full)] ?? "application/octet-stream" });
+      // Ticket 0029: the service worker MUST be served with
+      // `Service-Worker-Allowed: /` so its scope can extend to the site
+      // root from /sw.js. Browsers reject a wider scope without this
+      // header (defence against a SW registered from a subdir
+      // intercepting the parent). The other static assets keep the
+      // existing minimal header set.
+      const headers: Record<string, string> = {
+        "content-type": MIME[extname(full)] ?? "application/octet-stream",
+      };
+      if (path === "/sw.js") headers["service-worker-allowed"] = "/";
+      res.writeHead(200, headers);
       res.end(readFileSync(full));
     } catch (e: any) {
       json(res, { error: String(e?.message ?? e) }, 500);

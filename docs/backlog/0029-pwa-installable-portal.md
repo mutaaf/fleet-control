@@ -1,7 +1,7 @@
 ---
 id: 0029
 title: PWA installable portal with offline shell and stale-snapshot banner
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-05-30
@@ -210,4 +210,13 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-30 — implementation-dev: flipped status groomed → in-progress and
+  opened `feat/0029-pwa-installable-portal`. Plan:
+  add `web/manifest.webmanifest`, `web/icon-192.png`, `web/icon-512.png`,
+  `web/sw.js`; patch `web/index.html` with the manifest link; patch
+  `web/app.js` to register the SW + render the stale banner via
+  `redactSecrets`; extend the static-asset router in `src/server.ts` with
+  the four new paths and the `Service-Worker-Allowed: /` header on
+  `/sw.js`; add `tests/pwa.test.ts` with one `test()` per AC checkbox
+  (server-route tests follow LESSONS § empty-roots config seed, SW handler
+  tests stay text-level).
