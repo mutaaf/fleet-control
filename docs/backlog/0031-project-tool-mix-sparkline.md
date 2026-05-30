@@ -1,7 +1,7 @@
 ---
 id: 0031
 title: Per-project tool-mix sparkline - where this project's tokens actually went
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-05-30
@@ -241,4 +241,8 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-30 — implementation-dev: picked up groomed ticket; flipped to
+  `in-progress` on `feat/0031-project-tool-mix-sparkline` off
+  `origin/main`. Same commit fixes 0030 README/frontmatter drift
+  (PR #73 shipped quiet hours but the index + frontmatter still said
+  `in-progress`).
