@@ -60,7 +60,79 @@ function until(iso) {
   if (d < 86400) return "in " + Math.round(d / 3600) + "h";
   return "in " + Math.round(d / 86400) + "d";
 }
-async function get(p) { const r = await fetch(p); if (!r.ok) throw new Error(p); return r.json(); }
+// Ticket 0029: any /api/* fetch that the service worker can't reach is
+// answered by a synthetic 503 with body `{stale:true, reason:"offline"}`.
+// We intercept that here so EVERY caller of get() either receives JSON or
+// throws — and the throw triggers the amber stale banner via the catch
+// path on the home route. The detection is body-shape based, not status-
+// code based: if a server change ever returns 503 for a different reason
+// the banner will only fire if `stale === true` in the body.
+async function get(p) {
+  const r = await fetch(p);
+  if (!r.ok) {
+    let stale = false; let reason = "";
+    if (r.status === 503) {
+      try {
+        const body = await r.clone().json();
+        if (body && body.stale === true) { stale = true; reason = String(body.reason || "offline"); }
+      } catch { /* not a stale envelope; fall through */ }
+    }
+    if (stale) { renderStaleBanner({ reason, lastUrl: p }); throw new Error("stale:" + reason); }
+    throw new Error(p);
+  }
+  clearStaleBanner();
+  return r.json();
+}
+
+// Ticket 0029: amber stale banner above the inbox/home view. Rendered on
+// the home view whenever an /api/* fetch is intercepted by the SW with the
+// synthetic 503 envelope (laptop asleep / wifi flap). Tapping the banner
+// re-runs the home route — a successful refetch clears it via the get()
+// success path; another failure re-renders the banner with whatever reason
+// the SW returned. `data-testid="stale-banner"` is the stable test hook
+// per the cross-fleet "duplicate-name surfaces" pattern.
+function renderStaleBanner({ reason, lastUrl } = {}) {
+  // Defence-in-depth per LESSONS § "secret redaction at the renderer
+  // boundary": every operator-visible string passes through redactSecrets
+  // before it reaches the DOM. A cached payload could contain a leaked
+  // ghp_… in a project name or repo URL; the banner is a renderer surface
+  // so we strip token-shaped substrings here as a backstop even though
+  // the reason text we emit is normally a fixed string.
+  const safeReason = esc(redactSecrets(String(reason || "offline")));
+  let banner = document.querySelector('[data-testid="stale-banner"]');
+  const inner = "Fleet snapshot may be stale — laptop unreachable (" + safeReason + "). Tap to retry.";
+  if (banner) { banner.innerHTML = inner; return; }
+  banner = document.createElement("div");
+  banner.className = "banner stale-banner";
+  banner.setAttribute("data-testid", "stale-banner");
+  banner.setAttribute("role", "button");
+  banner.tabIndex = 0;
+  banner.style.cursor = "pointer";
+  banner.style.margin = "0 0 12px";
+  banner.innerHTML = inner;
+  banner.addEventListener("click", () => { route().catch(() => {}); });
+  if (app && app.parentNode) app.parentNode.insertBefore(banner, app);
+}
+function clearStaleBanner() {
+  const banner = document.querySelector('[data-testid="stale-banner"]');
+  if (banner) banner.remove();
+}
+
+// Ticket 0029: register the service worker on load. Failure is swallowed
+// silently — Safari private mode disables the SW API, an http:// loopback
+// hit a future iOS version doesn't whitelist, etc. The portal MUST keep
+// working without the SW; registration is a progressive enhancement.
+function registerServiceWorker() {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+  try {
+    const p = navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    if (p && typeof p.catch === "function") p.catch(() => { /* swallow */ });
+  } catch { /* swallow — Safari private, file://, etc. */ }
+}
+if (typeof window !== "undefined") {
+  if (document.readyState === "complete") registerServiceWorker();
+  else window.addEventListener("load", registerServiceWorker);
+}
 
 // ---- control actions ------------------------------------------------------
 function toast(msg, ok = true) {
