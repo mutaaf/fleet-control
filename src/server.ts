@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
@@ -376,6 +376,23 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           const pid = projectIdBySlug(db, bdm[1]);
           if (pid == null) return json(res, { error: "not found" }, 404);
           return json(res, projectBurndown(db, pid));
+        }
+        // Ticket 0031: per-project tool-mix sparkline. Returns
+        // {window, tools, total_invocations} — the stacked-bar
+        // ingredients the SPA's project page renders above the job
+        // cards. `days` clamps to [1,30] (default 7) — the tool-mix
+        // is a recent-window question; longer windows don't help the
+        // operator drilling into "where did this week's budget go?".
+        // Net-new route — no existing JSON shape to preserve; the
+        // /api/project/:slug detail payload stays additive-only and
+        // does NOT inline this aggregate (the SPA fetches lazily on
+        // render).
+        const tmm = path.match(/^\/api\/projects\/([\w-]+)\/tool-mix$/);
+        if (tmm) {
+          const pid = projectIdBySlug(db, tmm[1]);
+          if (pid == null) return json(res, { error: "not found" }, 404);
+          const days = clampToolMixDays(url.searchParams.get("days"));
+          return json(res, projectToolMix(db, pid, new Date(), days));
         }
         // Disk usage + stale-checkout candidates (ticket 0006). 200 with an
         // all-zeros payload for an unknown slug — the SPA's expandable

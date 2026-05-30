@@ -16,6 +16,19 @@
      re-tune card density / tap-target floor without renaming anything. */
   --card-pad-mobile: 12px 14px;
   --tap-min: 44px;
+  /* Ticket 0031: per-project tool-mix sparkline palette. Additive — no
+     rename / repurpose of an existing variable. Hues line up loosely
+     with the leaderboard heatmap so the operator's mental model
+     ("Bash = amber, Edit = green, Read = blue") survives between
+     surfaces. `--tool-other` is a neutral grey for the collapsed tail. */
+  --tool-bash:     #D98A2B;
+  --tool-edit:     #5B8C5A;
+  --tool-read:     #5C8EC7;
+  --tool-glob:     #8A6BB0;
+  --tool-grep:     #4FA09B;
+  --tool-write:    #C8841E;
+  --tool-webfetch: #C25E9C;
+  --tool-other:    #5c5d56;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans);
@@ -511,3 +524,48 @@ svg.burndown { width: 60px; height: 32px; flex: 0 0 60px; display: block; }
   border-bottom: 1px dotted var(--accent); }
 .pr-first-fail:hover { color: var(--accent); filter: brightness(1.15); }
 .pr-first-fail.dim { color: var(--dim); border-bottom-color: var(--dim); }
+
+/* Ticket 0031: per-project tool-mix sparkline. A 280x36 inline SVG with
+   one <rect> per segment + a wrapping legend underneath. Sits inside a
+   .jobcard above the existing job cards on the project page. Mobile
+   media query below shrinks to 200x28 ≤ 600px and the legend wraps to
+   two lines without horizontal scroll at 375px. Additive — no existing
+   selector is renamed or repurposed. */
+.project-tool-mix { position: relative; display: block;
+  font-family: var(--mono); font-size: 11.5px; }
+svg.tool-mix-bar { display: block; width: 280px; height: 36px;
+  border-radius: var(--r); overflow: hidden;
+  background: var(--panel2); }
+.tool-mix-segment { stroke: var(--bg); stroke-width: 1; cursor: pointer; }
+.tool-mix-segment:hover { filter: brightness(1.15); }
+.tool-mix-segment.seg-bash     { fill: var(--tool-bash); }
+.tool-mix-segment.seg-edit     { fill: var(--tool-edit); }
+.tool-mix-segment.seg-read     { fill: var(--tool-read); }
+.tool-mix-segment.seg-glob     { fill: var(--tool-glob); }
+.tool-mix-segment.seg-grep     { fill: var(--tool-grep); }
+.tool-mix-segment.seg-write    { fill: var(--tool-write); }
+.tool-mix-segment.seg-webfetch { fill: var(--tool-webfetch); }
+.tool-mix-segment.seg-other    { fill: var(--tool-other); }
+.tool-mix-legend { display: flex; flex-wrap: wrap; gap: 6px 14px;
+  margin-top: 8px; color: var(--dim); }
+.tool-mix-chip { display: inline-flex; align-items: center; gap: 5px;
+  white-space: nowrap; }
+.tool-mix-swatch { display: inline-block; width: 9px; height: 9px;
+  border-radius: 2px; background: var(--tool-other); }
+.tool-mix-swatch.swatch-bash     { background: var(--tool-bash); }
+.tool-mix-swatch.swatch-edit     { background: var(--tool-edit); }
+.tool-mix-swatch.swatch-read     { background: var(--tool-read); }
+.tool-mix-swatch.swatch-glob     { background: var(--tool-glob); }
+.tool-mix-swatch.swatch-grep     { background: var(--tool-grep); }
+.tool-mix-swatch.swatch-write    { background: var(--tool-write); }
+.tool-mix-swatch.swatch-webfetch { background: var(--tool-webfetch); }
+.tool-mix-swatch.swatch-other    { background: var(--tool-other); }
+.tool-mix-tooltip { margin-top: 8px; color: var(--ink); font-size: 11.5px;
+  min-height: 1.2em; }
+.tool-mix-empty { font-style: normal; }
+
+@media (max-width: 600px) {
+  svg.tool-mix-bar { width: 200px; height: 28px; }
+  .project-tool-mix { font-size: 11px; }
+  .tool-mix-legend { gap: 4px 10px; }
+}

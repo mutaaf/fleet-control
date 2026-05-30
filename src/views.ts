@@ -1198,6 +1198,179 @@ export function projectIdBySlug(db: DB, slug: string): number | null {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Per-project tool-mix sparkline (ticket 0031).
+//
+// Per-project drill-down for "where did this project's budget actually
+// go?" — single trailing-window aggregate, one stacked bar's worth of
+// numbers. The leaderboard helper (0014) answers the cross-project
+// version; this one is the per-project compose.
+//
+// Read-only: groups `run_event` by `tool_name` for the project + window,
+// computes the paired-duration total via the same `strftime`-based SQL
+// from fleetLeaderboard (LESSONS § "julianday() drifts ~10us per
+// timestamp" — decompose with strftime for sub-ms diffs). The top-6 +
+// "other" collapse happens in JS post-query to keep the SQL boring.
+//
+// Window discipline:
+//   - Default `days = 7`. Route handler clamps via `clampToolMixDays()`
+//     (a dedicated [1,30] clamp distinct from fleetLeaderboard's
+//     [1,90] — the tool-mix is a recent-window question; longer windows
+//     don't help the operator drilling into "where did this week go").
+//   - End = today (UTC midnight); start = end - days. Same `date(ts)`
+//     bucketing as fleetLeaderboard so a tool_use right at the window
+//     boundary buckets identically across both helpers.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`": every
+// new typed-row narrowing here uses the double-cast pattern.
+// ────────────────────────────────────────────────────────────────────
+
+export interface ToolMixWindow {
+  /** ISO date (yyyy-mm-dd) — inclusive lower bound. */
+  start: string;
+  /** ISO date (yyyy-mm-dd) — exclusive upper bound (today). */
+  end: string;
+  /** Window length in days. */
+  days: number;
+}
+
+export interface ToolMixEntry {
+  name: string;
+  invocations: number;
+  total_seconds: number;
+  /** 0..1, NaN-safe (only ever computed when total_invocations > 0). */
+  share: number;
+}
+
+export interface ProjectToolMix {
+  window: ToolMixWindow;
+  tools: ToolMixEntry[];
+  total_invocations: number;
+}
+
+/** Clamp `days` to [1,30] with default 7. Garbage (NaN, undefined,
+ *  empty string, non-numeric) → 7. Fractional inputs are floored.
+ *  Distinct from `clampDays()` because the tool-mix window cap is 30,
+ *  not 90 — see the engineering note. */
+export function clampToolMixDays(raw: unknown): number {
+  if (raw == null || raw === "") return 7;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 7;
+  const i = Math.floor(n);
+  if (i < 1) return 1;
+  if (i > 30) return 30;
+  return i;
+}
+
+interface ToolMixAggRow {
+  tool_name: string;
+  invocations: number;
+}
+
+interface ToolMixPairRow {
+  tool_name: string;
+  total_seconds: number;
+}
+
+/** Build the per-project tool-mix payload for the trailing `days`-day
+ *  window ending at `now` (UTC midnight). The top 6 named tools survive
+ *  verbatim; everything else collapses into a single `"other"` entry.
+ *
+ *  Caller passes a Date for `now` (production uses `new Date()`; tests
+ *  pin via the leaderboard's NOW anchor). Returns `tools: []` and
+ *  `total_invocations: 0` for an empty project — no NaN, no /0. */
+export function projectToolMix(
+  db: DB, projectId: number, now: Date = new Date(), days = 7,
+): ProjectToolMix {
+  // Window: end is today UTC midnight; start is `days` days before that.
+  // Same yyyy-mm-dd frame as fleetLeaderboard so both helpers' buckets
+  // line up exactly when read on the same call.
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - days);
+  const window: ToolMixWindow = {
+    start: start.toISOString().slice(0, 10),
+    end: end.toISOString().slice(0, 10),
+    days,
+  };
+
+  // ── Per-tool invocation counts ─────────────────────────────────────
+  // tool_use rows for this project, joined through `run.project_id`,
+  // bucketed by tool_name within the window. Mirrors fleetLeaderboard's
+  // toolAgg shape but with `r.project_id = ?` instead of the cross-fleet
+  // GROUP BY tool_name only.
+  const aggRows = db.prepare(
+    "SELECT e.tool_name AS tool_name, COUNT(*) AS invocations "
+    + "  FROM run_event e "
+    + "  JOIN run r ON r.id = e.run_id "
+    + " WHERE r.project_id = ? "
+    + "   AND e.kind = 'tool_use' AND e.tool_name IS NOT NULL "
+    + "   AND date(e.ts) >= ? AND date(e.ts) < ? "
+    + " GROUP BY e.tool_name "
+    + " ORDER BY invocations DESC, e.tool_name ASC",
+  ).all(projectId, window.start, window.end) as unknown as ToolMixAggRow[];
+
+  // ── Paired-duration totals per tool ────────────────────────────────
+  // Reuses the `strftime`-based SQL from fleetLeaderboard so sub-ms
+  // diffs (e.g. the AC2 5.0s ± 1e-6 tolerance) survive. `julianday()`
+  // drifts ~10us per timestamp; we keep the same decomposition.
+  const pairRows = db.prepare(
+    "SELECT eu.tool_name AS tool_name, "
+    + "       SUM("
+    + "         (CAST(strftime('%s', er.ts) AS INTEGER) - CAST(strftime('%s', eu.ts) AS INTEGER))"
+    + "         + (CAST(strftime('%f', er.ts) AS REAL) - CAST(strftime('%S', er.ts) AS INTEGER))"
+    + "         - (CAST(strftime('%f', eu.ts) AS REAL) - CAST(strftime('%S', eu.ts) AS INTEGER))"
+    + "       ) AS total_seconds "
+    + "  FROM run_event eu "
+    + "  JOIN run_event er ON er.tool_use_id = eu.tool_use_id "
+    + "  JOIN run r ON r.id = eu.run_id "
+    + " WHERE r.project_id = ? "
+    + "   AND eu.kind = 'tool_use' AND er.kind = 'tool_result' "
+    + "   AND eu.tool_name IS NOT NULL "
+    + "   AND eu.tool_use_id IS NOT NULL "
+    + "   AND date(eu.ts) >= ? AND date(eu.ts) < ? "
+    + " GROUP BY eu.tool_name",
+  ).all(projectId, window.start, window.end) as unknown as ToolMixPairRow[];
+  const secondsByTool = new Map<string, number>();
+  for (const r of pairRows) {
+    secondsByTool.set(r.tool_name, Math.max(0, Number(r.total_seconds) || 0));
+  }
+
+  // ── Empty branch: no /0, no NaN, no broken layout downstream ───────
+  const totalInvocations = aggRows.reduce((s, r) => s + r.invocations, 0);
+  if (totalInvocations === 0) {
+    return { window, tools: [], total_invocations: 0 };
+  }
+
+  // ── Top-6 + "other" collapse (JS-side; the SQL stays straightforward) ─
+  // Already sorted by invocations DESC / name ASC at the SQL layer. The
+  // first 6 named tools survive verbatim; the tail collapses into a
+  // single "other" entry whose invocations + total_seconds are the
+  // straight sum of the tail.
+  const TOP_N = 6;
+  const head = aggRows.slice(0, TOP_N);
+  const tail = aggRows.slice(TOP_N);
+  const tools: ToolMixEntry[] = head.map((r) => ({
+    name: r.tool_name,
+    invocations: r.invocations,
+    total_seconds: secondsByTool.get(r.tool_name) ?? 0,
+    share: r.invocations / totalInvocations,
+  }));
+  if (tail.length > 0) {
+    const tailInvocations = tail.reduce((s, r) => s + r.invocations, 0);
+    const tailSeconds = tail.reduce(
+      (s, r) => s + (secondsByTool.get(r.tool_name) ?? 0), 0);
+    tools.push({
+      name: "other",
+      invocations: tailInvocations,
+      total_seconds: tailSeconds,
+      share: tailInvocations / totalInvocations,
+    });
+  }
+
+  return { window, tools, total_invocations: totalInvocations };
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Backlog-ticket → merged-commit auto-link report (ticket 0018).
 //
 // Aggregates the ticket_commit_link rows for one ticket id into a

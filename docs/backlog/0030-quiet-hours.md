@@ -1,7 +1,7 @@
 ---
 id: 0030
 title: Quiet hours - sleep-window suppress non-critical pushes and demote inbox kinds
-status: in-progress
+status: shipped
 priority: P1
 area: control
 created: 2026-05-30
