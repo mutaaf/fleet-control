@@ -21,7 +21,7 @@ proposes new ones, `review` grades them.
 |----|-------|----------|--------|------|
 | 0029 | PWA installable portal with offline shell and stale-snapshot banner | P1 | shipped | portal |
 | 0030 | Quiet hours - sleep-window suppress non-critical pushes and demote inbox kinds | P1 | shipped | control |
-| 0031 | Per-project tool-mix sparkline - where this project's tokens actually went | P2 | in-progress | observability |
+| 0031 | Per-project tool-mix sparkline - where this project's tokens actually went | P2 | shipped | observability |
 | 0025 | fleetctl demo - one-command sandbox boots portal against seeded fixture fleet | P1 | shipped | infra |
 | 0026 | Merge streak counter and 90-day calendar heatmap on portal home | P1 | shipped | portal |
 | 0027 | Cross-project failure correlation - same error in N projects fires a fleet alert | P1 | shipped | observability |

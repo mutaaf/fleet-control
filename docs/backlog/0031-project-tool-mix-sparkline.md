@@ -1,7 +1,7 @@
 ---
 id: 0031
 title: Per-project tool-mix sparkline - where this project's tokens actually went
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-05-30
@@ -246,3 +246,11 @@ Each box maps 1:1 to a test scenario.
   `origin/main`. Same commit fixes 0030 README/frontmatter drift
   (PR #73 shipped quiet hours but the index + frontmatter still said
   `in-progress`).
+- 2026-05-30 — implementation-dev: PR #74 merged green
+  (typecheck + validate both pass; auto-merge armed). Per-project
+  tool-mix sparkline ships on every project page above the existing
+  job cards, with the lazy /api/projects/:slug/tool-mix route, a
+  zero-dep inline SVG renderer, a wrapping legend, and a hover/tap
+  tooltip. All 11 ACs covered by tests/tool_mix.test.ts; flipping
+  to `shipped` via chore/0031-mark-shipped per the recent
+  chore(0029)/chore(0024) convention.
