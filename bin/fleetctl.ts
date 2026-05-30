@@ -11,6 +11,7 @@ import { mintToken, listTokens, revokeToken, type Scope } from "../src/auth.ts";
 import { syncPricing, pricingRows, DEFAULT_PRICING_FILE } from "../src/pricing.ts";
 import { flagRun } from "../src/anomaly.ts";
 import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
+import { resolveWindow, isQuietNow, nextWindowEnd } from "../src/quiet_hours.ts";
 import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
 import { listSnapshots } from "../src/snapshot.ts";
 import { doAction } from "../src/control.ts";
@@ -426,6 +427,51 @@ switch (cmd) {
     }
     break;
   }
+  case "quiet-hours": {
+    // `fleetctl quiet-hours` — print the effective windows for the
+    // fleet default + each per-project override + the current active
+    // state. No subcommand for SETTING; operators edit
+    // fleet-control.config.json directly (per ticket 0030 § "matches
+    // the ntfyTopic / portalUrl precedent"). Exits 0 unconditionally.
+    const anyCfg = cfg as unknown as Record<string, unknown>;
+    const fleetDefault = anyCfg.quietHours as
+      { start: string; end: string; tz: string } | undefined;
+    const overrides = (anyCfg.quietHoursOverride
+      ?? {}) as Record<string, false | { start: string; end: string; tz: string }>;
+    const now = new Date();
+    console.log(`${c.bold}quiet-hours${c.rst} ${c.dim}— fleet-control.config.json${c.rst}`);
+    if (fleetDefault) {
+      const active = isQuietNow(cfg, "__fleet__", now);
+      const tail = active
+        ? `${c.grn}ACTIVE${c.rst} ${c.dim}— resumes ${(nextWindowEnd(cfg, "__fleet__", now) ?? new Date()).toISOString()}${c.rst}`
+        : `${c.dim}inactive${c.rst}`;
+      console.log(`  fleet default: ${fleetDefault.start}–${fleetDefault.end} ${c.dim}${fleetDefault.tz}${c.rst}  ${tail}`);
+    } else {
+      console.log(`  fleet default: ${c.dim}(none — set quietHours in fleet-control.config.json)${c.rst}`);
+    }
+    const slugs = Object.keys(overrides);
+    if (slugs.length === 0) {
+      console.log(`  per-project overrides: ${c.dim}(none)${c.rst}`);
+    } else {
+      console.log(`  per-project overrides:`);
+      for (const slug of slugs) {
+        const v = overrides[slug];
+        if (v === false) {
+          console.log(`    ${slug}: ${c.ylw}always page${c.rst} ${c.dim}(quiet hours disabled)${c.rst}`);
+        } else {
+          const win = resolveWindow(cfg, slug);
+          const active = isQuietNow(cfg, slug, now);
+          const tail = active ? `${c.grn}ACTIVE${c.rst}` : `${c.dim}inactive${c.rst}`;
+          if (win) {
+            console.log(`    ${slug}: ${win.start}–${win.end} ${c.dim}${win.tz}${c.rst}  ${tail}`);
+          } else {
+            console.log(`    ${slug}: ${c.red}invalid window${c.rst} ${c.dim}(falls back to fleet default)${c.rst}`);
+          }
+        }
+      }
+    }
+    break;
+  }
   case "demo": {
     // `fleetctl demo` — one-command sandbox (ticket 0025). Boots the
     // same server path as `serve` but against an ephemeral tmpdir DB
@@ -527,6 +573,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|doctor [--json]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|doctor [--json]]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run" && cmd !== "demo") db.close();

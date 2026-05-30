@@ -19,6 +19,7 @@ import { request as httpsRequest } from "node:https";
 import type { ClientRequest, IncomingMessage } from "node:http";
 import type { DB } from "./db.ts";
 import type { FleetConfig } from "./config.ts";
+import { isQuietNow } from "./quiet_hours.ts";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -212,25 +213,51 @@ export function _resetDedupForTests(): void {
   seenAnomalyKeys.clear();
 }
 
+/** Optional dispatcher overrides. `now` is the wall-clock used for the
+ *  quiet-hours gate (ticket 0030); defaults to `new Date()`. Tests
+ *  pin this so the gate is deterministic. */
+export interface NtfyDispatchOpts {
+  now?: Date;
+}
+
 /** Dispatch an alert to ntfy. Deduped per dedup_key. The dispatcher
  *  silently returns {ok:true,error:"disabled"} when ntfyTopic is unset OR
  *  the key has already been seen this process lifetime. Best-effort: a
- *  transport failure is logged to fleetd.err and the caller proceeds. */
+ *  transport failure is logged to fleetd.err and the caller proceeds.
+ *
+ *  Ticket 0030: when the resolved quiet-hours window catches `now` AND
+ *  the payload priority is < 5, the dispatcher returns
+ *  `{ok:true,status:0,error:"quiet_hours"}` and does NOT POST. Per AC4,
+ *  the dedup key is NOT consumed on the quiet-hours path so the alert
+ *  re-fires at window close if still open. */
 export async function ntfyForAlert(
-  db: DB, _cfg: FleetConfig, ncfg: NtfyConfig, alert: AlertLike,
+  db: DB, cfg: FleetConfig, ncfg: NtfyConfig, alert: AlertLike,
+  opts: NtfyDispatchOpts = {},
 ): Promise<NtfyResult> {
   if (!ncfg.topic) return { ok: true, status: 0, error: "disabled" };
   if (seenAlertKeys.has(alert.dedup_key)) {
     return { ok: true, status: 0, error: "deduped" };
   }
-  seenAlertKeys.add(alert.dedup_key);
   const slug = slugFor(db, alert.project_id) ?? "";
+  const priority = severityToPriority(alert.severity);
+  // Quiet-hours gate: priority < 5 (anything below critical) is
+  // suppressed when the project's effective window catches `now`.
+  // Critical (priority 5) and fleet-wide correlations always page.
+  if (priority < 5) {
+    const now = opts.now ?? new Date();
+    if (isQuietNow(cfg, slug, now)) {
+      // DO NOT seenAlertKeys.add(alert.dedup_key) here — the alert
+      // must re-fire at window close if still open.
+      return { ok: true, status: 0, error: "quiet_hours" };
+    }
+  }
+  seenAlertKeys.add(alert.dedup_key);
   const click = ncfg.portalUrl + slug;
   const tags = [alert.severity === "critical" ? "rotating_light" : "warning", alert.type];
   const r = await sendNtfy(ncfg.topic, {
     title: alert.title,
     message: alert.detail,
-    priority: severityToPriority(alert.severity),
+    priority,
     tags,
     click,
   });
@@ -250,17 +277,32 @@ export interface AnomalyDispatch {
 
 /** Dispatch an anomaly to ntfy. Deduped per (run_id, kind). Message
  *  surfaces the σ-multiplier so the operator gets immediate context
- *  ("ship #482 ran 5.2σ above baseline — repeated tool errors"). */
+ *  ("ship #482 ran 5.2σ above baseline — repeated tool errors").
+ *
+ *  Ticket 0030: anomalies dispatch at priority 4 (between warn and
+ *  critical) — strictly less than the priority-5 gate, so they
+ *  participate in the quiet-hours suppression. Same re-fire-at-close
+ *  semantics as ntfyForAlert: the dedup key is NOT consumed on the
+ *  quiet-hours path. */
 export async function ntfyForAnomaly(
-  db: DB, _cfg: FleetConfig, ncfg: NtfyConfig, a: AnomalyDispatch,
+  db: DB, cfg: FleetConfig, ncfg: NtfyConfig, a: AnomalyDispatch,
+  opts: NtfyDispatchOpts = {},
 ): Promise<NtfyResult> {
   if (!ncfg.topic) return { ok: true, status: 0, error: "disabled" };
   const key = `anomaly:${a.run_id}:${a.kind}`;
   if (seenAnomalyKeys.has(key)) {
     return { ok: true, status: 0, error: "deduped" };
   }
-  seenAnomalyKeys.add(key);
   const slug = slugFor(db, a.project_id) ?? "";
+  // Quiet-hours gate (priority 4 < 5). Don't consume the dedup key on
+  // suppression so a still-open anomaly re-fires at window close.
+  {
+    const now = opts.now ?? new Date();
+    if (isQuietNow(cfg, slug, now)) {
+      return { ok: true, status: 0, error: "quiet_hours" };
+    }
+  }
+  seenAnomalyKeys.add(key);
   const click = ncfg.portalUrl + slug;
   const sigma = a.stddev_multiplier.toFixed(1);
   const unit = a.kind === "duration" ? "ms" : "$";

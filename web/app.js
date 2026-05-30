@@ -615,8 +615,9 @@ function renderCorrelationItem(item) {
   </div>`;
 }
 
-function inboxRow(item) {
+function inboxRow(item, opts) {
   if (item.kind === "fleet_correlation") return renderCorrelationItem(item);
+  const quieted = !!(opts && opts.quieted);
   const lbl = INBOX_KIND_LABEL[item.kind] || item.kind;
   const slug = esc(item.project_slug);
   const title = esc(item.title);
@@ -631,9 +632,17 @@ function inboxRow(item) {
   const openLink = isExternal
     ? `<a class="btn sm" href="${esc(route)}" target="_blank" rel="noopener" data-stop="1">${actionLabel}</a>`
     : `<a class="btn sm" href="${esc(route)}" data-stop="1">${actionLabel}</a>`;
-  return `<div class="inbox-row" data-inbox-row data-kind="${esc(item.kind)}" data-slug="${slug}" data-payload-id="${esc(item.payload.id)}">
+  // Ticket 0030: quieted rows carry a small moon glyph (U+1F319) so
+  // the operator can scan the inbox at 9am and see immediately which
+  // rows arrived during the night. The glyph is text-only (no DOM
+  // shift) and carries an aria-label="quiet" for screen readers.
+  const moon = quieted
+    ? `<span class="moon" aria-label="quiet">🌙</span> `
+    : "";
+  const rowClass = quieted ? "inbox-row inbox-row-quieted" : "inbox-row";
+  return `<div class="${rowClass}" data-inbox-row data-kind="${esc(item.kind)}" data-slug="${slug}" data-payload-id="${esc(item.payload.id)}">
     <div class="inbox-meta">
-      <span class="inbox-kind">${esc(lbl)}</span>
+      ${moon}<span class="inbox-kind">${esc(lbl)}</span>
       <span class="dim">· ${slug} · ${esc(ago(new Date(Date.now() - (item.age_seconds || 0) * 1000).toISOString()))}</span>
     </div>
     <div class="inbox-title">${title}</div>
@@ -644,15 +653,54 @@ function inboxRow(item) {
   </div>`;
 }
 
+// Ticket 0030: render the "Queued during quiet hours — resumes at HH:MM"
+// divider above the quietedItems section. The `until` ISO string passes
+// through redactSecrets per LESSONS § "defence-in-depth secret redaction
+// at the renderer boundary" — even though the string is normally a fixed
+// ISO timestamp, the renderer surface stays disciplined.
+function renderQuietDivider(quietHoursUntil, count) {
+  const safeUntil = redactSecrets(String(quietHoursUntil || ""));
+  let resumesText = "";
+  if (safeUntil) {
+    try {
+      const d = new Date(safeUntil);
+      if (!isNaN(d.getTime())) {
+        // Render HH:MM in the operator's local zone (the browser's
+        // default — same convention as ago() and until() elsewhere).
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        resumesText = ` — resumes at ${hh}:${mm}`;
+      }
+    } catch { /* fall through, render the divider without time */ }
+  }
+  const countText = count === 1 ? "1 item arrived overnight"
+    : `${count} items arrived overnight`;
+  return `<div class="inbox-quiet-divider" data-testid="inbox-quiet-divider">
+    <span class="moon" aria-label="quiet">🌙</span>
+    <span class="dim">Queued during quiet hours${esc(resumesText)} · ${esc(countText)}</span>
+  </div>`;
+}
+
 function renderInbox(data) {
   if (!data) return "";
   const items = data.items || [];
-  if (items.length === 0) {
+  const quietedItems = data.quietedItems || [];
+  if (items.length === 0 && quietedItems.length === 0) {
     return `<div class="eyebrow">Inbox</div>
       <div class="inbox-empty">Inbox zero — fleet's healthy.</div>`;
   }
-  return `<div class="eyebrow">Inbox · ${items.length} thing${items.length === 1 ? "" : "s"} need${items.length === 1 ? "s" : ""} you</div>
-    <div class="inbox-list">${items.map(inboxRow).join("")}</div>`;
+  const totalCount = items.length + quietedItems.length;
+  const head = `<div class="eyebrow">Inbox · ${totalCount} thing${totalCount === 1 ? "" : "s"} need${totalCount === 1 ? "s" : ""} you</div>`;
+  const itemsHtml = items.map((it) => inboxRow(it)).join("");
+  // The divider is absent when quietedItems is empty — per the AC,
+  // "When data.quietedItems.length === 0 the divider is absent."
+  let quietedHtml = "";
+  if (quietedItems.length > 0) {
+    quietedHtml = renderQuietDivider(data.quietHoursUntil, quietedItems.length)
+      + quietedItems.map((it) => inboxRow(it, { quieted: true })).join("");
+  }
+  return `${head}
+    <div class="inbox-list">${itemsHtml}${quietedHtml}</div>`;
 }
 
 // Dismiss handler — POST to /api/fleet/inbox/dismiss, then trigger a
