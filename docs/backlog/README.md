@@ -19,7 +19,7 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
-| 0029 | PWA installable portal with offline shell and stale-snapshot banner | P1 | in-progress | portal |
+| 0029 | PWA installable portal with offline shell and stale-snapshot banner | P1 | shipped | portal |
 | 0030 | Quiet hours - sleep-window suppress non-critical pushes and demote inbox kinds | P1 | groomed | control |
 | 0031 | Per-project tool-mix sparkline - where this project's tokens actually went | P2 | groomed | observability |
 | 0025 | fleetctl demo - one-command sandbox boots portal against seeded fixture fleet | P1 | shipped | infra |

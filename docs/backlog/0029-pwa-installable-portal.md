@@ -1,7 +1,7 @@
 ---
 id: 0029
 title: PWA installable portal with offline shell and stale-snapshot banner
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-05-30
@@ -220,3 +220,9 @@ Each box maps 1:1 to a test scenario.
   `/sw.js`; add `tests/pwa.test.ts` with one `test()` per AC checkbox
   (server-route tests follow LESSONS § empty-roots config seed, SW handler
   tests stay text-level).
+- 2026-05-30 — implementation-dev: shipped via PR #71 (merged on green
+  `typecheck` + `validate`). All 16 AC-mapped tests in `tests/pwa.test.ts`
+  pass locally. Pre-existing time-pinned digest/leaderboard/prs-merged
+  failures noted in LESSONS § "time-pinned tests must NOT derive seed
+  timestamps from new Date()" remain — out of scope for this ticket and
+  not on the gating CI paths.
