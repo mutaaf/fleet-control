@@ -27,6 +27,18 @@ export interface FleetConfig {
    *  hash route `http://127.0.0.1:7070/#/p/`. The project slug is
    *  appended per notification. */
   portalUrl?: string;
+  /** Quiet hours — sleep-window suppress non-critical pushes (ticket 0030).
+   *  Operator-wide default. `tz` is an IANA zone name like
+   *  "America/Los_Angeles"; `start` and `end` are HH:MM strings interpreted
+   *  in `tz`. When `start > end` the window wraps midnight. Undefined =
+   *  no quiet hours. Invalid HH:MM / unknown tz falls back to undefined
+   *  via the parser in `src/quiet_hours.ts`. */
+  quietHours?: { start: string; end: string; tz: string };
+  /** Per-project quiet-hours override (ticket 0030). The literal `false`
+   *  means "always page for this project, never quiet" — useful for the
+   *  rare project that warrants 24/7 paging. An object overrides the
+   *  fleet default's window/tz for that slug. */
+  quietHoursOverride?: Record<string, false | { start: string; end: string; tz: string }>;
 }
 
 const DEFAULTS: FleetConfig = {

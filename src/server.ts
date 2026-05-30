@@ -319,7 +319,7 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         // Read-scope (loopback bypasses); same shape as every other
         // GET /api/fleet/* route — net-new, no existing JSON shape to
         // preserve.
-        if (path === "/api/fleet/inbox") return json(res, fleetInbox(db));
+        if (path === "/api/fleet/inbox") return json(res, fleetInbox(db, { cfg }));
         // Ticket 0027: active cross-project failure correlations.
         // Read-scope (loopback bypasses); same posture as every other
         // GET /api/fleet/* route. Net-new — no existing JSON shape to

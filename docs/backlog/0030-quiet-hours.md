@@ -1,7 +1,7 @@
 ---
 id: 0030
 title: Quiet hours - sleep-window suppress non-critical pushes and demote inbox kinds
-status: groomed
+status: in-progress
 priority: P1
 area: control
 created: 2026-05-30
@@ -255,4 +255,12 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-30: implementation-dev started. Branch `feat/0030-quiet-hours`.
+  Plan: new `src/quiet_hours.ts` module (pure functions with
+  `Intl.DateTimeFormat` for IANA tz arithmetic), extend `FleetConfig`
+  with `quietHours` + `quietHoursOverride`, gate `ntfyForAlert` /
+  `ntfyForAnomaly` early without consuming the dedup key, extend
+  `fleetInbox` to split into `items` + `quietedItems`, add the
+  `quietHoursActive` / `quietHoursUntil` envelope keys to the API
+  response (additive, preserves existing keys), render the moon-glyph
+  divider in `web/app.js`, add the `fleetctl quiet-hours` subcommand.
