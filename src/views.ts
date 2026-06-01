@@ -6,6 +6,8 @@ import { openAlerts } from "./alerts.ts";
 import { daemonStatus } from "./daemon.ts";
 import { ingestProjectPRs, projectPRs } from "./ingest/prs.ts";
 import { anomaliesForRun, recentAnomalies } from "./anomaly.ts";
+import { activeCorrelations } from "./correlate.ts";
+import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 
 const PHASES = ["ship", "groom", "review", "eng"];
 
@@ -1458,6 +1460,311 @@ export function ticketShipReport(db: DB, ticket_id: string): TicketShipReport | 
     total_files_changed: totalFiles,
     first_commit_date: rows[0].commit_date,
     last_commit_date: rows[rows.length - 1].commit_date,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// "Yesterday at a glance" morning card (ticket 0033).
+//
+// One fleet-wide helper that powers the home page's top card:
+// trailing-24h shipped PRs, today's spend, anomalies open in window,
+// streak day, plus a single one-line verdict picked by a priority
+// cascade. Composes 0022 (projectHealth), 0026 (fleetStreak), 0027
+// (activeCorrelations), 0028 (per-project burndown cap), and 0030
+// (quietHoursActiveAnywhere) — does NOT duplicate their SQL.
+//
+// Window arithmetic:
+//   - Window is the trailing 24h ending at `now`. Boundaries are
+//     compared as ISO strings against `started_at` / `created_at`
+//     columns (SQLite lexicographic ordering matches chronological
+//     ordering for ISO-8601), so we don't need julianday() math.
+//     Per LESSONS § "julianday() drifts ~10us per timestamp;
+//     decompose with strftime for sub-ms diffs" — we steer clear of
+//     julianday entirely.
+//   - `spent_usd` reads cost_rollup_day for the SINGLE calendar day
+//     containing `now` (the visible "today"), NOT a rolling 24h sum
+//     — the AC is explicit. This matches the daily-budget guard
+//     (0021) and the burndown today-dot (0028) so the three readings
+//     line up.
+//
+// Verdict cascade (first non-null match wins):
+//   1. band_shift_red       — projectHealth(now).band='red' AND was NOT
+//                             red 24h ago (re-derive ship_success over
+//                             runs <= now-24h).
+//   2. band_shift_amber     — same with band='amber'.
+//   3. budget_threshold     — cost_rollup_day for today >= 75% of
+//                             max_daily_usd from cadence_json (same
+//                             knob the 0021 autopause reads).
+//   4. fleet_correlation    — activeCorrelations() returns a non-empty
+//                             list in window (0027).
+//   5. first_ship           — a project whose FIRST EVER shipped run
+//                             (with pr_number) landed in window.
+//   6. all_quiet            — default.
+//
+// Quiet-hours demotion (0030): when quietHoursActiveAnywhere AND the
+// verdict kind is band_shift_amber / budget_threshold / first_ship, the
+// message gets a U+1F319 moon prefix + "(arrived during quiet hours)".
+// Critical kinds (band_shift_red, fleet_correlation) are never demoted
+// — matches 0030's "critical always pages" gating.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`": every
+// row narrowing here uses the double-cast pattern.
+
+export interface YesterdayGlanceVerdict {
+  kind: "band_shift_red" | "band_shift_amber" | "budget_threshold"
+    | "fleet_correlation" | "first_ship" | "all_quiet";
+  project_slug?: string;
+  message: string;
+}
+
+export interface YesterdayGlance {
+  window: { start: string; end: string };
+  shipped_count: number;
+  spent_usd: number;
+  anomalies_open: number;
+  streak_days: number;
+  verdict: YesterdayGlanceVerdict;
+  generated_at: string;
+}
+
+interface ShippedRow { n: number; }
+interface SpentRow { spent_usd: number | null; }
+interface AnomaliesRow { n: number; }
+interface ProjectGlanceRow {
+  id: number;
+  slug: string;
+  cadence_json: string | null;
+}
+interface ShipBucketRow { shipped: number; total: number; }
+interface FirstShipRow { slug: string; first_started_at: string | null; }
+
+/** Re-derive `ship_success` over the last-20 ship runs whose started_at
+ *  is strictly before `cutoffIso`. Mirrors the formula in `shipSuccess()`
+ *  above (LIMIT 20 + sub-query + COUNT) so the band lookup at the "24h
+ *  ago" anchor stays in lock-step with today's band math. Returns null
+ *  when no ship runs land before the cutoff (band → grey, not red). */
+function shipSuccessBefore(db: DB, projectId: number, cutoffIso: string): number | null {
+  const row = db.prepare(
+    "SELECT COUNT(*) AS total, "
+    + "  SUM(CASE WHEN outcome = 'shipped' THEN 1 ELSE 0 END) AS shipped "
+    + "FROM (SELECT outcome FROM run "
+    + "      WHERE project_id = ? AND phase = 'ship' AND outcome IS NOT 'smoke' "
+    + "        AND started_at IS NOT NULL AND started_at <= ? "
+    + "      ORDER BY started_at DESC LIMIT 20) sub",
+  ).get(projectId, cutoffIso) as unknown as ShipBucketRow | undefined;
+  if (!row || !row.total) return null;
+  return Math.round((Number(row.shipped) || 0) * 100 / row.total);
+}
+
+/** Band for a `ship_success` score, OR null when the score itself is
+ *  null (zero ship-run history → "grey", which is treated as "not red"
+ *  / "not amber" for the band-shift detector). */
+function bandForShipSuccessOrNull(score: number | null): "green" | "amber" | "red" | null {
+  if (score == null) return null;
+  if (score >= 80) return "green";
+  if (score >= 50) return "amber";
+  return "red";
+}
+
+/** "Yesterday at a glance" morning-card payload (ticket 0033).
+ *
+ *  `now` defaults to wall-clock; tests pin it. `cfg` is the optional
+ *  FleetConfig used to consult 0030's quiet-hours window — when absent
+ *  (e.g. inside unit tests that don't care about the demotion), the
+ *  verdict messages are unmodified.
+ */
+export function yesterdayGlance(
+  db: DB, now: Date = new Date(), cfg?: FleetConfig,
+): YesterdayGlance {
+  const nowIso = now.toISOString();
+  const windowStart = new Date(now.getTime() - 24 * 3600_000);
+  const windowStartIso = windowStart.toISOString();
+  const todayUtc = nowIso.slice(0, 10);
+
+  // ── shipped_count: DISTINCT pr_number on shipped runs in window ────
+  // Same source as 0019 / digest's mergedRunsByProject — cross-fleet,
+  // not per-project. We count DISTINCT (project_id, pr_number) pairs
+  // so two different repos sharing the same pr_number aren't merged.
+  const shippedRow = db.prepare(
+    "SELECT COUNT(*) AS n FROM ("
+    + "  SELECT DISTINCT project_id, pr_number FROM run "
+    + "   WHERE outcome = 'shipped' AND pr_number IS NOT NULL "
+    + "     AND started_at IS NOT NULL "
+    + "     AND started_at >= ? AND started_at <= ?"
+    + ")",
+  ).get(windowStartIso, nowIso) as unknown as ShippedRow | undefined;
+  const shipped_count = Number(shippedRow?.n ?? 0);
+
+  // ── spent_usd: cost_rollup_day SUM for the SINGLE today bucket ─────
+  const spentRow = db.prepare(
+    "SELECT SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day WHERE day = ?",
+  ).get(todayUtc) as unknown as SpentRow | undefined;
+  const spent_usd = Number(spentRow?.spent_usd ?? 0);
+
+  // ── anomalies_open: anomaly rows in window with dismissed_at NULL ──
+  const anomRow = db.prepare(
+    "SELECT COUNT(*) AS n FROM anomaly "
+    + " WHERE dismissed_at IS NULL "
+    + "   AND created_at IS NOT NULL "
+    + "   AND created_at >= ? AND created_at <= ?",
+  ).get(windowStartIso, nowIso) as unknown as AnomaliesRow | undefined;
+  const anomalies_open = Number(anomRow?.n ?? 0);
+
+  // ── streak_days: reuse 0026's fleetStreak() — no duplicated SQL ───
+  const streak = fleetStreak(db, { now: nowIso });
+  const streak_days = streak.streak_days;
+
+  // ── Verdict cascade ──────────────────────────────────────────────
+  // The cascade runs once per project (to keep "first match wins"
+  // discipline) and short-circuits at the first non-null hit.
+  const projects = db.prepare(
+    "SELECT id, slug, cadence_json FROM project ORDER BY slug",
+  ).all() as unknown as ProjectGlanceRow[];
+
+  // Anchor "24h ago" once; reused for the band-shift detector.
+  const cutoffIso = windowStartIso;
+
+  let verdict: YesterdayGlanceVerdict | null = null;
+
+  // Priority 1+2: band shift. We do a single pass over projects and
+  // capture the first red or amber flip; red wins over amber by virtue
+  // of being checked first.
+  let redCandidate: { slug: string } | null = null;
+  let amberCandidate: { slug: string } | null = null;
+  for (const p of projects) {
+    const todayShip = shipSuccess(db, p.id);
+    const todayBand = bandForShipSuccessOrNull(todayShip);
+    if (todayBand !== "red" && todayBand !== "amber") continue;
+    const beforeShip = shipSuccessBefore(db, p.id, cutoffIso);
+    const beforeBand = bandForShipSuccessOrNull(beforeShip);
+    if (todayBand === "red" && beforeBand !== "red" && !redCandidate) {
+      redCandidate = { slug: p.slug };
+    } else if (todayBand === "amber" && beforeBand !== "amber" && !amberCandidate) {
+      amberCandidate = { slug: p.slug };
+    }
+  }
+  if (redCandidate) {
+    // Most-recent failing ship run gives the operator the "what
+    // failing" detail the AC asks for.
+    const failingRow = db.prepare(
+      "SELECT phase, started_at FROM run "
+      + " WHERE project_id = (SELECT id FROM project WHERE slug = ?) "
+      + "   AND outcome = 'failure' AND started_at IS NOT NULL "
+      + " ORDER BY started_at DESC LIMIT 1",
+    ).get(redCandidate.slug) as unknown as { phase: string | null; started_at: string } | undefined;
+    const hhmm = failingRow?.started_at
+      ? failingRow.started_at.slice(11, 16) // "HH:MM" from ISO
+      : nowIso.slice(11, 16);
+    const detail = failingRow?.phase ? `${failingRow.phase} failed` : "build failing";
+    verdict = {
+      kind: "band_shift_red",
+      project_slug: redCandidate.slug,
+      message: `${redCandidate.slug} went red at ${hhmm} - ${detail}`,
+    };
+  } else if (amberCandidate) {
+    verdict = {
+      kind: "band_shift_amber",
+      project_slug: amberCandidate.slug,
+      message: `${amberCandidate.slug} went amber - ship_success below 80%`,
+    };
+  }
+
+  // Priority 3: budget threshold (>=75% of max_daily_usd).
+  if (!verdict) {
+    for (const p of projects) {
+      const cap = parseDailyCap(p.cadence_json);
+      if (cap == null) continue;
+      const spent = db.prepare(
+        "SELECT SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+        + "  FROM cost_rollup_day WHERE project_id = ? AND day = ?",
+      ).get(p.id, todayUtc) as unknown as SpentRow | undefined;
+      const todaySpent = Number(spent?.spent_usd ?? 0);
+      if (cap > 0 && todaySpent >= cap * 0.75) {
+        const pct = Math.round((todaySpent / cap) * 100);
+        verdict = {
+          kind: "budget_threshold",
+          project_slug: p.slug,
+          message: `${p.slug} at ${pct}% of daily budget`,
+        };
+        break;
+      }
+    }
+  }
+
+  // Priority 4: fleet_correlation (0027).
+  if (!verdict) {
+    const correlations = activeCorrelations(db, now);
+    // Filter to correlations whose `created_at`-derived first_seen sits
+    // in window — activeCorrelations already filters to the last 24h
+    // (cutoff in correlate.ts), so any non-empty list qualifies.
+    if (correlations.length > 0) {
+      const c = correlations[0];
+      verdict = {
+        kind: "fleet_correlation",
+        message: `${c.project_slugs.length} projects failing with ${c.signature}`,
+      };
+    }
+  }
+
+  // Priority 5: first_ship (a project whose first EVER shipped run is
+  // in the trailing 24h window). We pull the first shipped run per
+  // project in one query and pick the earliest whose timestamp is in
+  // window.
+  if (!verdict) {
+    const firstShips = db.prepare(
+      "SELECT p.slug AS slug, MIN(r.started_at) AS first_started_at "
+      + "  FROM project p "
+      + "  JOIN run r ON r.project_id = p.id "
+      + " WHERE r.outcome = 'shipped' AND r.pr_number IS NOT NULL "
+      + "   AND r.started_at IS NOT NULL "
+      + " GROUP BY p.id, p.slug",
+    ).all() as unknown as FirstShipRow[];
+    for (const fs of firstShips) {
+      if (!fs.first_started_at) continue;
+      if (fs.first_started_at >= windowStartIso && fs.first_started_at <= nowIso) {
+        verdict = {
+          kind: "first_ship",
+          project_slug: fs.slug,
+          message: `${fs.slug} shipped its first PR`,
+        };
+        break;
+      }
+    }
+  }
+
+  // Priority 6: all_quiet — the empty-state default.
+  if (!verdict) {
+    verdict = {
+      kind: "all_quiet",
+      message: `All quiet. Streak day ${streak_days}.`,
+    };
+  }
+
+  // ── Quiet-hours demotion (0030) ──────────────────────────────────
+  // Critical kinds always page through; non-critical kinds get the
+  // moon prefix + suffix when quiet hours are active anywhere in the
+  // fleet config.
+  if (cfg && quietHoursActiveAnywhere(cfg, now)) {
+    const critical: Array<YesterdayGlanceVerdict["kind"]> = [
+      "band_shift_red", "fleet_correlation",
+    ];
+    if (!critical.includes(verdict.kind)) {
+      verdict = {
+        ...verdict,
+        message: `\u{1F319} ${verdict.message} (arrived during quiet hours)`,
+      };
+    }
+  }
+
+  return {
+    window: { start: windowStartIso, end: nowIso },
+    shipped_count,
+    spent_usd,
+    anomalies_open,
+    streak_days,
+    verdict,
+    generated_at: nowIso,
   };
 }
 

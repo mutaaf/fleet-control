@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, type YesterdayGlance } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
@@ -88,6 +88,48 @@ const MIME: Record<string, string> = {
   ".webmanifest": "application/manifest+json",
   ".png": "image/png",
 };
+
+// Ticket 0033: "Yesterday at a glance" memo cache.
+//
+// 60s TTL keyed by `now` rounded to the minute (UTC). One module-level
+// Map; expired rows fall out lazily on the next lookup. Per LESSONS §
+// "in-process dedup sets need an explicit reset hook for tests": we
+// expose `_resetGlanceCacheForTests()`. Per LESSONS § "expose a build
+// counter for cache-hit tests, not a fetcher swap": we also expose a
+// read-only `_getGlanceCacheBuildsForTests()` that ticks on every cache
+// MISS so route tests can assert hit/miss semantics without stubbing
+// SQL. Production code never reads either.
+interface GlanceCacheEntry { value: YesterdayGlance; expires_at: number; }
+const GLANCE_TTL_MS = 60_000;
+const glanceCache = new Map<string, GlanceCacheEntry>();
+let glanceBuildCounter = 0;
+
+export function _resetGlanceCacheForTests(): void {
+  glanceCache.clear();
+  glanceBuildCounter = 0;
+}
+
+export function _getGlanceCacheBuildsForTests(): number {
+  return glanceBuildCounter;
+}
+
+function minuteKey(now: Date): string {
+  // Floor `now` to the minute in UTC: yyyy-mm-ddTHH:MM:00.000Z.
+  return now.toISOString().slice(0, 16);
+}
+
+/** Look up a fresh glance from the memo cache; rebuild on miss. The
+ *  cache key is `now` rounded to the minute so polled phones inside the
+ *  60s SW cache window (ticket 0029) share one build. */
+function getGlanceCached(db: DB, cfg: FleetConfig, now: Date): YesterdayGlance {
+  const key = minuteKey(now);
+  const hit = glanceCache.get(key);
+  if (hit && hit.expires_at > Date.now()) return hit.value;
+  glanceBuildCounter += 1;
+  const value = yesterdayGlance(db, now, cfg);
+  glanceCache.set(key, { value, expires_at: Date.now() + GLANCE_TTL_MS });
+  return value;
+}
 
 // Refresh history at most every 10s on read (cheap; live state is always fresh).
 let lastIngest = 0;
@@ -335,6 +377,22 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         // to preserve. The helper does two SQL GROUP BYs + one JS
         // walk; well under 50ms even at 10 projects × 90 days.
         if (path === "/api/fleet/streak") return json(res, fleetStreak(db));
+        // Ticket 0033: "Yesterday at a glance" morning card. Composes
+        // existing helpers (fleetStreak / projectHealth / activeCorrelations
+        // / daily-budget reads) into one payload; cached for 60s in a
+        // module-level Map keyed by `now` rounded to the minute. The
+        // response Cache-Control: max-age=60 also lets the SW cache
+        // (0029) survive across phone refreshes inside the window.
+        if (path === "/api/fleet/glance") {
+          const v = getGlanceCached(db, cfg, new Date());
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=60",
+          });
+          return res.end(body);
+        }
         // Cross-project tool-call leaderboard (ticket 0014). One JSON
         // payload composed of three SQL aggregations (tools across the
         // fleet, projects, cost-by-phase heatmap). `days` query param
