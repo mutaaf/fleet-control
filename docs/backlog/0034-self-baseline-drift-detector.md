@@ -1,7 +1,7 @@
 ---
 id: 0034
 title: Self-baseline drift detector - flag when a project diverges from its OWN 14-day shape
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-01
@@ -315,3 +315,5 @@ Each box maps 1:1 to a test scenario.
   `web/style.css` wiring; all 16 active AC tests pass locally; full
   local gate green (`npm ci && npx tsc --noEmit && node scripts/
   check-backlog.mjs`).
+- 2026-06-01 - PR #81 opened, both gating checks (`typecheck` +
+  `validate`) green, auto-merge armed, squash-merged to `main`.
