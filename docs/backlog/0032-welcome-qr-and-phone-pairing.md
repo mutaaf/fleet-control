@@ -1,7 +1,7 @@
 ---
 id: 0032
 title: Welcome banner prints LAN URL + ASCII-QR so the phone is paired in 60 seconds
-status: in-progress
+status: shipped
 priority: P1
 area: infra
 created: 2026-06-01
@@ -332,3 +332,5 @@ Each box maps 1:1 to a test scenario.
   welcome render + CLI subprocess + PWA install hint). Zero new
   runtime deps; full local gate (npm ci, tsc --noEmit,
   check-backlog.mjs) green.
+- 2026-06-01 - PR #77 opened, CI green (typecheck + validate +
+  enable-auto-merge), squash-merged to main.
