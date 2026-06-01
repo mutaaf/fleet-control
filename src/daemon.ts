@@ -12,6 +12,7 @@ import { runIngestPass } from "./ingest/index.ts";
 import { evalAlerts } from "./alerts.ts";
 import { runBudgetGuards } from "./budget_guard.ts";
 import { runCorrelationHook } from "./correlate.ts";
+import { runDriftHook } from "./drift.ts";
 
 const UID = process.getuid?.() ?? 0;
 const LABEL = "com.fleet.control.fleetd";
@@ -53,6 +54,17 @@ export async function runDaemon(intervalSec = 60): Promise<void> {
         const inserted = runCorrelationHook(db, new Date());
         if (inserted) console.log(`${new Date().toISOString()} ${inserted} new fleet correlation(s)`);
       } catch (e) { console.error("correlation hook error:", e); }
+      // Ticket 0034: self-baseline drift detector. Runs after the
+      // correlation hook so the inbox surfaces fleet-wide patterns
+      // first when both fire on the same tick. Idempotent across
+      // ticks via an application-level 24h aging-window lookup in
+      // runDriftHook (per LESSONS § "re-fire-after-dismiss needs an
+      // aging window, not a partial UNIQUE index"). Reads existing
+      // run_event/run/anomaly tables only — no schema migration.
+      try {
+        const inserted = runDriftHook(db, new Date());
+        if (inserted) console.log(`${new Date().toISOString()} ${inserted} new self-drift detection(s)`);
+      } catch (e) { console.error("drift hook error:", e); }
     } catch (e) { console.error("pass error:", e); }
     await sleep(intervalSec);
   }

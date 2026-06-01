@@ -730,6 +730,19 @@ const INBOX_KIND_LABEL = {
   // Ticket 0027: a fleet-wide pattern — the same failure signature
   // hitting N projects within 24h.
   fleet_correlation: "Fleet pattern",
+  // Ticket 0034: per-project shape drift — the project's last 24h
+  // diverges from its OWN 14-day baseline on one of three metrics
+  // (Bash share / Edit-Read ratio / median run cost).
+  self_drift: "Shape drift",
+};
+
+// Ticket 0034: human-readable copy for each drift metric. Used by the
+// inbox row + the detail view so the operator sees "Bash share 3.2x
+// normal" rather than the raw machine name.
+const DRIFT_METRIC_LABEL = {
+  bash_share: "Bash share",
+  edit_read_ratio: "Edit/Read ratio",
+  median_run_cost_usd: "Median run cost",
 };
 
 // Ticket 0027: defence-in-depth secret redaction at the renderer
@@ -779,8 +792,54 @@ function renderCorrelationItem(item) {
   </div>`;
 }
 
+// Ticket 0034: self_drift inbox row. Renders the headline copy
+// "<slug>: <metric> Nx normal since HH:MM" where N is current /
+// baseline_mean rounded to one decimal and HH:MM is derived from
+// `first_seen_at` in the operator's local timezone. The "investigate"
+// action navigates to #/project/<slug>/drift (the detail view). Per
+// LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary", every operator-visible string passes through redactSecrets
+// before any HTML interpolation.
+function renderDriftInboxRow(item) {
+  const payload = item.payload || {};
+  const metric = String(payload.metric || item.payload.id || "");
+  const slug = String(item.project_slug || "");
+  const safeSlug = esc(redactSecrets(slug));
+  const safeMetric = esc(redactSecrets(metric));
+  const metricLabel = esc(redactSecrets(DRIFT_METRIC_LABEL[metric] || metric));
+  const baselineMean = Number(payload.baseline_mean) || 0;
+  const current = Number(payload.current) || 0;
+  const ratio = baselineMean > 0 ? current / baselineMean : 0;
+  const nx = ratio > 0 ? ratio.toFixed(1) + "x" : "—";
+  let sinceText = "";
+  if (payload.first_seen_at) {
+    try {
+      const d = new Date(payload.first_seen_at);
+      if (!isNaN(d.getTime())) {
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        sinceText = ` since ${hh}:${mm}`;
+      }
+    } catch { /* leave sinceText empty */ }
+  }
+  const headline = `${safeSlug}: ${metricLabel} ${esc(nx)} normal${esc(sinceText)}`;
+  const route = "#/project/" + encodeURIComponent(slug) + "/drift";
+  return `<div class="inbox-row" data-inbox-row data-kind="self_drift" data-slug="${safeSlug}" data-payload-id="${safeMetric}">
+    <div class="inbox-meta">
+      <span class="inbox-kind">${esc(INBOX_KIND_LABEL.self_drift)}</span>
+      <span class="dim">· ${safeSlug} · ${safeMetric} · ${esc(ago(payload.first_seen_at || new Date(Date.now() - (item.age_seconds || 0) * 1000).toISOString()))}</span>
+    </div>
+    <div class="inbox-title">${headline}</div>
+    <div class="inbox-actions">
+      <a class="btn sm" href="${esc(route)}" data-stop="1">Investigate</a>
+      <button class="btn sm" data-act="inbox-dismiss" data-kind="self_drift" data-slug="${safeSlug}" data-payload-id="${safeMetric}">Dismiss</button>
+    </div>
+  </div>`;
+}
+
 function inboxRow(item, opts) {
   if (item.kind === "fleet_correlation") return renderCorrelationItem(item);
+  if (item.kind === "self_drift") return renderDriftInboxRow(item);
   const quieted = !!(opts && opts.quieted);
   const lbl = INBOX_KIND_LABEL[item.kind] || item.kind;
   const slug = esc(item.project_slug);
@@ -1930,6 +1989,132 @@ async function correlation(signature) {
     </div>`;
 }
 
+// ---- Self-baseline drift detail view (ticket 0034) -----------------------
+// /project/<slug>/drift renders three inline-SVG rows — one per metric —
+// each showing the trailing-14d baseline mean ± 1-sigma band as a grey
+// <rect> with the current value as an orange <circle> marker overlaid.
+// When the current marker sits OUTSIDE the band the metric is drifted;
+// when it sits inside the band the metric is healthy. Per LESSONS §
+// "defence-in-depth secret redaction at the renderer boundary", every
+// operator-visible string passes through redactSecrets before
+// interpolation. The detail container carries data-testid="project-
+// drift" per the cross-fleet stable-hook pattern.
+
+const DRIFT_METRIC_FORMATTERS = {
+  bash_share: (v) => (v == null ? "—" : (v * 100).toFixed(1) + "%"),
+  edit_read_ratio: (v) => (v == null ? "—" : v.toFixed(2)),
+  median_run_cost_usd: (v) => (v == null ? "—" : "$" + v.toFixed(2)),
+};
+
+const DRIFT_METRICS_ORDER = [
+  "bash_share", "edit_read_ratio", "median_run_cost_usd",
+];
+
+/** Render one inline SVG band+marker for a single metric. The band
+ *  spans [mean - sigma, mean + sigma] of an axis that runs from 0 to
+ *  `domainMax` (chosen so the current value + 1 sigma always sit
+ *  inside the viewBox). The current value renders as an orange
+ *  <circle>. The desktop dims are 400x40; CSS scales them down to
+ *  280x32 on phones (handled in style.css). */
+function renderDriftSvg(entry, opts) {
+  const desktopWidth = 400, desktopHeight = 40;
+  const padX = 8;
+  const mean = Number(entry.baseline_mean) || 0;
+  const sigma = Number(entry.baseline_sigma) || 0;
+  const current = Number(entry.current) || 0;
+  // Domain: widen so the current marker is always inside the viewBox.
+  const upperHint = Math.max(mean + 3 * sigma, current * 1.15, mean * 1.5, 0.01);
+  const domainMax = upperHint;
+  const scale = (v) => padX + (Math.max(0, Math.min(v, domainMax)) / domainMax) * (desktopWidth - 2 * padX);
+  const bandLeft = scale(Math.max(0, mean - sigma));
+  const bandRight = scale(mean + sigma);
+  const meanX = scale(mean);
+  const currentX = scale(current);
+  const drifted = !!(opts && opts.drifted);
+  const markerColor = drifted ? "var(--drift-marker, var(--warn))" : "var(--drift-marker-ok, var(--good))";
+  return `<svg class="drift-svg" viewBox="0 0 ${desktopWidth} ${desktopHeight}" preserveAspectRatio="none" aria-hidden="true">
+    <rect class="drift-band" x="${bandLeft.toFixed(1)}" y="14" width="${(bandRight - bandLeft).toFixed(1)}" height="12" rx="2"></rect>
+    <rect class="drift-mean" x="${(meanX - 0.5).toFixed(1)}" y="12" width="1.5" height="16"></rect>
+    <circle class="drift-current" cx="${currentX.toFixed(1)}" cy="20" r="5" fill="${markerColor}"></circle>
+  </svg>`;
+}
+
+/** Render one row for a metric — label + numeric summary + inline SVG.
+ *  `entry` is either an active DriftEntry (when the metric is drifted)
+ *  OR a synthesised "not drifted" row (when the metric is healthy).
+ *  The "drifted" CSS class flips the marker colour from green to amber.
+ */
+function renderDriftRow(metric, entry, drifted) {
+  const label = esc(redactSecrets(DRIFT_METRIC_LABEL[metric] || metric));
+  const fmt = DRIFT_METRIC_FORMATTERS[metric] || ((v) => String(v));
+  const meanStr = esc(fmt(entry.baseline_mean));
+  const sigmaStr = esc(fmt(entry.baseline_sigma));
+  const currentStr = esc(fmt(entry.current));
+  const sigmasText = entry.sigmas != null
+    ? (entry.sigmas >= 0 ? "+" : "") + Number(entry.sigmas).toFixed(2) + "σ"
+    : "—";
+  const verdict = drifted ? "DRIFTED" : "within band";
+  return `<div class="drift-row ${drifted ? "drifted" : ""}" data-metric="${esc(metric)}">
+    <div class="drift-row-head">
+      <span class="drift-label">${label}</span>
+      <span class="drift-verdict dim">${esc(verdict)} · ${esc(sigmasText)}</span>
+    </div>
+    <div class="drift-row-stats dim">baseline ${meanStr} ± ${sigmaStr} · current ${currentStr}</div>
+    ${renderDriftSvg(entry, { drifted })}
+  </div>`;
+}
+
+async function projectDrift(slug) {
+  summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
+  const safeSlug = esc(redactSecrets(String(slug || "")));
+  let data;
+  try {
+    data = await get("/api/projects/" + encodeURIComponent(slug) + "/drift");
+  } catch (e) {
+    app.innerHTML = `<div class="loading">couldn't load drift detail.<br><span class="dim">${esc(e.message)}</span></div>`;
+    return;
+  }
+  const detected = (data && data.detected) || [];
+  const driftedByMetric = new Map();
+  for (const d of detected) driftedByMetric.set(d.metric, d);
+  // Empty state: the operator clicked through but the project has no
+  // active drift. Render a small "no drift detected" card.
+  if (detected.length === 0) {
+    app.innerHTML = `<a class="back" href="#/">‹ all projects</a>
+      <div class="card-head"><span class="pname">${safeSlug}</span></div>
+      <div class="project-drift" data-testid="project-drift">
+        <div class="eyebrow">Shape drift</div>
+        <div class="drift-empty dim">No drift detected — this project's last 24h shape sits inside its 14-day baseline on all three metrics.</div>
+      </div>`;
+    return;
+  }
+  const rowsHtml = DRIFT_METRICS_ORDER.map((m) => {
+    const drifted = driftedByMetric.get(m);
+    if (drifted) return renderDriftRow(m, drifted, true);
+    // Healthy metric: synthesise a row from "no detection" by emitting
+    // a zero-sigma entry so the SVG still renders for visual scan.
+    return renderDriftRow(m, {
+      metric: m, baseline_mean: 0, baseline_sigma: 0, current: 0, sigmas: 0,
+    }, false);
+  }).join("");
+  // Contributing runs for any drifted metric, shown as compact chips
+  // below the rows. The route navigates into the existing run-detail
+  // page so the operator can read the transcript.
+  const contribChips = detected.flatMap((d) => {
+    return (d.contributing_runs || []).map((rid) =>
+      `<a class="chip" href="#/r/${encodeURIComponent(String(rid))}" data-stop="1">run ${esc(String(rid))}</a>`,
+    );
+  }).join("");
+  app.innerHTML = `<a class="back" href="#/">‹ all projects</a>
+    <div class="card-head"><span class="pname">${safeSlug}</span></div>
+    <div class="project-drift" data-testid="project-drift">
+      <div class="eyebrow">Shape drift</div>
+      <div class="drift-rows">${rowsHtml}</div>
+      ${contribChips ? `<div class="eyebrow">Top contributors</div><div class="drift-contributors">${contribChips}</div>` : ""}
+    </div>`;
+  foot.textContent = "";
+}
+
 // ---- Backlog ticket detail view (ticket 0018) ----------------------------
 // One-shot view that renders the "Shipped as PR #N · K commits · +X / -Y
 // across Z files" panel from the new /api/backlog/:id/ship-report
@@ -1989,6 +2174,12 @@ async function route() {
       const s = path.slice(2);
       await project(s, params);
       timer = setInterval(() => project(s, params).catch(() => {}), 5000);
+    } else if (path.startsWith("project/") && path.endsWith("/drift")) {
+      // Ticket 0034: self-baseline drift detail view. One-shot render
+      // — the operator is reading static contributors, not monitoring
+      // a live process; the inbox refresh on home is the live surface.
+      const s = path.slice("project/".length, path.length - "/drift".length);
+      await projectDrift(decodeURIComponent(s));
     } else if (path.startsWith("r/")) {
       await run(path.slice(2));
     } else if (path.startsWith("t/")) {
