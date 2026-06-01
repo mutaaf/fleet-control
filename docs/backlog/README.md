@@ -19,7 +19,7 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
-| 0032 | Welcome banner prints LAN URL + ASCII-QR so the phone is paired in 60 seconds | P1 | groomed | infra |
+| 0032 | Welcome banner prints LAN URL + ASCII-QR so the phone is paired in 60 seconds | P1 | in-progress | infra |
 | 0033 | Yesterday at a glance - single morning card recaps shipped, spent, broken | P1 | groomed | portal |
 | 0034 | Self-baseline drift detector - flag when a project diverges from its OWN 14-day shape | P2 | groomed | observability |
 | 0029 | PWA installable portal with offline shell and stale-snapshot banner | P1 | shipped | portal |

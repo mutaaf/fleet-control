@@ -1,7 +1,7 @@
 ---
 id: 0032
 title: Welcome banner prints LAN URL + ASCII-QR so the phone is paired in 60 seconds
-status: groomed
+status: in-progress
 priority: P1
 area: infra
 created: 2026-06-01
@@ -280,7 +280,55 @@ Each box maps 1:1 to a test scenario.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD - branch `feat/0032-...` opened
-- YYYY-MM-DD - failing test added in `tests/...`
-- YYYY-MM-DD - PR #N opened, CI [state]
-- YYYY-MM-DD - merged to main
+- 2026-06-01 - branch `feat/0032-welcome-qr-pairing` opened, status -> in-progress
+- 2026-06-01 - QR encoder (`src/qr.ts`) ships V1-L alphanumeric with
+  hand-rolled GF(256) Reed-Solomon, mask selection by penalty score,
+  and an ASCII renderer. Canonical fixture for HELLO WORLD committed
+  at `tests/fixtures/qr-vector.txt`. The implementation is ~280 lines
+  of pure functions; no new runtime deps.
+- 2026-06-01 - `src/lan.ts` discovers the first non-loopback IPv4 via
+  `os.networkInterfaces()`; deterministic on the lowest IP. Returns
+  null for explicit loopback bind so a `127.0.0.1` operator sees no
+  QR — matches the ticket's loopback-silent rule.
+- 2026-06-01 - `src/pair.ts` adds `mintPairToken` /
+  `consumePairToken` / `sweepExpiredPairTokens` / `rateLimitAllow` /
+  `_resetPairCacheForTests`. Tokens are 11-char `XX-XX-XX-XX` in an
+  unambiguous-alphanumeric alphabet; 90-second TTL; single-use via a
+  DELETE in consume. Rate-limit: 10 attempts/min/IP, in-process Map.
+- 2026-06-01 - `src/db.ts` SCHEMA appended with `pair_token` table
+  (token PK, admin_token, expires_at, created_at) + an expires_at
+  index. Identifiers stay plain words per LESSONS § "no backticks
+  inside template-literal SQL strings".
+- 2026-06-01 - `src/server.ts` adds GET `/pair?t=<token>` AND GET
+  `/P/<TOKEN>` (the uppercase path form the QR encodes, since V1-L
+  alphanumeric mode cannot carry `?`/`=`). Success: 302 to
+  `/?pair_just_consumed=1` with the x-fleet-token cookie. Failure:
+  200 HTML page explaining how to re-mint. Rate-limit fires BEFORE
+  the token lookup so an attacker can't probe token validity at
+  >10/min.
+- 2026-06-01 - `src/welcome.ts` gains optional `pairSection` opt.
+  Absent: byte-identical to pre-0032 output (every existing 0024
+  test still passes). Present: appends the "Scan from your phone to
+  pair (90s):" headline + URL + ASCII QR block. When `qrText` is
+  too long for V1-L the renderer falls back to a "QR unavailable"
+  line so the welcome never crashes serve.
+- 2026-06-01 - `bin/fleetctl.ts` discovers the LAN URL via
+  `discoverLanUrl`, mints a pair token, and threads the
+  `pairSection` opt into firstRun(). `--no-pair` flag suppresses
+  the section. `quietBanner: true` preserved per LESSONS § "when a
+  CLI subcommand adds boot output, take ownership of the listen
+  banner".
+- 2026-06-01 - `web/app.js` adds a `beforeinstallprompt` handler +
+  `maybeRenderPairInstallHint()` that surfaces an inline banner
+  with `data-testid="pair-install-hint"` when the operator just
+  paired AND a deferred install prompt is pending. "Not now"
+  dismissal persists in localStorage so the banner doesn't re-
+  appear on reload. Defence-in-depth secret redaction at the
+  renderer boundary per LESSONS.
+- 2026-06-01 - tests: `tests/qr.test.ts` (15 cases, fixture lock +
+  structural invariants), `tests/pair.test.ts` (22 cases, lan
+  discovery + mint/consume + schema + /pair route + rate-limit +
+  perf gated on PERF=1), `tests/welcome-pair.test.ts` (13 cases,
+  welcome render + CLI subprocess + PWA install hint). Zero new
+  runtime deps; full local gate (npm ci, tsc --noEmit,
+  check-backlog.mjs) green.

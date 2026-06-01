@@ -22,6 +22,7 @@
 //     existing FLEET_DB_PATH env-seam pattern (LESSONS.md § CLI
 //     subprocess tests need a FLEET_DB_PATH env seam).
 import { join } from "node:path";
+import { renderQrAscii } from "./qr.ts";
 
 // ────────────────────────────────────────────────────────────────────
 // Public types
@@ -53,6 +54,23 @@ export interface WelcomeOpts {
   /** Absolute path of the `.welcome-seen` sentinel file — surfaced in
    *  the footer so the operator can `touch` it themselves. */
   sentinelPath: string;
+  /** Optional phone-pairing section (ticket 0032). When present, the
+   *  rendered welcome appends a "Scan from your phone to pair (90s):"
+   *  block between the existing line 5 and the "Hide this with:"
+   *  footer. When absent the welcome output is byte-identical to
+   *  pre-0032 — every existing test that doesn't pass this opt
+   *  continues to see the same string. `qrText` is the upper-case
+   *  alphanumeric form the QR encoder will accept (typically a path-
+   *  style URL); `url` is the human-readable form the operator can
+   *  type if scanning fails. The renderer trusts both values to be
+   *  safe to print (no admin-token interpolation) but passes the
+   *  final string through redactSecrets as a defence-in-depth
+   *  backstop per LESSONS § "defence-in-depth secret redaction at
+   *  the renderer boundary". */
+  pairSection?: {
+    url: string;
+    qrText: string;
+  };
 }
 
 /** Injected filesystem surface. Production wires this to `node:fs`
@@ -153,6 +171,33 @@ export function renderWelcome(opts: WelcomeOpts): string {
   lines.push(`  3. ${projectsLine(opts.projects)}`);
   lines.push(`  4. Verify with:          ${paint(opts.color, C.cyan, "fleetctl doctor")}`);
   lines.push(`  5. Watch the live tail:  ${paint(opts.color, C.cyan, "fleetctl tail --follow")}`);
+  // Ticket 0032 — phone-pairing section. Inserted BETWEEN step 5 and the
+  // hide-hint footer so the operator's eye lands on the scan target
+  // immediately after the "Open the portal" instruction. When the opt
+  // is absent (loopback bind, `--no-pair`, LAN unreachable) we emit
+  // nothing here — the welcome is byte-identical to the pre-0032
+  // output (the welcome AC-suite in tests/welcome.test.ts continues to
+  // pass without modification).
+  if (opts.pairSection) {
+    lines.push("");
+    lines.push(paint(opts.color, C.dim, "Scan from your phone to pair (90s):"));
+    lines.push(`  ${paint(opts.color, C.cyan, opts.pairSection.url)}`);
+    // The QR encoder may throw if the qrText is too long or contains
+    // characters outside the alphanumeric alphabet; the welcome MUST
+    // NOT crash in that case (it's a banner, not a control path), so
+    // we swallow the error and fall back to "QR unavailable" on the
+    // next line. The CLI is expected to pre-validate qrText with the
+    // same encoder before passing it through; this is belt-and-braces.
+    let qrBlock = "";
+    try {
+      qrBlock = renderQrAscii(opts.pairSection.qrText, { cellWidth: 2 });
+    } catch (e) {
+      const msg = e && typeof e === "object" && "message" in e
+        ? String((e as { message: unknown }).message) : String(e);
+      qrBlock = `  (QR unavailable: ${msg})`;
+    }
+    for (const qrLine of qrBlock.split("\n")) lines.push(qrLine);
+  }
   lines.push("");
   lines.push(paint(opts.color, C.dim, `Hide this with: touch ${opts.sentinelPath}`));
   lines.push("");

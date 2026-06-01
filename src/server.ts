@@ -28,6 +28,7 @@ import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
   type Scope, type TokenRecord,
 } from "./auth.ts";
+import { consumePairToken, rateLimitAllow, sweepExpiredPairTokens } from "./pair.ts";
 
 const CONFIG_FILE = join(process.cwd(), "fleet-control.config.json");
 
@@ -476,6 +477,74 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           "access-control-allow-origin": "*",
         });
         return res.end(body);
+      }
+      // Ticket 0032: phone-pairing route. NOT under `/api/` so it
+      // never collides with the JSON API surface and doesn't trip the
+      // existing auth middleware (the token IS the auth). Rate-limited
+      // at 10 attempts / minute per source IP so an attacker on the
+      // LAN can't brute-force the 12-char token inside its 90-second
+      // window. The route is a simple GET because the QR-scan target
+      // becomes a browser navigation, which is always a GET — we
+      // accept that this leaks the token into Referer for any page the
+      // operator subsequently navigates to, but the token is single-
+      // use and already-consumed by the time the redirect runs.
+      // Two URL shapes accepted: `/pair?t=<token>` (human-typeable) and
+      // `/P/<TOKEN>` (uppercase path-style, alphanumeric-friendly so a
+      // V1-L QR can encode it under the 25-char capacity). Both are
+      // GET-only; both consume the same one-shot token row.
+      const pathPairMatch = path.match(/^\/P\/([0-9A-Z-]+)$/);
+      if ((path === "/pair" || pathPairMatch) && req.method === "GET") {
+        const ip = String(req.socket?.remoteAddress ?? "unknown");
+        if (!rateLimitAllow(ip)) {
+          res.writeHead(429, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("too many attempts");
+        }
+        // Opportunistic sweep so the table doesn't accumulate expired
+        // rows after many serve restarts.
+        try { sweepExpiredPairTokens(db); } catch { /* table missing on fresh boot; ignore */ }
+        // Path-style URLs carry the token in upper-case (QR
+        // alphanumeric constraint) but the stored token is whatever
+        // case mintPairToken produced (also upper) — we accept either
+        // form without lower-casing so a token that ever included
+        // lowercase via a future change continues to work.
+        const token = pathPairMatch
+          ? pathPairMatch[1]
+          : String(url.searchParams.get("t") ?? "");
+        const r = consumePairToken(db, token);
+        if (!r.ok || !r.admin_token) {
+          // Expired / unknown / malformed — render a small HTML page
+          // explaining how to re-mint. No cookie set. 200 because the
+          // page itself is intentional content; a 404 would render as
+          // browser chrome noise on the phone.
+          const reason = r.reason ?? "unknown";
+          res.writeHead(200, {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+          });
+          return res.end(
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+            + "<title>Pair link expired</title>"
+            + "<style>body{font:16px/1.5 -apple-system,system-ui,sans-serif;"
+            + "padding:24px;color:#1a1a1a;background:#fafafa}"
+            + "h1{font-size:22px;margin:0 0 12px}p{margin:0 0 12px}"
+            + "code{background:#eee;padding:2px 6px;border-radius:4px}</style></head>"
+            + `<body><h1>Pair link expired</h1>`
+            + `<p>This pairing link (<code>${reason}</code>) is no longer valid.</p>`
+            + `<p>Re-run <code>fleetctl serve</code> on the laptop to generate a new one.</p>`
+            + `</body></html>`,
+          );
+        }
+        // Success: set the x-fleet-token cookie carrying the admin
+        // token plaintext, then 302 to the SPA root with a
+        // `pair_just_consumed=1` query so the PWA install hint can
+        // surface immediately.
+        res.writeHead(302, {
+          "location": "/?pair_just_consumed=1",
+          "set-cookie": `x-fleet-token=${encodeURIComponent(r.admin_token)}; Path=/; HttpOnly; SameSite=Lax`,
+          "cache-control": "no-store",
+        });
+        return res.end();
       }
       // Ticket 0013: read-only shareable fleet snapshot.
       // GET /share/<token> renders an HTML page directly from the

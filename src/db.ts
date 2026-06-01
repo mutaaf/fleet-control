@@ -237,6 +237,21 @@ CREATE TABLE IF NOT EXISTS ticket_commit_link (
   PRIMARY KEY (project_slug, commit_sha, ticket_id)
 );
 CREATE INDEX IF NOT EXISTS ticket_commit_link_ticket ON ticket_commit_link(ticket_id);
+
+-- Phone-pairing one-shot tokens (ticket 0032). One row per minted pair
+-- token; the QR-scan flow consumes the row, sets an x-fleet-token
+-- cookie carrying the admin_token plaintext, and 302s to /. Single-
+-- use enforced at the application layer (mint INSERTs, consume DELETEs);
+-- 90-second TTL enforced via expires_at + a sweep on consume. Per
+-- LESSONS § no backticks inside template-literal SQL strings, all
+-- identifiers stay plain words inside this SCHEMA template.
+CREATE TABLE IF NOT EXISTS pair_token (
+  token        TEXT PRIMARY KEY,
+  admin_token  TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pair_token_expires ON pair_token(expires_at);
 `;
 
 export type DB = DatabaseSync;

@@ -18,6 +18,8 @@ import { doAction } from "../src/control.ts";
 import { defaultDeps, runDoctor, renderHuman, renderJson, exitCodeFor } from "../src/doctor.ts";
 import { loadDemoFixture, DEMO_BANNER, DEMO_DEFAULT_PORT } from "../src/demo/fixture.ts";
 import { firstRun, sentinelPathFor, type WelcomeOpts, type WelcomeDeps } from "../src/welcome.ts";
+import { discoverLanUrl } from "../src/lan.ts";
+import { mintPairToken } from "../src/pair.ts";
 import { mkdirSync, writeFileSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync as fsWriteFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -342,12 +344,18 @@ switch (cmd) {
     // callback stays a thin trigger.
     const forceWelcome = argv.includes("--welcome");
     const suppressWelcome = argv.includes("--no-welcome");
+    // Ticket 0032 — `--no-pair` suppresses the pair section even when
+    // the LAN URL is discoverable. Useful for headless boots and demos
+    // where the QR would clutter logs.
+    const suppressPair = argv.includes("--no-pair");
     const sentinelPath = sentinelPathFor(process.env);
-    // Re-open a short-lived handle ONLY to read project slugs for step 3.
-    // Using the same DB the server is about to open is fine because
-    // sqlite serialises writers and this is a read-only SELECT.
+    // Re-open a short-lived handle ONLY to read project slugs for step 3
+    // and to mint the pair token if we'll be showing a QR. Using the
+    // same DB the server is about to open is fine because sqlite
+    // serialises writers and this is a quick SELECT + INSERT.
     let projectSlugs: string[] = [];
     let cfgAdminToken = "";
+    let pairSection: { url: string; qrText: string } | undefined;
     try {
       const peekDb = openDb(serveCfg.dbPath);
       try {
@@ -362,6 +370,38 @@ switch (cmd) {
         if (typeof raw.adminToken === "string") cfgAdminToken = raw.adminToken;
       }
     } catch { /* config absent — auth.ts will mint one on first serve */ }
+    // Pair-section wiring. Only fires when:
+    //   * --no-pair was NOT passed, AND
+    //   * discoverLanUrl returns a non-null URL (operator bound LAN-side
+    //     AND a non-loopback IPv4 interface is discoverable), AND
+    //   * we have a plaintext admin token to mint the pair against
+    //     (fresh installs without a config-file token skip the QR; the
+    //     operator pairs manually until they re-run serve).
+    if (!suppressPair) {
+      try {
+        const lanUrl = discoverLanUrl(host, port);
+        if (lanUrl && cfgAdminToken) {
+          const mintDb = openDb(serveCfg.dbPath);
+          try {
+            const mint = mintPairToken(mintDb, cfgAdminToken);
+            // Human-readable URL keeps the `?t=` form so the operator
+            // can type it if scanning fails. The QR-encoded variant
+            // uses path-style routing (`/P/<TOKEN>`) and uppercase
+            // alphanumeric so it stays inside V1-L's 25-char capacity
+            // — the server's /pair route accepts both forms via the
+            // same query parser (the SPA's URL after redirect is the
+            // `?t=` form).
+            const url = `${lanUrl}/pair?t=${mint.token}`;
+            // Uppercase LAN URL plus path-style token. We accept that
+            // for many home IPs (e.g. 192.168.x.y plus port 7070) the
+            // QR text will exceed 25 chars; in that case the QR render
+            // throws and the welcome falls back to "QR unavailable".
+            const qrText = `${lanUrl.toUpperCase()}/P/${mint.token}`;
+            pairSection = { url, qrText };
+          } finally { mintDb.close(); }
+        }
+      } catch { /* never let a pair-mint failure crash serve */ }
+    }
     const welcomeOpts: WelcomeOpts = {
       token: cfgAdminToken,
       host,
@@ -371,6 +411,7 @@ switch (cmd) {
       color: process.stdout.isTTY === true,
       projects: projectSlugs,
       sentinelPath,
+      pairSection,
     };
     const welcomeDeps: WelcomeDeps = {
       fileExists: (p) => { try { return existsSync(p); } catch { return false; } },
