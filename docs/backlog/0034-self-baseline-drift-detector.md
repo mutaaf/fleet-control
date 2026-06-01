@@ -1,7 +1,7 @@
 ---
 id: 0034
 title: Self-baseline drift detector - flag when a project diverges from its OWN 14-day shape
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-01
@@ -308,7 +308,4 @@ Each box maps 1:1 to a test scenario.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD - branch `feat/0034-...` opened
-- YYYY-MM-DD - failing test added in `tests/...`
-- YYYY-MM-DD - PR #N opened, CI [state]
-- YYYY-MM-DD - merged to main
+- 2026-06-01 - branch `feat/0034-self-baseline-drift-detector` opened
