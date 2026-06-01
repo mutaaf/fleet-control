@@ -14,6 +14,7 @@ import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDa
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
+import { projectDriftReport } from "./drift.ts";
 import { doAction } from "./control.ts";
 import { diskUsage } from "./infra.ts";
 import { evalAlerts } from "./alerts.ts";
@@ -435,6 +436,19 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           const pid = projectIdBySlug(db, bdm[1]);
           if (pid == null) return json(res, { error: "not found" }, 404);
           return json(res, projectBurndown(db, pid));
+        }
+        // Ticket 0034: self-baseline drift detector — per-project
+        // detail. Returns {detected, baseline_window, current_window,
+        // generated_at}. Read-scope (loopback bypasses); same posture
+        // as every other GET /api/projects/:slug/* route. Net-new —
+        // no existing JSON shape to preserve. The detector reads
+        // existing run_event / run / anomaly tables only; no schema
+        // migration needed.
+        const dfmDrift = path.match(/^\/api\/projects\/([\w-]+)\/drift$/);
+        if (dfmDrift) {
+          const pid = projectIdBySlug(db, dfmDrift[1]);
+          if (pid == null) return json(res, { error: "not found" }, 404);
+          return json(res, projectDriftReport(db, pid, new Date()));
         }
         // Ticket 0031: per-project tool-mix sparkline. Returns
         // {window, tools, total_invocations} — the stacked-bar

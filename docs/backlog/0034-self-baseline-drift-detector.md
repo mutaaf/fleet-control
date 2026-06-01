@@ -1,7 +1,7 @@
 ---
 id: 0034
 title: Self-baseline drift detector - flag when a project diverges from its OWN 14-day shape
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-01
@@ -308,7 +308,10 @@ Each box maps 1:1 to a test scenario.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD - branch `feat/0034-...` opened
-- YYYY-MM-DD - failing test added in `tests/...`
-- YYYY-MM-DD - PR #N opened, CI [state]
-- YYYY-MM-DD - merged to main
+- 2026-06-01 - branch `feat/0034-self-baseline-drift-detector` opened
+- 2026-06-01 - failing tests added in `tests/drift.test.ts`
+- 2026-06-01 - implementation landed: `src/drift.ts` (new) +
+  `src/inbox.ts`, `src/server.ts`, `src/daemon.ts`, `web/app.js`,
+  `web/style.css` wiring; all 16 active AC tests pass locally; full
+  local gate green (`npm ci && npx tsc --noEmit && node scripts/
+  check-backlog.mjs`).
