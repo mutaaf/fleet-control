@@ -560,6 +560,68 @@ async function fetchStreak() {
   try { return await get("/api/fleet/streak"); } catch { return null; }
 }
 
+// Ticket 0033: "Yesterday at a glance" morning card. One trailing-24h
+// summary above the inbox: shipped count, dollars spent today, open
+// anomalies, fleet streak, plus a single verdict line. Lazy-fetched
+// from /api/fleet/glance so the home payload stays small and the SW
+// cache (0029) can satisfy a phone refresh inside the 60s window.
+// Errors fall through silently — the card just disappears for that
+// render cycle and the rest of the home page still loads.
+async function fetchGlance() {
+  try { return await get("/api/fleet/glance"); } catch { return null; }
+}
+
+/** Skeleton block shown while /api/fleet/glance is in flight. Carries
+ *  `aria-busy="true"` so screen readers announce the loading state;
+ *  the pulsing animation flattens under
+ *  `prefers-reduced-motion: reduce` via the matching CSS rule. The
+ *  container has the same `data-testid` as the resolved card so the
+ *  phone tests' selector is stable across loading vs loaded. */
+function renderGlanceSkeleton() {
+  return `<div class="yesterday-glance yesterday-glance-skeleton" data-testid="yesterday-glance" aria-busy="true">
+    <div class="glance-title">Last 24 hours</div>
+    <div class="glance-stats">
+      <span class="glance-stat skeleton-bar" aria-hidden="true"></span>
+      <span class="glance-stat skeleton-bar" aria-hidden="true"></span>
+      <span class="glance-stat skeleton-bar" aria-hidden="true"></span>
+      <span class="glance-stat skeleton-bar" aria-hidden="true"></span>
+    </div>
+    <div class="glance-verdict skeleton-bar" aria-hidden="true"></div>
+  </div>`;
+}
+
+/** Render the loaded "Yesterday at a glance" card. Tapping anywhere
+ *  navigates to the weekly digest route (#/digest, per ticket 0012).
+ *  Per LESSONS § "defence-in-depth secret redaction at the renderer
+ *  boundary": verdict.project_slug + verdict.message pass through
+ *  redactSecrets before insertion so any future ingest regression
+ *  that smuggles a token-shaped substring into a project slug is
+ *  defanged at the render boundary. */
+function renderYesterdayGlance(data) {
+  if (!data) return "";
+  const shipped = Number(data.shipped_count || 0);
+  const spent = Number(data.spent_usd || 0);
+  const anomalies = Number(data.anomalies_open || 0);
+  const streak = Number(data.streak_days || 0);
+  const v = data.verdict || { kind: "all_quiet", message: "" };
+  // Defence-in-depth: redact tokens before any HTML interpolation.
+  const safeMessage = esc(redactSecrets(String(v.message || "")));
+  const safeKind = esc(String(v.kind || ""));
+  // Tap-anywhere navigates to the digest (the user story's
+  // "[tap for digest]" affordance). Internal hash route — the
+  // existing routing already handles it.
+  return `<a class="yesterday-glance" data-testid="yesterday-glance" href="#/digest" aria-label="Last 24 hours — tap for digest">
+    <div class="glance-title">Last 24 hours <span class="glance-tap-hint dim">tap for digest</span></div>
+    <div class="glance-stats">
+      <span class="glance-stat"><b>${shipped}</b> PR${shipped === 1 ? "" : "s"} shipped</span>
+      <span class="glance-stat"><b>${usd(spent)}</b> spent</span>
+      <span class="glance-stat"><b>${anomalies}</b> anomal${anomalies === 1 ? "y" : "ies"}</span>
+      <span class="glance-stat"><b>${streak}</b> day${streak === 1 ? "" : "s"} streak</span>
+    </div>
+    <div class="glance-verdict glance-verdict-${safeKind}">${safeMessage}</div>
+  </a>`;
+}
+
 const STREAK_BAND_TITLE = {
   empty: "no activity",
   low: "1 merged",
@@ -884,11 +946,13 @@ function digestBanner(d) {
 
 async function home() {
   // Fan out /api/fleet + /api/digest/week + /api/fleet/inbox +
-  // /api/fleet/streak so the round-trips don't serialize. Streak
-  // banner renders ABOVE the inbox (ticket 0026) — the morning
-  // "is the fleet working?" hook before "what needs me?".
-  const [data, digestData, inboxData, streakData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(),
+  // /api/fleet/streak + /api/fleet/glance so the round-trips don't
+  // serialize. Streak banner renders above the inbox (ticket 0026);
+  // the "Yesterday at a glance" card (ticket 0033) renders ABOVE the
+  // inbox AND the streak — it's the first thing the operator sees
+  // on a morning open. Errors fall through silently per the helper.
+  const [data, digestData, inboxData, streakData, glanceData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(),
   ]);
   const alerts = data.alerts || [];
   const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
@@ -897,6 +961,7 @@ async function home() {
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
     digestBanner(digestData) +
+    renderYesterdayGlance(glanceData) +
     renderStreak(streakData) +
     renderInbox(inboxData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +

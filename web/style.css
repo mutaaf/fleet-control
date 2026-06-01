@@ -569,3 +569,98 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .project-tool-mix { font-size: 11px; }
   .tool-mix-legend { gap: 4px 10px; }
 }
+
+/* Ticket 0033: "Yesterday at a glance" morning card.
+ * Mobile-first: stats wrap 2x2 on phones (375px viewport),
+ * single row at >=600px (the 0011 mobile breakpoint convention).
+ * Reuses existing palette tokens (--panel / --line / --dim /
+ * --accent / --warn / --bad) — no new variables. */
+.yesterday-glance {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, background .15s;
+}
+.yesterday-glance:hover { border-color: #3a3b34; background: var(--panel2); }
+.glance-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.glance-tap-hint {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: none;
+}
+.glance-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.glance-stat { color: var(--dim); white-space: nowrap; }
+.glance-stat b { color: var(--ink); font-weight: 600; }
+.glance-verdict {
+  font-size: 13.5px;
+  color: var(--ink);
+  line-height: 1.4;
+}
+.glance-verdict-band_shift_red { color: var(--bad); }
+.glance-verdict-band_shift_amber { color: var(--warn); }
+.glance-verdict-budget_threshold { color: var(--warn); }
+.glance-verdict-fleet_correlation { color: var(--bad); }
+.glance-verdict-first_ship { color: var(--good); }
+.glance-verdict-all_quiet { color: var(--dim); }
+
+/* Skeleton state: 4 bars stacked 2x2 + a verdict bar.
+ * The pulsing animation gives the operator a "data is on its way"
+ * cue; CSS-only, no JS. */
+.yesterday-glance-skeleton .glance-stat,
+.yesterday-glance-skeleton .glance-verdict {
+  display: block;
+  background: var(--panel2);
+  border-radius: 2px;
+  height: 14px;
+  min-width: 80px;
+  animation: glance-skeleton-pulse 1.4s ease-in-out infinite;
+}
+.yesterday-glance-skeleton .glance-verdict { height: 16px; min-width: 60%; }
+.skeleton-bar { /* alias for the bar class used in renderGlanceSkeleton */ }
+@keyframes glance-skeleton-pulse {
+  0%, 100% { opacity: .55; }
+  50% { opacity: .9; }
+}
+
+/* Reduced-motion accessibility: flat grey, no pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .yesterday-glance-skeleton .glance-stat,
+  .yesterday-glance-skeleton .glance-verdict {
+    animation: none;
+    background: var(--panel2);
+    opacity: .7;
+  }
+}
+
+/* Phone-first → desktop upgrade. At >=600px the four stats live on a
+ * single row per the AC (0011 convention). */
+@media (min-width: 600px) {
+  .yesterday-glance .glance-stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}

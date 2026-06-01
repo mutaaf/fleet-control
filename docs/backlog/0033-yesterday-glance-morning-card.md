@@ -1,7 +1,7 @@
 ---
 id: 0033
 title: Yesterday at a glance - single morning card recaps shipped, spent, broken
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-01
@@ -269,7 +269,4 @@ Each box maps 1:1 to a test scenario.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD - branch `feat/0033-...` opened
-- YYYY-MM-DD - failing test added in `tests/...`
-- YYYY-MM-DD - PR #N opened, CI [state]
-- YYYY-MM-DD - merged to main
+- 2026-06-01 - branch `feat/0033-yesterday-glance` opened
