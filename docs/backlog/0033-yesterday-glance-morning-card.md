@@ -1,7 +1,7 @@
 ---
 id: 0033
 title: Yesterday at a glance - single morning card recaps shipped, spent, broken
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-01
@@ -270,3 +270,6 @@ Each box maps 1:1 to a test scenario.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-01 - branch `feat/0033-yesterday-glance` opened
+- 2026-06-01 - failing test added in `tests/glance.test.ts`
+- 2026-06-01 - PR #79 opened, CI green (typecheck + validate)
+- 2026-06-01 - merged to main via auto-merge squash

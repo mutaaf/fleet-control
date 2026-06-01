@@ -20,7 +20,7 @@ proposes new ones, `review` grades them.
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
 | 0032 | Welcome banner prints LAN URL + ASCII-QR so the phone is paired in 60 seconds | P1 | shipped | infra |
-| 0033 | Yesterday at a glance - single morning card recaps shipped, spent, broken | P1 | in-progress | portal |
+| 0033 | Yesterday at a glance - single morning card recaps shipped, spent, broken | P1 | shipped | portal |
 | 0034 | Self-baseline drift detector - flag when a project diverges from its OWN 14-day shape | P2 | groomed | observability |
 | 0029 | PWA installable portal with offline shell and stale-snapshot banner | P1 | shipped | portal |
 | 0030 | Quiet hours - sleep-window suppress non-critical pushes and demote inbox kinds | P1 | shipped | control |
