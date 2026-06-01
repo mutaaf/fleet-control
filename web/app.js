@@ -134,6 +134,108 @@ if (typeof window !== "undefined") {
   else window.addEventListener("load", registerServiceWorker);
 }
 
+// Ticket 0032: PWA install hint after a successful phone-pair. The
+// /pair route redirects to /?pair_just_consumed=1 on success; if the
+// browser has fired `beforeinstallprompt` (per ticket 0029) AND the
+// operator hasn't already dismissed the hint, we show a small inline
+// banner with the install CTA. Dismissal is persisted in localStorage
+// so the banner doesn't re-appear on reload.
+let _deferredInstallPrompt = null;
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeinstallprompt", (e) => {
+    // Stash the event so we can surface it on demand. Per the spec,
+    // calling prompt() must happen synchronously from a user gesture.
+    if (e && typeof e.preventDefault === "function") e.preventDefault();
+    _deferredInstallPrompt = e;
+    // Best-effort: if we already landed here via a successful pair
+    // consume, fire the banner immediately.
+    try { maybeRenderPairInstallHint(); } catch { /* swallow */ }
+  });
+  window.addEventListener("appinstalled", () => {
+    _deferredInstallPrompt = null;
+    const b = document.querySelector('[data-testid="pair-install-hint"]');
+    if (b && b.parentNode) b.parentNode.removeChild(b);
+  });
+}
+
+/** Detect a `pair_just_consumed=1` query param. We read from window.location
+ *  rather than threading a router because the SPA is hash-routed — the query
+ *  param sits on the document URL alongside the hash and persists across
+ *  hash navigations until the operator explicitly drops it. */
+function pairJustConsumed() {
+  if (typeof window === "undefined" || !window.location) return false;
+  const search = window.location.search || "";
+  return /(?:^|[?&])pair_just_consumed=1(?:&|$)/.test(search);
+}
+
+/** Render the PWA install hint banner if all preconditions are met. The
+ *  banner carries `data-testid="pair-install-hint"` per the cross-fleet
+ *  pattern for stable test hooks. Idempotent: a second call while the
+ *  banner is up is a no-op. */
+function renderPairInstallHint() {
+  if (typeof document === "undefined") return;
+  const existing = document.querySelector('[data-testid="pair-install-hint"]');
+  if (existing) return;
+  // Defence-in-depth per LESSONS § "secret redaction at the renderer
+  // boundary": the banner body is a fixed string, but we route it
+  // through redactSecrets anyway so a future copy-tweak that splices
+  // in a server value (e.g. a project slug) can't leak a token.
+  const text = redactSecrets("Add to Home Screen to keep this one tap away");
+  const banner = document.createElement("div");
+  banner.className = "banner pair-install-hint";
+  banner.setAttribute("data-testid", "pair-install-hint");
+  banner.style.margin = "0 0 12px";
+  banner.innerHTML =
+    "<span>" + esc(text) + "</span>"
+    + " <button class=\"btn sm primary\" data-pair-install-accept>Install</button>"
+    + " <button class=\"btn sm\" data-pair-install-dismiss>Not now</button>";
+  banner.addEventListener("click", async (e) => {
+    const t = e.target;
+    if (!t) return;
+    if (t.matches && t.matches("[data-pair-install-accept]")) {
+      e.preventDefault();
+      try {
+        if (_deferredInstallPrompt && typeof _deferredInstallPrompt.prompt === "function") {
+          _deferredInstallPrompt.prompt();
+          // The result either way dismisses the hint — we don't re-show
+          // a banner on "dismissed" because the operator already saw it.
+          try { await _deferredInstallPrompt.userChoice; } catch { /* ignore */ }
+          _deferredInstallPrompt = null;
+        }
+      } catch { /* swallow */ }
+      dismissPairInstallHint(false);
+    } else if (t.matches && t.matches("[data-pair-install-dismiss]")) {
+      e.preventDefault();
+      dismissPairInstallHint(true);
+    }
+  });
+  if (app && app.parentNode) app.parentNode.insertBefore(banner, app);
+}
+
+/** Tear down the banner and (optionally) persist a dismissal so it
+ *  doesn't re-appear on reload. */
+function dismissPairInstallHint(persist) {
+  const b = document.querySelector('[data-testid="pair-install-hint"]');
+  if (b && b.parentNode) b.parentNode.removeChild(b);
+  if (persist) {
+    try { localStorage.setItem("pairInstallDismissed", "1"); } catch { /* private mode */ }
+  }
+}
+
+/** Guarded entry point: render IFF the operator just paired AND a
+ *  beforeinstallprompt is pending AND the operator hasn't permanently
+ *  dismissed the hint. Called both from beforeinstallprompt (in case
+ *  the SPA already loaded with the pair query) and from the SPA's
+ *  initial route() so a late-firing event still surfaces the banner. */
+function maybeRenderPairInstallHint() {
+  if (!pairJustConsumed()) return;
+  if (!_deferredInstallPrompt) return;
+  try {
+    if (localStorage.getItem("pairInstallDismissed") === "1") return;
+  } catch { /* private mode — proceed without persistence */ }
+  renderPairInstallHint();
+}
+
 // ---- control actions ------------------------------------------------------
 function toast(msg, ok = true) {
   let t = document.getElementById("toast");
@@ -1846,6 +1948,11 @@ async function route() {
       await home();
       timer = setInterval(() => home().catch(() => {}), 5000);
     }
+    // Ticket 0032: after rendering, check whether the operator just
+    // arrived via /pair?... and (if so + a beforeinstallprompt is
+    // pending) surface the install hint. The function is a no-op when
+    // any precondition fails.
+    try { maybeRenderPairInstallHint(); } catch { /* swallow */ }
   } catch (e) {
     app.innerHTML = `<div class="loading">couldn’t reach the fleet server.<br><span class="dim">${esc(e.message)}</span></div>`;
   }
