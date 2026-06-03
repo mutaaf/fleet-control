@@ -23,6 +23,11 @@ import { tailTranscript, type TailEvent } from "./live.ts";
 import { pricingRows, lastSyncedAt, syncPricing } from "./pricing.ts";
 import { fetchPrDiff } from "./diff.ts";
 import { weeklyDigest } from "./digest.ts";
+import {
+  loadCrossLessons, defaultLessonsPath, newThisWeekCount,
+  type CrossLessonsLoadResult,
+} from "./lessons.ts";
+import { statSync } from "node:fs";
 import { serveShare } from "./snapshot.ts";
 import { renderBadge, projectBadge, parseMetric } from "./badge.ts";
 import {
@@ -181,6 +186,50 @@ function getCostPerPrCached(db: DB, now: Date, days: number): CostPerMergedPr {
   costPerPrBuildCounter += 1;
   const value = costPerMergedPr(db, { now, days });
   costPerPrCache.set(key, { value, expires_at: Date.now() + COST_PER_PR_TTL_MS });
+  return value;
+}
+
+// Ticket 0036: cross-fleet lessons portal view memo cache.
+//
+// One module-level `{path, mtimeMs, value}` per LESSONS § "expose a
+// build counter for cache-hit tests, not a fetcher swap". The route
+// returns the memoised parse when the file's mtime hasn't changed;
+// any change to the source file (a fresh `fleet lessons-sync` run)
+// bumps mtime and invalidates the entry. Per LESSONS § "in-process
+// dedup sets need an explicit reset hook for tests" we expose
+// `_resetLessonsCacheForTests()` AND a read-only build counter via
+// `_getLessonsCacheBuildsForTests()` so tests can assert hit/miss
+// semantics without stubbing fs.
+interface LessonsCacheEntry {
+  path: string;
+  mtimeMs: number;
+  value: CrossLessonsLoadResult;
+}
+let lessonsCache: LessonsCacheEntry | null = null;
+let lessonsBuildCounter = 0;
+
+export function _resetLessonsCacheForTests(): void {
+  lessonsCache = null;
+  lessonsBuildCounter = 0;
+}
+
+export function _getLessonsCacheBuildsForTests(): number {
+  return lessonsBuildCounter;
+}
+
+function getLessonsCached(path: string): CrossLessonsLoadResult {
+  // Read mtime first so a swap-in of a different file (via the env
+  // override) or a `utimesSync` from a test invalidates the cache.
+  // A missing file has no mtime; treat that as mtimeMs=0 so two
+  // consecutive missing-file requests share one build.
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(path).mtimeMs; } catch { mtimeMs = 0; }
+  if (lessonsCache && lessonsCache.path === path && lessonsCache.mtimeMs === mtimeMs) {
+    return lessonsCache.value;
+  }
+  lessonsBuildCounter += 1;
+  const value = loadCrossLessons(path);
+  lessonsCache = { path, mtimeMs, value };
   return value;
 }
 
@@ -462,6 +511,38 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=300",
+          });
+          return res.end(body);
+        }
+        // Ticket 0036: cross-fleet lessons portal view. Reads
+        // ~/.local/share/agent-fleet/CROSS_LESSONS.md (or the
+        // FLEET_CROSS_LESSONS_PATH override), parses the per-project
+        // structure once per mtime, returns the structured payload
+        // with the additional `new_this_week` count for the SPA's
+        // filter checkbox. Cache-Control: max-age=120 lets the SW
+        // cache (0029) survive across phone refreshes inside the
+        // window; the server-side mtime memo handles the long tail
+        // of polled refreshes. Net-new route — no existing JSON
+        // shape to preserve. The oversized branch returns the same
+        // top-level shape (projects:[], source_present:true,
+        // oversized:true) so the SPA's empty-state path renders the
+        // friendly copy instead of a 500.
+        if (path === "/api/fleet/lessons") {
+          const lessonsPath = defaultLessonsPath();
+          const v = getLessonsCached(lessonsPath);
+          const nwt = newThisWeekCount(v, new Date());
+          const body = JSON.stringify({
+            projects: v.projects,
+            parsed_at: v.parsed_at,
+            total: v.total,
+            source_present: v.source_present,
+            oversized: v.oversized ?? false,
+            new_this_week: nwt,
+          });
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=120",
           });
           return res.end(body);
         }

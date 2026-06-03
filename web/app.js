@@ -949,6 +949,11 @@ const INBOX_KIND_LABEL = {
   // diverges from its OWN 14-day baseline on one of three metrics
   // (Bash share / Edit-Read ratio / median run cost).
   self_drift: "Shape drift",
+  // Ticket 0036: a fresh batch of cross-fleet lessons synced since
+  // yesterday. The row deep-links into #/lessons?filter=new which
+  // pre-checks the "new this week" filter so the operator lands on
+  // the just-arrived entries.
+  lessons_new: "New fleet lessons",
 };
 
 // Ticket 0034: human-readable copy for each drift metric. Used by the
@@ -2383,6 +2388,193 @@ async function backlog(id) {
   foot.textContent = "";
 }
 
+// ---- Cross-fleet lessons portal view (ticket 0036) ---------------------
+//
+// Reads `~/.local/share/agent-fleet/CROSS_LESSONS.md` via the new
+// `/api/fleet/lessons` route and renders one <details> per entry,
+// grouped under per-project H2 headers. Search filters by substring
+// (case-insensitive) across `title + body`; the "new this week"
+// checkbox filters to entries within 7 days of `Date.now()`. Both
+// filters walk the existing DOM and toggle `hidden` on
+// non-matching <details> — NO re-render — so search stays snappy on
+// a phone even at 600+ entries.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string passes through
+// `redactSecrets` before HTML interpolation. The lessons file is
+// auto-generated from per-project docs/LESSONS.md so any leaked
+// token in a future entry is silently stripped at the boundary.
+//
+// Empty state: when `source_present: false` the page renders a
+// friendly explanation + a link to the agent-fleet kit's README. No
+// error, no crash — this is the fresh-install path.
+
+const LESSONS_WEEK_MS = 7 * 24 * 3600 * 1000;
+const LESSONS_AGENT_FLEET_README =
+  "https://github.com/mutaaf/agent-fleet#lessons-sync";
+
+function renderLessonsEmptyState() {
+  // Operator copy is a fixed string — no operator-supplied data lands
+  // here — but we still pass through redactSecrets at the boundary
+  // so a future copy edit can't smuggle a token-shape string into
+  // the DOM.
+  const safeBody = esc(redactSecrets(
+    "No cross-fleet lessons file at ~/.local/share/agent-fleet/CROSS_LESSONS.md yet. "
+    + "Run `fleet lessons-sync` from your agent-fleet checkout to populate it.",
+  ));
+  const safeHref = esc(redactSecrets(LESSONS_AGENT_FLEET_README));
+  return `<div class="lessons-empty">
+    <p>${safeBody}</p>
+    <p><a href="${safeHref}" target="_blank" rel="noopener" data-testid="lessons-empty-link">Read the lessons-sync docs ›</a></p>
+  </div>`;
+}
+
+function renderLessonsEntry(entry) {
+  // Both `title` and `body` pass through redactSecrets before any
+  // HTML interpolation. `date` is a server-validated YYYY-MM-DD
+  // string but we still treat it as untrusted (esc + redact) per
+  // the renderer-boundary discipline.
+  const dateLabel = entry.date ? esc(redactSecrets(entry.date)) : `<span class="dim">undated</span>`;
+  const safeTitle = esc(redactSecrets(String(entry.title || "")));
+  const safeBody = esc(redactSecrets(String(entry.body || "")));
+  const kind = entry.kind === "bullet" ? "bullet" : "h3";
+  // The summary carries the date + title; the body (h3 only) renders
+  // as a paragraph. We attach `data-lesson-date` to the <details>
+  // so the "new this week" filter can read it without re-parsing
+  // the summary text.
+  return `<details class="lesson" data-lesson-date="${esc(entry.date || "")}" data-lesson-kind="${esc(kind)}">
+    <summary><span class="lesson-date">${dateLabel}</span> <span class="lesson-title">${safeTitle}</span></summary>
+    ${safeBody ? `<div class="lesson-body">${safeBody}</div>` : ""}
+  </details>`;
+}
+
+function renderLessonsProject(p) {
+  const safeSlug = esc(redactSecrets(String(p.slug || "")));
+  const count = (p.lessons || []).length;
+  const entriesHtml = (p.lessons || []).map(renderLessonsEntry).join("");
+  // Project shells are CLOSED by default — the wireLessonsFilters
+  // call opens them on viewports >= 600px so desktop matches the
+  // user-story screenshot (open by default) while phones get a
+  // tap-to-expand accordion per the mobile pass AC.
+  return `<section class="lessons-project" data-lessons-project="${safeSlug}">
+    <details class="lessons-project-shell">
+      <summary><h2 class="lessons-h2">${safeSlug} <span class="dim">(${count} lesson${count === 1 ? "" : "s"})</span></h2></summary>
+      <div class="lessons-entries">${entriesHtml}</div>
+    </details>
+  </section>`;
+}
+
+function renderLessonsPage(data) {
+  if (!data || !data.source_present) return renderLessonsEmptyState();
+  if (data.oversized) {
+    const msg = esc(redactSecrets(
+      "Cross-fleet lessons file is unusually large (>2MB) and has been skipped to keep the server responsive. "
+      + "Trim the file or contact the operator who owns lessons-sync.",
+    ));
+    return `<div class="lessons-empty"><p>${msg}</p></div>`;
+  }
+  const projects = data.projects || [];
+  if (projects.length === 0) return renderLessonsEmptyState();
+  const projectsHtml = projects.map(renderLessonsProject).join("");
+  return `<div class="lessons-grid">${projectsHtml}</div>`;
+}
+
+function wireLessonsFilters(container, opts) {
+  // Both filters walk the existing DOM and toggle `hidden` on each
+  // <details class="lesson">. Project sections whose every entry is
+  // hidden also collapse — we set `hidden` on the wrapping
+  // <section> so the empty H2 header doesn't take up space.
+  const search = container.querySelector('input[data-testid="lessons-search"]');
+  const newOnly = container.querySelector('input[data-testid="lessons-new-only"]');
+  const cutoff = Date.now() - LESSONS_WEEK_MS;
+  const apply = () => {
+    const q = (search && search.value || "").trim().toLowerCase();
+    const wantNew = !!(newOnly && newOnly.checked);
+    const sections = container.querySelectorAll(".lessons-project");
+    for (const section of sections) {
+      let anyVisible = false;
+      const entries = section.querySelectorAll(".lesson");
+      for (const entry of entries) {
+        const title = (entry.querySelector(".lesson-title")?.textContent || "").toLowerCase();
+        const body = (entry.querySelector(".lesson-body")?.textContent || "").toLowerCase();
+        const text = title + " " + body;
+        let visible = true;
+        if (q && text.indexOf(q) === -1) visible = false;
+        if (visible && wantNew) {
+          const ds = entry.getAttribute("data-lesson-date") || "";
+          const t = ds ? Date.parse(ds) : NaN;
+          if (!Number.isFinite(t) || t < cutoff) visible = false;
+        }
+        entry.hidden = !visible;
+        if (visible) anyVisible = true;
+      }
+      section.hidden = !anyVisible;
+    }
+  };
+  if (search) search.addEventListener("input", apply);
+  if (newOnly) newOnly.addEventListener("change", apply);
+  if (opts && opts.initialFilterNew && newOnly) {
+    newOnly.checked = true;
+  }
+  // Desktop default: open all project shells so the operator can
+  // skim every project at once. Phones (<600px) keep them closed —
+  // the accordion-style header is the mobile-friendly pattern per
+  // AC8. We trust matchMedia at first render; we don't re-fire on
+  // resize because the operator's primary device class doesn't
+  // change mid-session.
+  try {
+    if (typeof window !== "undefined" && window.matchMedia && window.matchMedia("(min-width: 600px)").matches) {
+      const shells = container.querySelectorAll(".lessons-project-shell");
+      for (const s of shells) s.setAttribute("open", "");
+    }
+  } catch { /* JSDOM-less paths fall back to closed-everywhere; the UX is still functional. */ }
+  apply();
+}
+
+async function lessons(params) {
+  summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
+  let data = null;
+  try {
+    data = await get("/api/fleet/lessons");
+  } catch (e) {
+    app.innerHTML = `<div class="loading">couldn't load fleet lessons.<br><span class="dim">${esc(e.message)}</span></div>`;
+    return;
+  }
+  const newThisWeek = (data && data.new_this_week) || 0;
+  const total = (data && data.total) || 0;
+  const projectCount = (data && data.projects && data.projects.length) || 0;
+  // Hash params: ?filter=new pre-checks the "new this week" box so the
+  // inbox row's "Open lessons" deep-link lands on the filtered view.
+  const initialFilterNew = !!(params && params.get && params.get("filter") === "new");
+  const checkedAttr = initialFilterNew ? "checked" : "";
+  // The header lives inside the data-testid container so phone tests
+  // can find the search + filter as a unit. Per LESSONS §
+  // "defence-in-depth secret redaction at the renderer boundary" the
+  // total + new-this-week numbers are server-derived integers but
+  // the header copy still routes through redactSecrets as a
+  // belt-and-braces backstop.
+  const safeTotal = esc(redactSecrets(String(total)));
+  const safeProjectCount = esc(redactSecrets(String(projectCount)));
+  const safeNewThisWeek = esc(redactSecrets(String(newThisWeek)));
+  app.innerHTML = `<div class="cross-lessons" data-testid="cross-lessons">
+    <a class="back" href="#/">‹ all projects</a>
+    <div class="lessons-head">
+      <h1 class="lessons-title">LESSONS <span class="dim">${safeTotal} across ${safeProjectCount} project${projectCount === 1 ? "" : "s"}</span></h1>
+      <div class="lessons-controls">
+        <input type="search" placeholder="search lessons…" data-testid="lessons-search" autocomplete="off" />
+        <label class="lessons-new-only">
+          <input type="checkbox" data-testid="lessons-new-only" ${checkedAttr} />
+          new this week (${safeNewThisWeek})
+        </label>
+      </div>
+    </div>
+    ${renderLessonsPage(data)}
+  </div>`;
+  foot.textContent = "";
+  const container = app.querySelector('[data-testid="cross-lessons"]');
+  if (container) wireLessonsFilters(container, { initialFilterNew });
+}
+
 async function route() {
   stop();
   const h = location.hash || "#/";
@@ -2392,6 +2584,12 @@ async function route() {
       const s = path.slice(2);
       await project(s, params);
       timer = setInterval(() => project(s, params).catch(() => {}), 5000);
+    } else if (path === "lessons" || path.startsWith("lessons")) {
+      // Ticket 0036: cross-fleet lessons portal view. One-shot
+      // render — search/filter are client-side over the existing
+      // DOM, no polling timer needed (the 2-min route cache + the
+      // server-side mtime memo handle re-loads inside the window).
+      await lessons(params);
     } else if (path.startsWith("project/") && path.endsWith("/drift")) {
       // Ticket 0034: self-baseline drift detail view. One-shot render
       // — the operator is reading static contributors, not monitoring

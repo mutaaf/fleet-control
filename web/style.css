@@ -872,3 +872,77 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   }
   .cost-per-pr-detail .cost-per-pr-table { display: table; }
 }
+
+/* Ticket 0036: cross-fleet lessons portal view.
+ *
+ * Per-project H2 headers (one per `## <slug>` in CROSS_LESSONS.md)
+ * stack vertically. Each entry is a <details> element so the operator
+ * can fan out only the one they're investigating; the
+ * project-level shell <details> is open by default on desktop and
+ * collapses to accordion headers at <600px (mobile pass per AC8).
+ *
+ * The search input + "new this week" checkbox sit sticky at the top
+ * of the page so the operator can type while scrolling.
+ *
+ * Topbar LESSONS link sits between the brand and the fleet-summary
+ * at the same monospace cadence as .brand. */
+.topbar-link { font-family: var(--mono); font-weight: 600; letter-spacing: .18em;
+  font-size: 12px; color: var(--dim); text-decoration: none; padding: 4px 6px; }
+.topbar-link:hover { color: var(--ink); }
+.cross-lessons { margin-top: 4px; }
+.cross-lessons .lessons-head { position: sticky; top: 56px; z-index: 5;
+  background: var(--bg, #0E0F0D); padding: 8px 0 12px;
+  border-bottom: 1px solid var(--line); }
+.lessons-title { font-family: var(--mono); font-size: 18px; letter-spacing: .12em;
+  margin: 0 0 8px; }
+.lessons-controls { display: grid; grid-template-columns: 1fr;
+  gap: 8px; align-items: center; }
+.lessons-controls input[type="search"] {
+  font-family: var(--mono); font-size: 13px; padding: 8px 10px;
+  background: var(--panel2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r);
+  width: 100%; min-height: var(--tap-min); }
+.lessons-controls input[type="search"]:focus {
+  outline: 1px solid var(--accent); outline-offset: 1px; }
+.lessons-controls .lessons-new-only { font-family: var(--mono); font-size: 12.5px;
+  color: var(--dim); display: inline-flex; gap: 6px; align-items: center; }
+.lessons-controls .lessons-new-only input { width: 16px; height: 16px; }
+.lessons-grid { display: block; padding-top: 8px; }
+.lessons-project { margin: 12px 0; }
+.lessons-project-shell > summary { list-style: none; cursor: pointer;
+  padding: 4px 0; }
+.lessons-project-shell > summary::-webkit-details-marker { display: none; }
+.lessons-h2 { display: inline; font-family: var(--mono); font-size: 14px;
+  letter-spacing: .14em; margin: 0; font-weight: 600; }
+.lessons-entries { padding: 6px 0 4px 8px;
+  border-left: 1px solid var(--line); margin-left: 4px; }
+.lesson { padding: 6px 0; border-bottom: 1px dashed var(--line); }
+.lesson > summary { cursor: pointer; font-size: 13.5px; line-height: 1.5;
+  list-style: none; padding: 4px 2px; min-height: var(--tap-min);
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.lesson > summary::-webkit-details-marker { display: none; }
+.lesson-date { font-family: var(--mono); font-size: 12px; color: var(--dim);
+  white-space: nowrap; }
+.lesson-title { color: var(--ink); }
+.lesson-body { padding: 8px 4px 6px 0; font-size: 13px; line-height: 1.55;
+  color: var(--ink); white-space: pre-wrap; }
+.lessons-empty { padding: 24px 8px; color: var(--dim); font-size: 13.5px;
+  line-height: 1.55; }
+.lessons-empty a { color: var(--accent); }
+
+/* Mobile-first (default <600px): project shells collapse to accordion
+ * headers (closed by default); the search + checkbox stack into two
+ * rows so the input gets the full width. */
+@media (max-width: 599px) {
+  .cross-lessons .lessons-head { top: 48px; }
+  .lessons-controls { grid-template-columns: 1fr; }
+  .lessons-project-shell:not([data-keep-open]) { /* closed by default */ }
+}
+
+/* Desktop upgrade at >=600px: project shells stay open by default;
+ * the search + checkbox sit on one row so the input shares space with
+ * the new-this-week toggle. */
+@media (min-width: 600px) {
+  .lessons-controls { grid-template-columns: 1fr auto; }
+  .lessons-controls input[type="search"] { max-width: 480px; }
+}
