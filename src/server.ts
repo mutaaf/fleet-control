@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, type YesterdayGlance, type CostPerMergedPr } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, type YesterdayGlance, type CostPerMergedPr, type FridayWrap } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
@@ -215,6 +215,100 @@ export function _resetLessonsCacheForTests(): void {
 
 export function _getLessonsCacheBuildsForTests(): number {
   return lessonsBuildCounter;
+}
+
+// Ticket 0037: "Friday wrap" memo cache.
+//
+// 10-minute TTL keyed by `(week_iso, day_of_week)`. The wrap data
+// changes slowly (PR sizes don't shift hour-to-hour; cost rollups
+// move once per ingest pass) so a wide window is fine — when the ISO
+// week rolls or the day-of-week changes the key changes and we
+// rebuild. Per LESSONS § "in-process dedup sets need an explicit
+// reset hook for tests": we expose `_resetFridayWrapCacheForTests()`.
+// Per LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap": we also expose a read-only
+// `_getFridayWrapCacheBuildsForTests()` that ticks on every cache
+// MISS so route tests can assert hit/miss semantics without stubbing
+// SQL. Production code never reads either.
+interface FridayWrapCacheEntry {
+  value: FridayWrap & { visible: boolean };
+  expires_at: number;
+}
+const FRIDAY_WRAP_TTL_MS = 600_000; // 10 minutes per the AC.
+const fridayWrapCache = new Map<string, FridayWrapCacheEntry>();
+let fridayWrapBuildCounter = 0;
+
+export function _resetFridayWrapCacheForTests(): void {
+  fridayWrapCache.clear();
+  fridayWrapBuildCounter = 0;
+}
+
+export function _getFridayWrapCacheBuildsForTests(): number {
+  return fridayWrapBuildCounter;
+}
+
+function fridayWrapCacheKey(now: Date, tz: string): string {
+  // Day-of-week + week_iso composite, both in the requested tz. We
+  // derive day-of-week via Intl in the same way isFriday() does so
+  // the key is consistent with the visible boolean it returns.
+  let weekday = "?";
+  try {
+    weekday = new Intl.DateTimeFormat("en-US", {
+      weekday: "short", timeZone: tz,
+    }).format(now);
+  } catch {
+    weekday = new Intl.DateTimeFormat("en-US", {
+      weekday: "short", timeZone: "UTC",
+    }).format(now);
+  }
+  // We import isoWeekKey indirectly via views.ts (it's exported by
+  // digest.ts and re-used inside fridayWrap()); to keep the key
+  // shape stable here we derive yyyy-mm directly from `now`'s ISO and
+  // include the calendar date too — that gives us a per-day key on
+  // top of weekday so two calls on different physical days don't
+  // share a cache row even if their (week_iso, weekday) happen to
+  // collide.
+  const ymd = now.toISOString().slice(0, 10);
+  return `${ymd}|${weekday}|tz=${tz}`;
+}
+
+/** Resolve the tz string for a /api/fleet/friday-wrap request. Per
+ *  the engineering note in the ticket: `?tz=<iana>` is whitelisted
+ *  against `Intl.supportedValuesOf("timeZone")` before use. An invalid
+ *  tz falls back to the server's local tz so a malformed query
+ *  param can't surface a 500. */
+function resolveFridayWrapTz(raw: string | null): string {
+  const fallback = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
+  if (!raw) return fallback;
+  // Intl.supportedValuesOf landed in node v20+; guard for older
+  // engines by checking the function exists. When it's missing we
+  // accept any string that node's Intl will round-trip without
+  // throwing (the Intl.DateTimeFormat constructor below is the
+  // ultimate validator).
+  const supported = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf;
+  if (typeof supported === "function") {
+    let names: string[];
+    try { names = supported("timeZone"); } catch { return fallback; }
+    if (!names.includes(raw)) return fallback;
+    return raw;
+  }
+  // Fallback validator for older engines.
+  try { new Intl.DateTimeFormat("en-US", { timeZone: raw }); return raw; }
+  catch { return fallback; }
+}
+
+/** Look up a fresh friday-wrap from the memo cache; rebuild on miss.
+ *  The cache key folds `(yyyy-mm-dd, weekday, tz)` so two phones
+ *  polling inside the 10-min window share one build. */
+function getFridayWrapCached(db: DB, cfg: FleetConfig, now: Date, tz: string): FridayWrap & { visible: boolean } {
+  const key = fridayWrapCacheKey(now, tz);
+  const hit = fridayWrapCache.get(key);
+  if (hit && hit.expires_at > Date.now()) return hit.value;
+  fridayWrapBuildCounter += 1;
+  const wrap = fridayWrap(db, now, cfg);
+  const value = { ...wrap, visible: isFriday(now, tz) };
+  fridayWrapCache.set(key, { value, expires_at: Date.now() + FRIDAY_WRAP_TTL_MS });
+  return value;
 }
 
 function getLessonsCached(path: string): CrossLessonsLoadResult {
@@ -492,6 +586,26 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=60",
+          });
+          return res.end(body);
+        }
+        // Ticket 0037: Friday wrap weekly card. Composes the existing
+        // fridayWrap() helper into a route that always returns 200 so
+        // the SPA can pre-fetch on any day; the `visible` boolean is
+        // the gate the SPA reads to decide whether to render. The
+        // 10-min memo cache is keyed by `(yyyy-mm-dd, weekday, tz)`
+        // so polled SPA refreshes inside the window share one build —
+        // matches the AC's "wrap data changes slowly" framing and the
+        // SW cache (0029) survives a phone refresh inside the window.
+        // Net-new route; no existing JSON shape to preserve.
+        if (path === "/api/fleet/friday-wrap") {
+          const tz = resolveFridayWrapTz(url.searchParams.get("tz"));
+          const v = getFridayWrapCached(db, cfg, new Date(), tz);
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=600",
           });
           return res.end(body);
         }
