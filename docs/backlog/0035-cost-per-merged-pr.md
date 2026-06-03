@@ -1,7 +1,7 @@
 ---
 id: 0035
 title: Cost per merged PR - the single number that frames spend in value terms
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-03
@@ -281,7 +281,4 @@ Each box maps 1:1 to a test scenario.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD - branch `feat/0035-...` opened
-- YYYY-MM-DD - failing test added in `tests/cost-per-pr.test.ts`
-- YYYY-MM-DD - PR #N opened, CI [state]
-- YYYY-MM-DD - merged to main
+- 2026-06-03 - branch `feat/0035-cost-per-merged-pr` opened
