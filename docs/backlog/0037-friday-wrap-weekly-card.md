@@ -1,7 +1,7 @@
 ---
 id: 0037
 title: Friday wrap - one weekly card recaps the fleet's week so the operator closes the laptop on a high
-status: groomed
+status: in-progress
 priority: P2
 area: portal
 created: 2026-06-03
@@ -327,7 +327,7 @@ Each box maps 1:1 to a test scenario.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD - branch `feat/0037-...` opened
-- YYYY-MM-DD - failing test added in `tests/friday-wrap.test.ts`
-- YYYY-MM-DD - PR #N opened, CI [state]
-- YYYY-MM-DD - merged to main
+- 2026-06-03 - branch `feat/0037-friday-wrap-weekly-card` opened
+- 2026-06-03 - failing test added in `tests/friday-wrap.test.ts`
+- 2026-06-03 - PR #N opened, CI [state]
+- 2026-06-03 - merged to main
