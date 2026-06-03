@@ -1768,6 +1768,252 @@ export function yesterdayGlance(
   };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Cost per merged PR — the single number that frames spend in value
+// terms (ticket 0035).
+//
+// One fleet-wide composition over existing `pr` + `cost_rollup_day` +
+// `project` tables; no schema migration. The helper returns three
+// nested objects: a fleet rollup, an array of per-project rows
+// (sorted by $/PR DESC, nulls to the bottom), and a window spec.
+//
+// Window discipline:
+//   - `days` defaults to 14, clamped to [1, 90] via the same
+//     `clampDays()` helper the leaderboard route uses.
+//   - The current window is the trailing `days` days ending at `now`
+//     (inclusive lower bound, exclusive upper bound). The prior window
+//     is the SAME number of days immediately preceding (so a 14-day
+//     window's prior is days [-28, -14)).
+//   - Window arithmetic uses the same `date(...)` lexicographic frame
+//     as fleetLeaderboard so the buckets line up across helpers; per
+//     LESSONS § "julianday() drifts ~10us per timestamp; decompose
+//     with strftime for sub-ms diffs", we avoid julianday()
+//     intermediates entirely.
+//
+// Trend guard:
+//   - `trend_pct = (current_$/PR - prior_$/PR) / prior_$/PR * 100`.
+//   - Returns `null` when the prior window has < 3 merged PRs OR < $1
+//     spent for that project — a sparse base produces misleading
+//     percentages (the same "sigma > 0" intuition as the anomaly
+//     fixture lesson).
+//
+// Division-by-zero guards:
+//   - A project with `spent_usd > 0` but zero merges in window returns
+//     `dollars_per_pr: null` (NOT Infinity, NOT 0, NOT NaN).
+//   - The fleet rollup excludes such projects from the numerator IFF
+//     the fleet total `prs_merged === 0` (then top-level is null too).
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every typed row narrowing uses the double-cast.
+
+export interface CostPerMergedPrRow {
+  slug: string;
+  spent_usd: number;
+  prs_merged: number;
+  dollars_per_pr: number | null;
+  trend_pct: number | null;
+}
+
+export interface CostPerMergedPrFleet {
+  spent_usd: number;
+  prs_merged: number;
+  dollars_per_pr: number | null;
+  trend_pct: number | null;
+}
+
+export interface CostPerMergedPrWindow {
+  /** ISO date (yyyy-mm-dd) — inclusive lower bound. */
+  start: string;
+  /** ISO date (yyyy-mm-dd) — exclusive upper bound (today). */
+  end: string;
+  /** Window length in days. */
+  days: number;
+}
+
+export interface CostPerMergedPr {
+  window: CostPerMergedPrWindow;
+  fleet: CostPerMergedPrFleet;
+  projects: CostPerMergedPrRow[];
+  generated_at: string;
+}
+
+export interface CostPerMergedPrOptions {
+  /** Window length in days. Defaults to 14; clamped to [1, 90]. */
+  days?: number;
+  /** ISO timestamp used as "now" for windowing. Defaults to wall-clock;
+   *  tests pin so seeded fetched_at / day values bucket predictably. */
+  now?: Date;
+}
+
+interface CostSpendRow {
+  project_id: number;
+  spent_usd: number | null;
+}
+interface MergedCountRow {
+  project_id: number;
+  prs_merged: number;
+}
+interface ProjectSlugRow {
+  id: number;
+  slug: string;
+}
+
+/** Insufficient-baseline guard per AC3: a trend is meaningful only when
+ *  the prior window has at least 3 merged PRs AND at least $1 spent. */
+const TREND_MIN_PRS = 3;
+const TREND_MIN_SPENT = 1.0;
+
+/** Compute the per-project + fleet "$ per merged PR" payload for the
+ *  trailing `days`-day window ending at `now` (UTC midnight). Pure SQL
+ *  inside; no shell-out, no network, no transcript I/O.
+ *
+ *  The two passes (current + prior) share the same SQL templates with
+ *  parameterised window bounds. Per LESSONS § "node:sqlite's .all()
+ *  needs `as unknown as T[]`": both rows narrow via the double-cast. */
+export function costPerMergedPr(
+  db: DB, opts: CostPerMergedPrOptions = {},
+): CostPerMergedPr {
+  const now = opts.now ?? new Date();
+  const days = clampDays(opts.days ?? 14);
+  // Window end is today (UTC midnight); start is `days` days before.
+  // Prior window is [start - days, start).
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - days);
+  const priorStart = new Date(start);
+  priorStart.setUTCDate(priorStart.getUTCDate() - days);
+  const endStr = end.toISOString().slice(0, 10);
+  const startStr = start.toISOString().slice(0, 10);
+  const priorStartStr = priorStart.toISOString().slice(0, 10);
+
+  // ── All projects (anchor table) ─────────────────────────────────
+  const projectRows = db.prepare(
+    "SELECT id, slug FROM project ORDER BY slug",
+  ).all() as unknown as ProjectSlugRow[];
+
+  // ── Spend per project: cost_rollup_day in [start, end) ──────────
+  const spendCurrent = db.prepare(
+    "SELECT project_id, SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day < ? "
+    + " GROUP BY project_id",
+  ).all(startStr, endStr) as unknown as CostSpendRow[];
+  const spendCurrentByPid = new Map<number, number>();
+  for (const r of spendCurrent) {
+    spendCurrentByPid.set(r.project_id, Number(r.spent_usd ?? 0));
+  }
+  const spendPrior = db.prepare(
+    "SELECT project_id, SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day < ? "
+    + " GROUP BY project_id",
+  ).all(priorStartStr, startStr) as unknown as CostSpendRow[];
+  const spendPriorByPid = new Map<number, number>();
+  for (const r of spendPrior) {
+    spendPriorByPid.set(r.project_id, Number(r.spent_usd ?? 0));
+  }
+
+  // ── Merged-PR counts per project: pr in [start, end), state=MERGED,
+  //    is_agent=1 — per the AC's "agent-shipped" framing. We bucket by
+  //    date(fetched_at) and count rows; deduped by the (project_id,
+  //    number) primary key already.
+  const mergedCurrent = db.prepare(
+    "SELECT project_id, COUNT(*) AS prs_merged "
+    + "  FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) < ? "
+    + " GROUP BY project_id",
+  ).all(startStr, endStr) as unknown as MergedCountRow[];
+  const mergedCurrentByPid = new Map<number, number>();
+  for (const r of mergedCurrent) {
+    mergedCurrentByPid.set(r.project_id, Number(r.prs_merged ?? 0));
+  }
+  const mergedPrior = db.prepare(
+    "SELECT project_id, COUNT(*) AS prs_merged "
+    + "  FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) < ? "
+    + " GROUP BY project_id",
+  ).all(priorStartStr, startStr) as unknown as MergedCountRow[];
+  const mergedPriorByPid = new Map<number, number>();
+  for (const r of mergedPrior) {
+    mergedPriorByPid.set(r.project_id, Number(r.prs_merged ?? 0));
+  }
+
+  // ── Per-project rows ────────────────────────────────────────────
+  const projects: CostPerMergedPrRow[] = [];
+  let fleetSpent = 0;
+  let fleetMerged = 0;
+  let fleetPriorSpent = 0;
+  let fleetPriorMerged = 0;
+  for (const p of projectRows) {
+    const spent = spendCurrentByPid.get(p.id) ?? 0;
+    const merged = mergedCurrentByPid.get(p.id) ?? 0;
+    const priorSpent = spendPriorByPid.get(p.id) ?? 0;
+    const priorMerged = mergedPriorByPid.get(p.id) ?? 0;
+    // Division-by-zero guard (AC2): null when merged === 0.
+    const dollars_per_pr = merged > 0 ? spent / merged : null;
+    const prior_dpp = priorMerged > 0 ? priorSpent / priorMerged : null;
+    // Trend baseline guard (AC3): need >= 3 PRs AND >= $1 prior spend.
+    let trend_pct: number | null = null;
+    if (
+      dollars_per_pr != null && prior_dpp != null
+      && priorMerged >= TREND_MIN_PRS && priorSpent >= TREND_MIN_SPENT
+    ) {
+      trend_pct = ((dollars_per_pr - prior_dpp) / prior_dpp) * 100;
+    }
+    projects.push({
+      slug: p.slug,
+      spent_usd: spent,
+      prs_merged: merged,
+      dollars_per_pr,
+      trend_pct,
+    });
+    fleetSpent += spent;
+    fleetMerged += merged;
+    fleetPriorSpent += priorSpent;
+    fleetPriorMerged += priorMerged;
+  }
+
+  // ── Sort: $/PR DESC; nulls to the bottom; slug ASC as tie-break. ─
+  projects.sort((a, b) => {
+    const an = a.dollars_per_pr == null;
+    const bn = b.dollars_per_pr == null;
+    if (an && bn) return a.slug.localeCompare(b.slug);
+    if (an) return 1;
+    if (bn) return -1;
+    if (b.dollars_per_pr !== a.dollars_per_pr) {
+      return (b.dollars_per_pr as number) - (a.dollars_per_pr as number);
+    }
+    return a.slug.localeCompare(b.slug);
+  });
+
+  // ── Fleet rollup (AC1 + AC2): null at top when fleet merges === 0. ─
+  const fleet_dpp = fleetMerged > 0 ? fleetSpent / fleetMerged : null;
+  const fleet_prior_dpp = fleetPriorMerged > 0 ? fleetPriorSpent / fleetPriorMerged : null;
+  let fleet_trend: number | null = null;
+  if (
+    fleet_dpp != null && fleet_prior_dpp != null
+    && fleetPriorMerged >= TREND_MIN_PRS && fleetPriorSpent >= TREND_MIN_SPENT
+  ) {
+    fleet_trend = ((fleet_dpp - fleet_prior_dpp) / fleet_prior_dpp) * 100;
+  }
+
+  return {
+    window: { start: startStr, end: endStr, days },
+    fleet: {
+      spent_usd: fleetSpent,
+      prs_merged: fleetMerged,
+      dollars_per_pr: fleet_dpp,
+      trend_pct: fleet_trend,
+    },
+    projects,
+    generated_at: now.toISOString(),
+  };
+}
+
 export function runView(db: DB, id: number) {
   const run = db.prepare("SELECT * FROM run WHERE id=?").get(id) as any;
   if (!run) return null;

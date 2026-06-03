@@ -571,6 +571,18 @@ async function fetchGlance() {
   try { return await get("/api/fleet/glance"); } catch { return null; }
 }
 
+// Ticket 0035: "Cost per merged PR" headline summary. One trailing-14d
+// summary above the 0033 glance card: dollars per merged PR, count of
+// PRs shipped, total spend, window length. Lazy-fetched from
+// /api/fleet/cost-per-pr so the home payload stays small and the
+// existing SW cache (0029) survives a phone refresh inside the 5-min
+// window. Errors fall through silently — the summary line just
+// disappears for that render cycle and the rest of the home page still
+// loads.
+async function fetchCostPerPr() {
+  try { return await get("/api/fleet/cost-per-pr"); } catch { return null; }
+}
+
 /** Skeleton block shown while /api/fleet/glance is in flight. Carries
  *  `aria-busy="true"` so screen readers announce the loading state;
  *  the pulsing animation flattens under
@@ -621,6 +633,209 @@ function renderYesterdayGlance(data) {
     <div class="glance-verdict glance-verdict-${safeKind}">${safeMessage}</div>
   </a>`;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0035: cost per merged PR.
+//
+// One-line summary at the very top of the home page (above the 0033
+// glance card): "$2.37 per merged PR · 28 PRs · $66.36 spent · last
+// 14d". When there are zero merged PRs in window, the line collapses
+// to "No merged PRs yet · $X spent · last <days>d" (no division).
+// Tap-anywhere navigates to #/cost-per-pr where the detail table
+// renders sortable rows + a fleet-rollup row.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every interpolated string passes through redactSecrets
+// before HTML insertion. This surface has no operator-supplied text
+// today (only numbers + slug-shape strings), but the pattern stays
+// consistent with the rest of the renderer layer so a future field
+// addition can't smuggle a token-shape string into the DOM.
+// ────────────────────────────────────────────────────────────────────
+
+/** Render the one-line "$ per merged PR" summary. Quiet hours do NOT
+ *  alter this surface — it's a pull view, not a push notification
+ *  (ticket 0030 gates pushes only). */
+function renderCostPerPrSummary(data) {
+  if (!data) return "";
+  const fleet = data.fleet || {};
+  const days = Number(data.window && data.window.days) || 14;
+  const spent = Number(fleet.spent_usd || 0);
+  const prs = Number(fleet.prs_merged || 0);
+  // Defence-in-depth: route the (small) interpolated strings through
+  // redactSecrets even though they are numbers/integers today.
+  const daysLabel = esc(redactSecrets(`last ${days}d`));
+  let body;
+  if (fleet.dollars_per_pr == null) {
+    // Empty / no-merges branch: no division, just the spend + window.
+    body = `<span class="cost-per-pr-empty">No merged PRs yet</span>`
+      + ` <span class="cost-per-pr-sep">·</span>`
+      + ` <span class="cost-per-pr-stat"><b>${usd(spent)}</b> spent</span>`
+      + ` <span class="cost-per-pr-sep">·</span>`
+      + ` <span class="cost-per-pr-stat dim">${daysLabel}</span>`;
+  } else {
+    const dpp = Number(fleet.dollars_per_pr);
+    body = `<span class="cost-per-pr-headline"><b>${usd(dpp)}</b> per merged PR</span>`
+      + ` <span class="cost-per-pr-sep">·</span>`
+      + ` <span class="cost-per-pr-stat"><b>${prs}</b> PR${prs === 1 ? "" : "s"} shipped</span>`
+      + ` <span class="cost-per-pr-sep">·</span>`
+      + ` <span class="cost-per-pr-stat"><b>${usd(spent)}</b> spent</span>`
+      + ` <span class="cost-per-pr-sep">·</span>`
+      + ` <span class="cost-per-pr-stat dim">${daysLabel}</span>`;
+  }
+  return `<a class="cost-per-pr-summary" data-testid="cost-per-pr-summary"`
+    + ` href="#/cost-per-pr" aria-label="Cost per merged PR — tap for breakdown">${body}</a>`;
+}
+
+/** Format a trend percentage cell. Null prior baseline → em-dash. The
+ *  arrow glyph is text-only so existing table layouts don't shift. */
+function formatTrendCell(trendPct) {
+  if (trendPct == null) return `<span class="cost-per-pr-trend cost-per-pr-trend-none">—</span>`;
+  const v = Number(trendPct);
+  const sign = v > 0 ? "up" : (v < 0 ? "down" : "flat");
+  const arrow = sign === "up" ? "▲" : sign === "down" ? "▼" : "·";
+  const cls = `cost-per-pr-trend cost-per-pr-trend-${sign}`;
+  const pct = Math.abs(v).toFixed(0) + "%";
+  return `<span class="${cls}">${arrow} ${pct}</span>`;
+}
+
+const COST_PER_PR_SORT_DIR = { asc: 1, desc: -1 };
+let _costPerPrSortState = { col: "dollars_per_pr", dir: "desc" };
+
+/** Sort project rows by the configured column + direction. Rows with
+ *  `dollars_per_pr === null` ALWAYS sort to the bottom regardless of
+ *  direction (per AC7). */
+function sortCostPerPrRows(rows, col, dir) {
+  const sign = COST_PER_PR_SORT_DIR[dir] || -1;
+  const sorted = [...rows];
+  sorted.sort((a, b) => {
+    // Null-$/PR rows always sink to the bottom.
+    const aNull = a.dollars_per_pr == null;
+    const bNull = b.dollars_per_pr == null;
+    if (aNull && bNull) return String(a.slug).localeCompare(String(b.slug));
+    if (aNull) return 1;
+    if (bNull) return -1;
+    const av = a[col];
+    const bv = b[col];
+    // Strings (slug) sort lexicographically; numbers do numeric.
+    if (typeof av === "string" && typeof bv === "string") {
+      return sign * av.localeCompare(bv);
+    }
+    const an = Number(av);
+    const bn = Number(bv);
+    if (Number.isFinite(an) && Number.isFinite(bn)) {
+      return sign * (an - bn);
+    }
+    return 0;
+  });
+  return sorted;
+}
+
+/** Detail page for /cost-per-pr. Sortable table; fleet-rollup row is
+ *  appended as the last visual row with a CSS border-top separator
+ *  (per AC7). */
+function renderCostPerPrDetail(data) {
+  if (!data) {
+    return `<a class="back" href="#/">‹ all projects</a>
+      <div class="loading">no data yet for the cost-per-PR breakdown.</div>`;
+  }
+  const days = Number(data.window && data.window.days) || 14;
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+  const fleet = data.fleet || {};
+  const sortCol = _costPerPrSortState.col;
+  const sortDir = _costPerPrSortState.dir;
+  const sorted = sortCostPerPrRows(projects, sortCol, sortDir);
+  const headers = [
+    { key: "slug", label: "project" },
+    { key: "spent_usd", label: `${days}d $` },
+    { key: "prs_merged", label: "PRs" },
+    { key: "dollars_per_pr", label: "$/PR" },
+    { key: "trend_pct", label: "trend" },
+  ];
+  const thRow = headers.map((h) => {
+    const active = h.key === sortCol;
+    const ind = active ? (sortDir === "asc" ? " ▲" : " ▼") : "";
+    return `<th data-sort-key="${esc(h.key)}" class="${active ? "active" : ""}">`
+      + `${esc(h.label)}${ind}</th>`;
+  }).join("");
+  const projRow = (p) => {
+    const slug = esc(redactSecrets(String(p.slug || "")));
+    const dpp = p.dollars_per_pr == null
+      ? `<span class="cost-per-pr-na">—</span>`
+      : `${esc(usd(p.dollars_per_pr))}`;
+    return `<tr class="cost-per-pr-row" data-slug="${slug}">`
+      + `<td class="cost-per-pr-slug"><a href="#/p/${slug}"><b>${slug}</b></a></td>`
+      + `<td class="cost-per-pr-spent mono">${esc(usd(p.spent_usd))}</td>`
+      + `<td class="cost-per-pr-prs mono">${Number(p.prs_merged) || 0}</td>`
+      + `<td class="cost-per-pr-dpp mono">${dpp}</td>`
+      + `<td class="cost-per-pr-trendcell mono">${formatTrendCell(p.trend_pct)}</td>`
+      + `</tr>`;
+  };
+  const fleetDpp = fleet.dollars_per_pr == null
+    ? `<span class="cost-per-pr-na">—</span>`
+    : `${esc(usd(fleet.dollars_per_pr))}`;
+  const fleetRow = `<tr class="cost-per-pr-row cost-per-pr-fleet-row" data-testid="cost-per-pr-fleet-row">`
+    + `<td class="cost-per-pr-slug"><b>fleet</b></td>`
+    + `<td class="cost-per-pr-spent mono">${esc(usd(fleet.spent_usd || 0))}</td>`
+    + `<td class="cost-per-pr-prs mono">${Number(fleet.prs_merged) || 0}</td>`
+    + `<td class="cost-per-pr-dpp mono">${fleetDpp}</td>`
+    + `<td class="cost-per-pr-trendcell mono">${formatTrendCell(fleet.trend_pct)}</td>`
+    + `</tr>`;
+  return `<a class="back" href="#/">‹ all projects</a>
+    <div class="card-head"><span class="pname">Fleet · Cost per merged PR</span>
+      <span class="state dim mono">last ${days} days</span></div>
+    <div class="cost-per-pr-detail">
+      <table class="cost-per-pr-table" data-testid="cost-per-pr-table">
+        <thead><tr>${thRow}</tr></thead>
+        <tbody>${sorted.map(projRow).join("") || `<tr><td colspan="5" class="dim">no projects with PR data in the window</td></tr>`}${fleetRow}</tbody>
+      </table>
+    </div>`;
+}
+
+/** Hash-route handler: render the cost-per-PR detail page. Pulls the
+ *  API once, stores the data in a module-level cache so click handlers
+ *  on the header cells can re-sort without re-fetching. */
+let _costPerPrLastData = null;
+async function costPerPr() {
+  let d;
+  try { d = await get("/api/fleet/cost-per-pr"); }
+  catch (e) {
+    app.innerHTML = `<div class="loading">couldn't load cost-per-PR.<br><span class="dim">${esc(e.message)}</span></div>`;
+    return;
+  }
+  _costPerPrLastData = d;
+  summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
+  app.innerHTML = renderCostPerPrDetail(d);
+  foot.textContent = "window: " + d.window.start + " → " + d.window.end + " (" + d.window.days + " days)";
+}
+
+// Click delegate for the sortable header cells. Reads data-sort-key
+// from the <th> and re-renders against the cached payload.
+document.addEventListener("click", (e) => {
+  const th = e.target && e.target.closest && e.target.closest(".cost-per-pr-table th[data-sort-key]");
+  if (!th) return;
+  const col = th.getAttribute("data-sort-key");
+  if (!col) return;
+  if (_costPerPrSortState.col === col) {
+    _costPerPrSortState.dir = _costPerPrSortState.dir === "asc" ? "desc" : "asc";
+  } else {
+    _costPerPrSortState.col = col;
+    _costPerPrSortState.dir = "desc";
+  }
+  if (_costPerPrLastData) {
+    app.innerHTML = renderCostPerPrDetail(_costPerPrLastData);
+  }
+});
+
+// Mobile collapse expand toggle: tapping a row on phones expands the
+// hidden columns inline. The fleet-rollup row is always expanded.
+document.addEventListener("click", (e) => {
+  const row = e.target && e.target.closest && e.target.closest(".cost-per-pr-row");
+  if (!row) return;
+  if (row.classList.contains("cost-per-pr-fleet-row")) return;
+  // Don't intercept clicks on the embedded project link.
+  if (e.target.tagName === "A") return;
+  row.classList.toggle("expanded");
+});
 
 const STREAK_BAND_TITLE = {
   empty: "no activity",
@@ -1005,13 +1220,15 @@ function digestBanner(d) {
 
 async function home() {
   // Fan out /api/fleet + /api/digest/week + /api/fleet/inbox +
-  // /api/fleet/streak + /api/fleet/glance so the round-trips don't
-  // serialize. Streak banner renders above the inbox (ticket 0026);
-  // the "Yesterday at a glance" card (ticket 0033) renders ABOVE the
-  // inbox AND the streak — it's the first thing the operator sees
-  // on a morning open. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(),
+  // /api/fleet/streak + /api/fleet/glance + /api/fleet/cost-per-pr so
+  // the round-trips don't serialize. Streak banner renders above the
+  // inbox (ticket 0026); the "Yesterday at a glance" card (ticket
+  // 0033) renders ABOVE the inbox AND the streak; the "Cost per
+  // merged PR" summary (ticket 0035) renders at the very top so it's
+  // the first thing the operator sees on a morning open. Errors fall
+  // through silently per the helper.
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(),
   ]);
   const alerts = data.alerts || [];
   const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
@@ -1020,6 +1237,7 @@ async function home() {
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
     digestBanner(digestData) +
+    renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +
     renderStreak(streakData) +
     renderInbox(inboxData) +
@@ -2200,6 +2418,12 @@ async function route() {
       // (last 14 days) and the leaderboard is a "glance" view, not a
       // live monitor.
       await leaderboard();
+    } else if (path === "cost-per-pr" || path.startsWith("cost-per-pr")) {
+      // Ticket 0035: cost per merged PR detail. One-shot render — the
+      // data is a 5-min cached aggregate, not a live monitor; the
+      // home view's 5s refresh picks up new numbers via the summary
+      // line.
+      await costPerPr();
     } else {
       await home();
       timer = setInterval(() => home().catch(() => {}), 5000);
