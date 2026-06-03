@@ -665,6 +665,77 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   }
 }
 
+/* Ticket 0037: Friday wrap weekly card.
+ * Mobile-first: stats wrap 2x2 on phones (matches the 0033 morning
+ * card layout for visual consistency), single row at >=600px.
+ * Reuses existing palette tokens — no new CSS variables. The wrap
+ * uses a slightly bolder left border than the daily glance card so
+ * the two cards read as a pair when both are visible on Fridays. */
+.friday-wrap {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, background .15s;
+}
+.friday-wrap:hover { border-color: #3a3b34; background: var(--panel2); }
+.wrap-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.wrap-tap-hint {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: none;
+}
+.wrap-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.wrap-stat { color: var(--dim); white-space: nowrap; }
+.wrap-stat b { color: var(--ink); font-weight: 600; }
+.wrap-win, .wrap-watch {
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.4;
+  margin-top: 4px;
+}
+.wrap-win b { font-weight: 600; }
+.wrap-watch-drift { color: var(--bad); }
+.wrap-watch-correlation { color: var(--bad); }
+.wrap-watch-cost_trend { color: var(--warn); }
+.wrap-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+
+@media (min-width: 600px) {
+  .friday-wrap .wrap-stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
 /* Ticket 0034: self-baseline drift detail view. Three rows stacked
  * single-column on phones; each row carries the metric label, the
  * baseline mean/sigma + current value as a numeric line, and an

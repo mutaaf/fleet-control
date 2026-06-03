@@ -7,7 +7,9 @@ import { daemonStatus } from "./daemon.ts";
 import { ingestProjectPRs, projectPRs } from "./ingest/prs.ts";
 import { anomaliesForRun, recentAnomalies } from "./anomaly.ts";
 import { activeCorrelations } from "./correlate.ts";
+import { activeDrifts } from "./drift.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
+import { isoWeekKey } from "./digest.ts";
 
 const PHASES = ["ship", "groom", "review", "eng"];
 
@@ -2024,4 +2026,425 @@ export function runView(db: DB, id: number) {
   // array (not null) when the run is clean — keeps the SPA branch simple.
   const anomalies = anomaliesForRun(db, id);
   return { run, events, project, anomalies };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Friday wrap — weekly recap card (ticket 0037).
+//
+// One fleet-wide helper that powers the home page's Friday-only card:
+// the four trailing-7d headline stats (shipped PRs, $ spent, anomalies
+// flagged, active days), a single biggest_win pick, and a single
+// watch_item from a three-branch cascade. Pure composition over
+// existing tables (pr, cost_rollup_day, anomaly, ticket_commit_link,
+// project) — NO schema migration, NO ingest changes.
+//
+// Window arithmetic:
+//   - The window is the trailing 7-day span ending at `now`. End is
+//     `now` itself (ISO). Start is `now - 7d`. We bucket PRs and
+//     cost rollups by `date(fetched_at)` / `day` against
+//     [date(start), date(end)) using SQLite's `date(ts)` function —
+//     same lexicographic frame as fleetStreak / yesterdayGlance so the
+//     cells line up across helpers.
+//   - We never go through julianday() here. Per LESSONS § "julianday()
+//     drifts ~10us per timestamp" we decompose into strftime / date
+//     arithmetic for sub-ms accuracy.
+//
+// Biggest-win selection (AC2):
+//   - Sort merged PRs in window by (additions + deletions) DESC, then
+//     fetched_at DESC. Pick the first. Ticket-id resolves via the
+//     ticket_commit_link table (0018).
+//   - Returns null when there are zero merged PRs in window.
+//
+// Watch-item cascade (AC3) — first non-null match wins:
+//   1. drift        — any active self_drift anomaly (0034). Message:
+//                     `"<slug> <metric> Nx normal"`. Critical kind.
+//   2. correlation  — any active fleet_correlated anomaly (0027).
+//                     Message: `"<N> projects failing with <signature>"`.
+//                     Critical kind.
+//   3. cost_trend   — any project whose trailing 7d $/PR spend is
+//                     >= 1.5x the prior 7d $/PR. Message:
+//                     `"<slug> burn rate Nx normal"`. Non-critical kind.
+//   4. null         — no watch line.
+//
+// Quiet-hours integration (AC9):
+//   - When the FleetConfig's quietHoursActiveAnywhere() returns true,
+//     non-critical watch kinds (cost_trend) are suppressed. Critical
+//     kinds (drift, correlation) ALWAYS surface — mirrors 0030's
+//     "critical always pages" gating and the 0033 glance card's
+//     identical rule.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every typed row narrowing here uses the double-cast.
+
+export interface FridayWrapBiggestWin {
+  project_slug: string;
+  pr_number: number;
+  pr_title: string;
+  /** 4-digit ticket id when a ticket_commit_link row points at this PR,
+   *  null otherwise. The SPA renders `(<ticket_id>)` after the title. */
+  ticket_id: string | null;
+  merged_at: string;
+  size_score: number;
+}
+
+export type FridayWrapWatchKind = "drift" | "correlation" | "cost_trend";
+
+export interface FridayWrapWatchItem {
+  kind: FridayWrapWatchKind;
+  project_slug: string;
+  message: string;
+}
+
+export interface FridayWrapWindow {
+  /** ISO timestamp (with `now - 7d` for the inclusive lower bound). */
+  start: string;
+  /** ISO timestamp = `now`. */
+  end: string;
+  /** ISO-8601 week key (yyyy-Www) for the week containing `end`.
+   *  Used as the memo cache key alongside day-of-week. */
+  week_iso: string;
+}
+
+export interface FridayWrap {
+  window: FridayWrapWindow;
+  shipped_count: number;
+  spent_usd: number;
+  anomalies_count: number;
+  active_days: number;
+  biggest_win: FridayWrapBiggestWin | null;
+  watch_item: FridayWrapWatchItem | null;
+  generated_at: string;
+}
+
+// Watch kinds that survive quiet-hours demotion (mirrors the
+// yesterdayGlance critical set). cost_trend is the only kind absent
+// from this list, so the suppression rule reads as "anything not here
+// is demoted".
+const FRIDAY_WRAP_CRITICAL_WATCH_KINDS: ReadonlyArray<FridayWrapWatchKind> = [
+  "drift", "correlation",
+];
+
+// Cost-trend trigger ratio: a project's current-7d $/PR being >=1.5x
+// the prior-7d $/PR fires the watch. Matches the user story's "burn
+// rate doubled" framing while not being so strict that a quiet week
+// hides a real bump (>=1.5x is the same threshold the AC text picks).
+const FRIDAY_WRAP_COST_TREND_RATIO = 1.5;
+// Minimum baseline guards so a sparse prior window doesn't fire the
+// trend on noise (same intuition as 0035's TREND_MIN_PRS guard).
+const FRIDAY_WRAP_COST_TREND_MIN_PRIOR_PRS = 1;
+const FRIDAY_WRAP_COST_TREND_MIN_PRIOR_SPEND = 0.5;
+
+interface FridayWrapShippedRow { n: number; }
+interface FridayWrapSpentRow { spent_usd: number | null; }
+interface FridayWrapAnomalyRow { n: number; }
+interface FridayWrapActiveDaysRow { n: number; }
+interface FridayWrapBiggestWinRow {
+  project_id: number;
+  project_slug: string;
+  pr_number: number;
+  pr_title: string | null;
+  fetched_at: string;
+  additions: number | null;
+  deletions: number | null;
+}
+interface FridayWrapTicketLinkRow {
+  ticket_id: string;
+}
+interface FridayWrapCostRow {
+  project_id: number;
+  project_slug: string;
+  spent_usd: number | null;
+}
+interface FridayWrapMergedCountRow {
+  project_id: number;
+  project_slug: string;
+  prs_merged: number;
+}
+
+/** True when `now`'s day-of-week in `tz` is Friday. Uses
+ *  `Intl.DateTimeFormat` so we don't need a tz library; the parser
+ *  accepts any IANA name node supports. An invalid tz falls back to
+ *  UTC so the helper never throws (a malformed `?tz=` query param
+ *  shouldn't break the route). */
+export function isFriday(now: Date, tz?: string): boolean {
+  const zone = tz && tz.length > 0
+    ? tz
+    : (Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC");
+  let weekday: string;
+  try {
+    weekday = new Intl.DateTimeFormat("en-US", {
+      weekday: "short", timeZone: zone,
+    }).format(now);
+  } catch {
+    // Bad tz — fall back to UTC so we never throw on a malformed param.
+    weekday = new Intl.DateTimeFormat("en-US", {
+      weekday: "short", timeZone: "UTC",
+    }).format(now);
+  }
+  return weekday === "Fri";
+}
+
+/** Friday wrap weekly recap (ticket 0037). `now` defaults to wall-clock;
+ *  tests pin it. `cfg` is the optional FleetConfig used to demote
+ *  non-critical watch items during quiet hours (0030); when absent,
+ *  the watch_item is returned unmodified. */
+export function fridayWrap(
+  db: DB, now: Date = new Date(), cfg?: FleetConfig,
+): FridayWrap {
+  const nowIso = now.toISOString();
+  const windowStart = new Date(now.getTime() - 7 * 86400_000);
+  const windowStartIso = windowStart.toISOString();
+  // Bucket boundaries for date()-based GROUP BY. Inclusive lower; we
+  // use the same start/end on both sides so a PR merged exactly at
+  // `now - 7d` is in window. We compare against `date(...)` which
+  // truncates to yyyy-mm-dd, so a same-day boundary buckets to the
+  // start date.
+  const startDate = windowStartIso.slice(0, 10);
+  const endDate = nowIso.slice(0, 10);
+  const weekIso = isoWeekKey(now);
+
+  // ── shipped_count: merged PRs in window across all projects ───────
+  // Window via date(fetched_at) — same frame as fleetStreak so the
+  // four numbers line up with the GitHub-style heatmap on the home
+  // page. We count rows (the PR table already dedupes by (project_id,
+  // number)).
+  const shippedRow = db.prepare(
+    "SELECT COUNT(*) AS n FROM pr "
+    + " WHERE state = 'MERGED' "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) <= ?",
+  ).get(startDate, endDate) as unknown as FridayWrapShippedRow | undefined;
+  const shipped_count = Number(shippedRow?.n ?? 0);
+
+  // ── spent_usd: cost_rollup_day SUM across the 7 days ──────────────
+  // SUM across day in [startDate, endDate]. cost_rollup_day stores
+  // `day` as yyyy-mm-dd (UTC) so lexicographic comparison matches the
+  // chronological order.
+  const spentRow = db.prepare(
+    "SELECT SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day <= ?",
+  ).get(startDate, endDate) as unknown as FridayWrapSpentRow | undefined;
+  const spent_usd = Number(spentRow?.spent_usd ?? 0);
+
+  // ── anomalies_count: anomaly rows created in window (active OR
+  //    dismissed — the spec is explicit). ─────────────────────────────
+  const anomalyRow = db.prepare(
+    "SELECT COUNT(*) AS n FROM anomaly "
+    + " WHERE created_at IS NOT NULL "
+    + "   AND date(created_at) >= ? AND date(created_at) <= ?",
+  ).get(startDate, endDate) as unknown as FridayWrapAnomalyRow | undefined;
+  const anomalies_count = Number(anomalyRow?.n ?? 0);
+
+  // ── active_days: distinct calendar dates in window with >= 1
+  //    merged PR. ──────────────────────────────────────────────────
+  const activeDaysRow = db.prepare(
+    "SELECT COUNT(DISTINCT date(fetched_at)) AS n FROM pr "
+    + " WHERE state = 'MERGED' "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) <= ?",
+  ).get(startDate, endDate) as unknown as FridayWrapActiveDaysRow | undefined;
+  const active_days = Number(activeDaysRow?.n ?? 0);
+
+  // ── biggest_win: top by (additions + deletions), tie-break newest
+  //    merged_at. ─────────────────────────────────────────────────────
+  const winRow = db.prepare(
+    "SELECT p.id AS project_id, p.slug AS project_slug, "
+    + "       pr.number AS pr_number, pr.title AS pr_title, "
+    + "       pr.fetched_at AS fetched_at, "
+    + "       pr.additions AS additions, pr.deletions AS deletions "
+    + "  FROM pr JOIN project p ON p.id = pr.project_id "
+    + " WHERE pr.state = 'MERGED' "
+    + "   AND pr.fetched_at IS NOT NULL "
+    + "   AND date(pr.fetched_at) >= ? AND date(pr.fetched_at) <= ? "
+    + " ORDER BY (COALESCE(pr.additions,0) + COALESCE(pr.deletions,0)) DESC, "
+    + "          pr.fetched_at DESC "
+    + " LIMIT 1",
+  ).get(startDate, endDate) as unknown as FridayWrapBiggestWinRow | undefined;
+  let biggest_win: FridayWrapBiggestWin | null = null;
+  if (winRow) {
+    const size_score = (Number(winRow.additions) || 0) + (Number(winRow.deletions) || 0);
+    // Resolve ticket id by joining through ticket_commit_link on
+    // (project_slug, pr_number). The link table stores `pr_number`
+    // directly so we don't need to chase the commit graph.
+    const linkRow = db.prepare(
+      "SELECT ticket_id FROM ticket_commit_link "
+      + " WHERE project_slug = ? AND pr_number = ? "
+      + " ORDER BY ticket_id ASC LIMIT 1",
+    ).get(winRow.project_slug, winRow.pr_number) as unknown as FridayWrapTicketLinkRow | undefined;
+    biggest_win = {
+      project_slug: winRow.project_slug,
+      pr_number: winRow.pr_number,
+      pr_title: winRow.pr_title ?? "",
+      ticket_id: linkRow?.ticket_id ?? null,
+      merged_at: winRow.fetched_at,
+      size_score,
+    };
+  }
+
+  // ── watch_item cascade: drift → correlation → cost_trend → null ──
+  let watch_item: FridayWrapWatchItem | null = null;
+
+  // Priority 1: drift (0034). activeDrifts already filters to the
+  // trailing 24h non-dismissed rows, sorted DESC by created_at.
+  const drifts = activeDrifts(db, now);
+  if (drifts.length > 0) {
+    const d = drifts[0];
+    // "Nx normal" framing: current ÷ baseline_mean when the baseline
+    // is non-zero, otherwise omit the multiplier. We round to 1 decimal
+    // so the operator-visible string reads naturally.
+    let ratio = 0;
+    if (d.baseline_mean && d.baseline_mean !== 0) {
+      ratio = d.current / d.baseline_mean;
+    }
+    const ratioStr = ratio > 0 ? `${ratio.toFixed(1)}x normal` : "spiking";
+    watch_item = {
+      kind: "drift",
+      project_slug: d.project_slug,
+      message: `${d.project_slug} ${d.metric} ${ratioStr}`,
+    };
+  }
+
+  // Priority 2: correlation (0027). activeCorrelations returns the
+  // live, non-dismissed fleet_correlated rows in the trailing 24h.
+  if (!watch_item) {
+    const corr = activeCorrelations(db, now);
+    if (corr.length > 0) {
+      const c = corr[0];
+      const slugs = c.project_slugs ?? [];
+      watch_item = {
+        kind: "correlation",
+        // Correlations are cross-fleet; we still surface a
+        // project_slug so the SPA's per-slug renderer has a stable
+        // value to render. Pick the first slug; the message carries
+        // the cross-fleet "<N> projects" framing.
+        project_slug: slugs[0] ?? "fleet",
+        message: `${slugs.length} projects failing with ${c.signature}`,
+      };
+    }
+  }
+
+  // Priority 3: cost_trend. For each project we compare the trailing
+  // 7d cost/PR to the prior 7d cost/PR; trigger when the ratio is
+  // >= FRIDAY_WRAP_COST_TREND_RATIO AND the prior baseline isn't
+  // sparse (>= 1 PR AND >= $0.50). The match is the highest-ratio
+  // project; ties broken by slug ASC for determinism.
+  if (!watch_item) {
+    const priorStartIso = new Date(now.getTime() - 14 * 86400_000).toISOString();
+    const priorStartDate = priorStartIso.slice(0, 10);
+    // Per-project cost in current + prior windows.
+    const currentCost = db.prepare(
+      "SELECT cr.project_id AS project_id, p.slug AS project_slug, "
+      + "       SUM(COALESCE(cr.cost_usd, 0)) AS spent_usd "
+      + "  FROM cost_rollup_day cr JOIN project p ON p.id = cr.project_id "
+      + " WHERE cr.day >= ? AND cr.day <= ? "
+      + " GROUP BY cr.project_id, p.slug",
+    ).all(startDate, endDate) as unknown as FridayWrapCostRow[];
+    const priorCost = db.prepare(
+      "SELECT cr.project_id AS project_id, p.slug AS project_slug, "
+      + "       SUM(COALESCE(cr.cost_usd, 0)) AS spent_usd "
+      + "  FROM cost_rollup_day cr JOIN project p ON p.id = cr.project_id "
+      + " WHERE cr.day >= ? AND cr.day < ? "
+      + " GROUP BY cr.project_id, p.slug",
+    ).all(priorStartDate, startDate) as unknown as FridayWrapCostRow[];
+    const currentMerged = db.prepare(
+      "SELECT pr.project_id AS project_id, p.slug AS project_slug, "
+      + "       COUNT(*) AS prs_merged "
+      + "  FROM pr JOIN project p ON p.id = pr.project_id "
+      + " WHERE pr.state = 'MERGED' AND pr.fetched_at IS NOT NULL "
+      + "   AND date(pr.fetched_at) >= ? AND date(pr.fetched_at) <= ? "
+      + " GROUP BY pr.project_id, p.slug",
+    ).all(startDate, endDate) as unknown as FridayWrapMergedCountRow[];
+    const priorMerged = db.prepare(
+      "SELECT pr.project_id AS project_id, p.slug AS project_slug, "
+      + "       COUNT(*) AS prs_merged "
+      + "  FROM pr JOIN project p ON p.id = pr.project_id "
+      + " WHERE pr.state = 'MERGED' AND pr.fetched_at IS NOT NULL "
+      + "   AND date(pr.fetched_at) >= ? AND date(pr.fetched_at) < ? "
+      + " GROUP BY pr.project_id, p.slug",
+    ).all(priorStartDate, startDate) as unknown as FridayWrapMergedCountRow[];
+
+    const cMap = new Map<number, { slug: string; cost: number; merged: number }>();
+    for (const r of currentCost) {
+      cMap.set(r.project_id, {
+        slug: r.project_slug,
+        cost: Number(r.spent_usd ?? 0),
+        merged: 0,
+      });
+    }
+    for (const r of currentMerged) {
+      const cur = cMap.get(r.project_id) ?? { slug: r.project_slug, cost: 0, merged: 0 };
+      cur.merged = Number(r.prs_merged ?? 0);
+      cMap.set(r.project_id, cur);
+    }
+    const pMap = new Map<number, { cost: number; merged: number }>();
+    for (const r of priorCost) {
+      pMap.set(r.project_id, {
+        cost: Number(r.spent_usd ?? 0),
+        merged: 0,
+      });
+    }
+    for (const r of priorMerged) {
+      const cur = pMap.get(r.project_id) ?? { cost: 0, merged: 0 };
+      cur.merged = Number(r.prs_merged ?? 0);
+      pMap.set(r.project_id, cur);
+    }
+
+    let topRatio = 0;
+    let topSlug: string | null = null;
+    const projectIds = [...cMap.keys()].sort((a, b) => {
+      const sa = cMap.get(a)?.slug ?? "";
+      const sb = cMap.get(b)?.slug ?? "";
+      return sa.localeCompare(sb);
+    });
+    for (const pid of projectIds) {
+      const cur = cMap.get(pid)!;
+      const prior = pMap.get(pid);
+      if (!prior) continue;
+      if (prior.merged < FRIDAY_WRAP_COST_TREND_MIN_PRIOR_PRS) continue;
+      if (prior.cost < FRIDAY_WRAP_COST_TREND_MIN_PRIOR_SPEND) continue;
+      if (cur.merged <= 0 || cur.cost <= 0) continue;
+      const curDpp = cur.cost / cur.merged;
+      const priorDpp = prior.cost / prior.merged;
+      if (priorDpp <= 0) continue;
+      const ratio = curDpp / priorDpp;
+      if (ratio < FRIDAY_WRAP_COST_TREND_RATIO) continue;
+      if (ratio > topRatio) {
+        topRatio = ratio;
+        topSlug = cur.slug;
+      }
+    }
+    if (topSlug != null) {
+      watch_item = {
+        kind: "cost_trend",
+        project_slug: topSlug,
+        message: `${topSlug} burn rate ${topRatio.toFixed(1)}x normal`,
+      };
+    }
+  }
+
+  // ── Quiet-hours demotion (0030) — non-critical kinds only ────────
+  if (
+    watch_item
+    && cfg
+    && !FRIDAY_WRAP_CRITICAL_WATCH_KINDS.includes(watch_item.kind)
+    && quietHoursActiveAnywhere(cfg, now)
+  ) {
+    watch_item = null;
+  }
+
+  return {
+    window: {
+      start: windowStartIso,
+      end: nowIso,
+      week_iso: weekIso,
+    },
+    shipped_count,
+    spent_usd,
+    anomalies_count,
+    active_days,
+    biggest_win,
+    watch_item,
+    generated_at: nowIso,
+  };
 }

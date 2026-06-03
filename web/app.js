@@ -583,6 +583,19 @@ async function fetchCostPerPr() {
   try { return await get("/api/fleet/cost-per-pr"); } catch { return null; }
 }
 
+// Ticket 0037: "Friday wrap" weekly recap card. One trailing-7d
+// summary at the very top of the home page — shipped PRs, dollars
+// spent, anomalies, active days, plus a biggest_win line and an
+// optional watch_item. Lazy-fetched from /api/fleet/friday-wrap so
+// the home payload stays small; the route always returns 200 so the
+// SPA can pre-fetch on any day and decide-to-render via the
+// `visible` boolean. Errors fall through silently — the card just
+// disappears for that render cycle and the rest of the home page
+// still loads.
+async function fetchFridayWrap() {
+  try { return await get("/api/fleet/friday-wrap"); } catch { return null; }
+}
+
 /** Skeleton block shown while /api/fleet/glance is in flight. Carries
  *  `aria-busy="true"` so screen readers announce the loading state;
  *  the pulsing animation flattens under
@@ -631,6 +644,62 @@ function renderYesterdayGlance(data) {
       <span class="glance-stat"><b>${streak}</b> day${streak === 1 ? "" : "s"} streak</span>
     </div>
     <div class="glance-verdict glance-verdict-${safeKind}">${safeMessage}</div>
+  </a>`;
+}
+
+/** Render the Friday-wrap weekly card. Returns an empty string when
+ *  the API response is missing OR has `visible: false` — the card is
+ *  invisible Saturday through Thursday (no skeleton, no whitespace,
+ *  no DOM element). On Fridays the card sits ABOVE the 0033
+ *  "Last 24 hours" glance card (and below the 0035 cost-per-PR
+ *  summary line). Tapping anywhere navigates to the weekly digest.
+ *
+ *  Per LESSONS § "defence-in-depth secret redaction at the renderer
+ *  boundary": biggest_win.pr_title and watch_item.message pass
+ *  through redactSecrets before insertion so a future ingest
+ *  regression that smuggles a token-shaped substring is defanged at
+ *  the render boundary. */
+function renderFridayWrap(data) {
+  if (!data || !data.visible) return "";
+  const shipped = Number(data.shipped_count || 0);
+  const spent = Number(data.spent_usd || 0);
+  const anomalies = Number(data.anomalies_count || 0);
+  const activeDays = Number(data.active_days || 0);
+  // Biggest-win line. Redact + escape before insertion. Missing →
+  // omit the line entirely (no "Biggest win: —" placeholder; the
+  // wrap reads cleanly without it).
+  let winLine = "";
+  if (data.biggest_win) {
+    const win = data.biggest_win;
+    const safeSlug = esc(redactSecrets(String(win.project_slug || "")));
+    const safeTitle = esc(redactSecrets(String(win.pr_title || "")));
+    const ticket = win.ticket_id
+      ? ` (${esc(redactSecrets(String(win.ticket_id)))})`
+      : "";
+    winLine = `<div class="wrap-win"><span class="wrap-eyebrow dim">Biggest win:</span>`
+      + ` <b>${safeSlug}</b> · ${safeTitle}${ticket}</div>`;
+  }
+  // Watch-item line. Omitted entirely when null (the operator's week
+  // has nothing worrying — let the card stay positive).
+  let watchLine = "";
+  if (data.watch_item) {
+    const watch = data.watch_item;
+    const safeWatch = esc(redactSecrets(String(watch.message || "")));
+    const safeWatchKind = esc(String(watch.kind || ""));
+    watchLine = `<div class="wrap-watch wrap-watch-${safeWatchKind}">`
+      + `<span class="wrap-eyebrow dim">Watch over weekend:</span> ${safeWatch}</div>`;
+  }
+  // Tap-anywhere → weekly digest (the deep-dive surface).
+  return `<a class="friday-wrap" data-testid="friday-wrap" href="#/digest" aria-label="This week — tap for full digest">
+    <div class="wrap-title">This week <span class="wrap-tap-hint dim">tap for full digest</span></div>
+    <div class="wrap-stats">
+      <span class="wrap-stat"><b>${shipped}</b> PR${shipped === 1 ? "" : "s"} shipped</span>
+      <span class="wrap-stat"><b>${usd(spent)}</b> spent</span>
+      <span class="wrap-stat"><b>${anomalies}</b> anomal${anomalies === 1 ? "y" : "ies"}</span>
+      <span class="wrap-stat"><b>${activeDays}</b> day${activeDays === 1 ? "" : "s"} active</span>
+    </div>
+    ${winLine}
+    ${watchLine}
   </a>`;
 }
 
@@ -1225,15 +1294,18 @@ function digestBanner(d) {
 
 async function home() {
   // Fan out /api/fleet + /api/digest/week + /api/fleet/inbox +
-  // /api/fleet/streak + /api/fleet/glance + /api/fleet/cost-per-pr so
-  // the round-trips don't serialize. Streak banner renders above the
-  // inbox (ticket 0026); the "Yesterday at a glance" card (ticket
-  // 0033) renders ABOVE the inbox AND the streak; the "Cost per
-  // merged PR" summary (ticket 0035) renders at the very top so it's
-  // the first thing the operator sees on a morning open. Errors fall
-  // through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(),
+  // /api/fleet/streak + /api/fleet/glance + /api/fleet/cost-per-pr +
+  // /api/fleet/friday-wrap so the round-trips don't serialize.
+  // Streak banner renders above the inbox (ticket 0026); the
+  // "Yesterday at a glance" card (ticket 0033) renders ABOVE the
+  // inbox AND the streak; the "Cost per merged PR" summary (ticket
+  // 0035) renders above the glance; the "Friday wrap" weekly card
+  // (ticket 0037) renders at the very top on Fridays, invisible
+  // otherwise — its renderer returns "" when `visible:false` so the
+  // home page is byte-identical to the pre-0037 render on
+  // Saturday-Thursday. Errors fall through silently per the helper.
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(),
   ]);
   const alerts = data.alerts || [];
   const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
@@ -1242,6 +1314,7 @@ async function home() {
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
     digestBanner(digestData) +
+    renderFridayWrap(fridayWrapData) +
     renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +
     renderStreak(streakData) +
