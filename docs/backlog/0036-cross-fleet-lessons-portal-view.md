@@ -1,7 +1,7 @@
 ---
 id: 0036
 title: Cross-fleet lessons portal view - the file the operator never sees becomes a daily surface
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-03
@@ -349,3 +349,5 @@ Each box maps 1:1 to a test scenario.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-03 - branch `feat/0036-lessons-portal-view` opened
+- 2026-06-03 - PR #86 opened
+- 2026-06-03 - PR #86 merged to main
