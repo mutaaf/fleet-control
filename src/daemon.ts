@@ -13,6 +13,7 @@ import { evalAlerts } from "./alerts.ts";
 import { runBudgetGuards } from "./budget_guard.ts";
 import { runCorrelationHook } from "./correlate.ts";
 import { runDriftHook } from "./drift.ts";
+import { runLessonsHook } from "./lessons.ts";
 
 const UID = process.getuid?.() ?? 0;
 const LABEL = "com.fleet.control.fleetd";
@@ -65,6 +66,19 @@ export async function runDaemon(intervalSec = 60): Promise<void> {
         const inserted = runDriftHook(db, new Date());
         if (inserted) console.log(`${new Date().toISOString()} ${inserted} new self-drift detection(s)`);
       } catch (e) { console.error("drift hook error:", e); }
+      // Ticket 0036: cross-fleet lessons once-per-day diff. Reads the
+      // CROSS_LESSONS.md file via loadCrossLessons, diffs the total
+      // against the `cross_lessons_total` watermark, and writes a
+      // fresh `cross_lessons_last_new` watermark when a positive
+      // delta exists. Idempotent across ticks via the 24h aging
+      // window per LESSONS § "re-fire-after-dismiss needs an aging
+      // window, not a partial UNIQUE index". Cheap (one file read +
+      // two watermark reads/writes); safe to run every tick — the
+      // aging window keeps the inbox row stable.
+      try {
+        const inserted = runLessonsHook(db, new Date());
+        if (inserted) console.log(`${new Date().toISOString()} ${inserted} new fleet-lessons batch detected`);
+      } catch (e) { console.error("lessons hook error:", e); }
     } catch (e) { console.error("pass error:", e); }
     await sleep(intervalSec);
   }
