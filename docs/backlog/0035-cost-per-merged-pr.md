@@ -282,3 +282,13 @@ Each box maps 1:1 to a test scenario.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-03 - branch `feat/0035-cost-per-merged-pr` opened
+- 2026-06-03 - failing test added in `tests/cost-per-pr.test.ts` (one
+  test per AC checkbox)
+- 2026-06-03 - implemented `costPerMergedPr(db, opts)` in
+  `src/views.ts`, `/api/fleet/cost-per-pr` route + 5-min memo cache +
+  `_resetCostPerPrCacheForTests` / `_getCostPerPrCacheBuildsForTests`
+  seams in `src/server.ts`, `renderCostPerPrSummary` (above the 0033
+  glance card) + `renderCostPerPrDetail` (sortable table with
+  fleet-rollup row + mobile collapse) in `web/app.js`, and supporting
+  selectors in `web/style.css`. All 11 AC tests pass; perf gate
+  (AC10) is opt-in via `PERF=1`.

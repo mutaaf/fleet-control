@@ -753,3 +753,122 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .project-drift .drift-row-head { font-size: 12px; }
   .project-drift .drift-row-stats { font-size: 11px; }
 }
+
+/* Ticket 0035: cost per merged PR.
+ *
+ * Mobile-first: the summary line on the home page wraps gracefully on
+ * a 375px viewport, and the detail-page table collapses to one row
+ * per project (slug + $/PR + trend) — tapping a row expands the
+ * hidden columns inline. The fleet-rollup row is always expanded
+ * and uses a top border to separate it visually from the project
+ * list.
+ *
+ * Reuses the existing palette tokens (--panel / --line / --dim /
+ * --accent / --ink) so no new variables enter the theme. */
+
+.cost-per-pr-summary {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  text-decoration: none;
+  color: inherit;
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 1.4;
+  transition: border-color .15s, background .15s;
+}
+.cost-per-pr-summary:hover { border-color: #3a3b34; background: var(--panel2); }
+.cost-per-pr-summary .cost-per-pr-headline b,
+.cost-per-pr-summary .cost-per-pr-stat b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.cost-per-pr-summary .cost-per-pr-stat { color: var(--dim); white-space: nowrap; }
+.cost-per-pr-summary .cost-per-pr-sep { color: var(--faint); margin: 0 2px; }
+.cost-per-pr-summary .cost-per-pr-empty {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* Detail table.
+ *
+ * On phones (<= 375px / default mobile-first): the table renders as a
+ * stack of single-line rows showing slug + $/PR + trend glyph only;
+ * the spent + PRs columns are hidden via the .mobile-hide class. When
+ * a row is tapped (JS toggles .expanded), the hidden columns slide
+ * into view as a second line.
+ *
+ * On >= 600px: the table is laid out as a regular 5-column grid.
+ */
+.cost-per-pr-detail { margin: 12px 0 22px; }
+.cost-per-pr-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.cost-per-pr-table thead th {
+  text-align: left;
+  padding: 8px 10px;
+  font-weight: 600;
+  color: var(--dim);
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  user-select: none;
+}
+.cost-per-pr-table thead th.active { color: var(--ink); }
+.cost-per-pr-table tbody td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.cost-per-pr-table tbody tr:hover td { background: var(--panel2); }
+.cost-per-pr-row .cost-per-pr-trend-up { color: var(--warn); }
+.cost-per-pr-row .cost-per-pr-trend-down { color: var(--good); }
+.cost-per-pr-row .cost-per-pr-trend-flat { color: var(--dim); }
+.cost-per-pr-row .cost-per-pr-trend-none { color: var(--faint); }
+.cost-per-pr-row .cost-per-pr-na { color: var(--faint); }
+
+/* Fleet rollup: the last row, visually separated by a thicker top
+ * border that breaks the per-project sequence. Always expanded
+ * regardless of any .expanded toggle. */
+.cost-per-pr-table tbody tr.cost-per-pr-fleet-row td {
+  border-top: 2px solid var(--accent);
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--panel);
+}
+
+/* Mobile collapse: at <=599px (default), hide the spent + PRs columns
+ * (cells 2 and 3) on per-project rows; show them when the row is
+ * tapped (.expanded). The fleet-rollup row always shows everything.
+ *
+ * The trend cell stays visible — it's the most useful glyph at a
+ * glance per the user story ("phone collapses to slug + $/PR + trend
+ * glyph"). */
+@media (max-width: 599px) {
+  .cost-per-pr-table thead th:nth-child(2),
+  .cost-per-pr-table thead th:nth-child(3),
+  .cost-per-pr-table tbody tr:not(.cost-per-pr-fleet-row):not(.expanded) td:nth-child(2),
+  .cost-per-pr-table tbody tr:not(.cost-per-pr-fleet-row):not(.expanded) td:nth-child(3) {
+    display: none;
+  }
+  .cost-per-pr-row { cursor: pointer; }
+  .cost-per-pr-table { display: table; }
+}
+
+/* Desktop upgrade: at >=600px the full 5-column layout always shows
+ * (the .expanded toggle becomes a no-op). */
+@media (min-width: 600px) {
+  .cost-per-pr-table thead th:nth-child(2),
+  .cost-per-pr-table thead th:nth-child(3),
+  .cost-per-pr-table tbody tr td:nth-child(2),
+  .cost-per-pr-table tbody tr td:nth-child(3) {
+    display: table-cell;
+  }
+  .cost-per-pr-detail .cost-per-pr-table { display: table; }
+}

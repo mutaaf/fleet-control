@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, type YesterdayGlance } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, type YesterdayGlance, type CostPerMergedPr } from "./views.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
@@ -129,6 +129,58 @@ function getGlanceCached(db: DB, cfg: FleetConfig, now: Date): YesterdayGlance {
   glanceBuildCounter += 1;
   const value = yesterdayGlance(db, now, cfg);
   glanceCache.set(key, { value, expires_at: Date.now() + GLANCE_TTL_MS });
+  return value;
+}
+
+// Ticket 0035: "Cost per merged PR" memo cache.
+//
+// 5-minute TTL keyed by `(days, now-rounded-to-5-min)` per the AC. One
+// module-level Map; expired rows fall out lazily on the next lookup. Per
+// LESSONS § "in-process dedup sets need an explicit reset hook for
+// tests": we expose `_resetCostPerPrCacheForTests()`. Per LESSONS §
+// "expose a build counter for cache-hit tests, not a fetcher swap": we
+// also expose a read-only `_getCostPerPrCacheBuildsForTests()` that
+// ticks on every cache MISS so route tests can assert hit/miss
+// semantics without stubbing SQL. Production code never reads either.
+interface CostPerPrCacheEntry { value: CostPerMergedPr; expires_at: number; }
+const COST_PER_PR_TTL_MS = 300_000; // 5 minutes per the AC
+const costPerPrCache = new Map<string, CostPerPrCacheEntry>();
+let costPerPrBuildCounter = 0;
+
+export function _resetCostPerPrCacheForTests(): void {
+  costPerPrCache.clear();
+  costPerPrBuildCounter = 0;
+}
+
+export function _getCostPerPrCacheBuildsForTests(): number {
+  return costPerPrBuildCounter;
+}
+
+function fiveMinKey(now: Date, days: number): string {
+  // Floor `now` to a 5-minute bucket in UTC. yyyy-mm-ddTHH:MM with the
+  // minute integer rounded down to a multiple of 5. The `days` query
+  // value is folded into the key so a request that toggles between
+  // /api/fleet/cost-per-pr?days=14 and ?days=30 doesn't return the
+  // wrong window.
+  const iso = now.toISOString();
+  const hh = iso.slice(11, 13);
+  const m = parseInt(iso.slice(14, 16), 10);
+  const bucket = Math.floor(m / 5) * 5;
+  const mm = String(bucket).padStart(2, "0");
+  return `${iso.slice(0, 10)}T${hh}:${mm}|d=${days}`;
+}
+
+/** Look up a fresh cost-per-PR payload from the memo cache; rebuild on
+ *  miss. The cache key folds `days` together with `now` rounded to a
+ *  5-minute bucket so two phones polling within the same window share
+ *  one build. */
+function getCostPerPrCached(db: DB, now: Date, days: number): CostPerMergedPr {
+  const key = fiveMinKey(now, days);
+  const hit = costPerPrCache.get(key);
+  if (hit && hit.expires_at > Date.now()) return hit.value;
+  costPerPrBuildCounter += 1;
+  const value = costPerMergedPr(db, { now, days });
+  costPerPrCache.set(key, { value, expires_at: Date.now() + COST_PER_PR_TTL_MS });
   return value;
 }
 
@@ -391,6 +443,25 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=60",
+          });
+          return res.end(body);
+        }
+        // Ticket 0035: cost per merged PR — the single number that
+        // frames spend in value terms. Composes existing pr +
+        // cost_rollup_day + project tables; no schema migration. The
+        // 5-minute memo cache is keyed by (days, now-rounded-to-5-min)
+        // so polled SPA refreshes inside the window share one build —
+        // matches the AC's "5 min — this number changes slowly" framing
+        // and the SW cache (0029) survives a phone refresh inside the
+        // window. Net-new route; no existing JSON shape to preserve.
+        if (path === "/api/fleet/cost-per-pr") {
+          const days = clampDays(url.searchParams.get("days"));
+          const v = getCostPerPrCached(db, new Date(), days);
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=300",
           });
           return res.end(body);
         }
