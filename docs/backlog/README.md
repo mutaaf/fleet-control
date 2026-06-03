@@ -21,7 +21,7 @@ proposes new ones, `review` grades them.
 |----|-------|----------|--------|------|
 | 0037 | Friday wrap - one weekly card recaps the fleet's week so the operator closes the laptop on a high | P2 | groomed | portal |
 | 0036 | Cross-fleet lessons portal view - the file the operator never sees becomes a daily surface | P1 | groomed | portal |
-| 0035 | Cost per merged PR - the single number that frames spend in value terms | P1 | in-progress | observability |
+| 0035 | Cost per merged PR - the single number that frames spend in value terms | P1 | shipped | observability |
 | 0032 | Welcome banner prints LAN URL + ASCII-QR so the phone is paired in 60 seconds | P1 | shipped | infra |
 | 0033 | Yesterday at a glance - single morning card recaps shipped, spent, broken | P1 | shipped | portal |
 | 0034 | Self-baseline drift detector - flag when a project diverges from its OWN 14-day shape | P2 | shipped | observability |

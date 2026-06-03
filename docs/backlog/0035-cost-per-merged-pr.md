@@ -1,7 +1,7 @@
 ---
 id: 0035
 title: Cost per merged PR - the single number that frames spend in value terms
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-03
@@ -292,3 +292,5 @@ Each box maps 1:1 to a test scenario.
   fleet-rollup row + mobile collapse) in `web/app.js`, and supporting
   selectors in `web/style.css`. All 11 AC tests pass; perf gate
   (AC10) is opt-in via `PERF=1`.
+- 2026-06-03 - PR #84 opened and squash-merged via auto-merge; both
+  gating checks (typecheck + validate) green.
