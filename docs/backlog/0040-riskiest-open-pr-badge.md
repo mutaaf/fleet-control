@@ -1,7 +1,7 @@
 ---
 id: 0040
 title: Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-05
@@ -390,3 +390,7 @@ Each box maps 1:1 to a test scenario.
   ingester (src/ingest/prs.ts line 164), not `'OPEN'` as the AC text
   suggested. The schema is the source of truth; the helper queries
   `state = 'open' AND is_agent = 1`.
+- 2026-06-05 [ship/0040] PR #91 merged on green typecheck + validate.
+  Flipped status to `shipped` via chore branch (auto-merge was already
+  armed and consumed before the same-branch flip could land — matches
+  the LESSONS#0020 ship-loop pattern).

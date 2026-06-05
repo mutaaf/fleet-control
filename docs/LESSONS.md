@@ -439,3 +439,32 @@ own the full boot stdout — otherwise the operator gets two banners
 that race the kernel's listen callback in unpredictable order. Same
 trap will bite future subcommands (`fleetctl serve --json-logs`,
 `fleetctl serve --quiet`, etc.) that want to control startup output.
+
+## 2026-06-05 — groomer prose can disagree with the schema; the schema wins
+
+Symptom: ticket 0040 (riskiest open PR badge) specified the helper's
+main query as `SELECT FROM pr WHERE state = 'OPEN' AND is_agent = 1`
+in upper-case prose. The first cut of `riskiestOpenPr()` followed the
+prose verbatim and returned `open_count: 0` against every fixture
+that seeded `state: 'open'` — because the production ingester
+(`src/ingest/prs.ts` line 164) writes the literal string `'open'`
+(lower-case) on every pass, and SQLite's `=` is case-sensitive on
+TEXT comparisons by default (no `COLLATE NOCASE`). The helper's tests
+failed instantly; tsc was clean (a string literal compares to any
+string at the type level); the validator was clean (no schema change
+needed). Only the run-the-tests step caught it. Cause: the groomer's
+spec text was written without round-tripping through the actual schema
+— it described the INTENT (open PRs only) using one casing, while the
+ingester historically picked another. Fix: query `state = 'open'` and
+document the reconciliation in the Implementation log. General rule
+for this repo: when a ticket's engineering notes name a column value
+literally (state, ci_state, outcome, kind, phase), `grep` the
+ingester / writer paths in `src/ingest/*.ts` for that exact column
+before writing the SELECT — the source of truth is the producer, not
+the spec. Same family as the courtiq cross-fleet lesson
+"groomer billing-shorthand vs schema": the spec is a hint, the
+schema is the contract. `cost_rollup_day.phase`, `run.outcome`,
+`pr.ci_state` (`'red' | 'pending' | 'green' | 'none'` — NOT the
+GitHub-rollup tokens FAILURE/SUCCESS/PENDING the spec used), and
+`anomaly.kind` are all places this trap could bite next; the producer
+file is the chokepoint to grep.
