@@ -1,7 +1,7 @@
 ---
 id: 0039
 title: Fleet changelog - one chronological page of every merged PR across every project, ticket-linked
-status: proposed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-05
@@ -350,4 +350,25 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-05 — implementation-dev: branch `feat/0039-fleet-changelog-page`
+  opened. Mark ticket in-progress, sync README. Schema-vs-prose
+  reconciliation (per LESSONS § "groomer prose can disagree with the
+  schema; the schema wins"): grepped every `INSERT INTO pr ...` writer
+  + every existing WHERE-state read in `src/views.ts`. Two findings:
+  (a) `src/ingest/prs.ts` only writes OPEN PRs (state literal `'open'`
+  lower-case) — it never inserts MERGED rows; (b) every existing
+  reader in `src/views.ts` that targets merged PRs uses `state =
+  'MERGED'` (UPPER-case). So MERGED rows are seeded externally
+  (tests, future ingest, fixtures) and the repo-wide convention is
+  uppercase `'MERGED'`. The ticket's prose is correct here. The
+  changelog WHERE clause uses `pr.state = 'MERGED' AND pr.is_agent = 1`
+  to match this convention. Same casing the rest of the file uses
+  (`fleetStreak`, `costPerMergedPr`, `fridayWrap`, `mondayCatchUp`).
+- 2026-06-05 — implementation-dev: ticket_commit_link join columns
+  verified against `src/db.ts` lines 226-238: PK is (project_slug,
+  commit_sha, ticket_id) with optional pr_number — same join keys the
+  `mondayCatchUp` biggest-ship lookup uses (`project_slug + pr_number`).
+  Cache-invalidation hook lives in `src/ingest/index.ts`
+  `runIngestPass()` post-COMMIT tail (line 59); we add one call to
+  `_resetChangelogCacheForTests()` there guarded by an import — and
+  re-export the helper from `src/server.ts` for tests.
