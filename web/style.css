@@ -736,6 +736,83 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   }
 }
 
+/* Ticket 0038: Monday morning catch-up card. Sits at the absolute
+ * top of the home page on Mondays only (the renderer returns "" on
+ * other days so no DOM element is emitted). Reuses the same 2x2
+ * mobile / 4-column desktop grid the 0033 yesterday-glance and 0037
+ * friday-wrap cards use so the three cards read as a triad.
+ *
+ * Border colour: a slightly different stripe from the friday-wrap
+ * (warn amber) so when both happen to render the operator's eye
+ * separates "weekend recap" from "weekly recap" — we use the
+ * neutral --accent for "you're back". Reuses existing palette
+ * tokens — no new CSS variables. */
+.monday-catchup {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, background .15s;
+}
+.monday-catchup:hover { border-color: #3a3b34; background: var(--panel2); }
+.catchup-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.catchup-window {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .04em;
+  text-transform: none;
+}
+.catchup-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.catchup-stat { color: var(--dim); white-space: nowrap; }
+.catchup-stat b { color: var(--ink); font-weight: 600; }
+.catchup-ship, .catchup-needs {
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.4;
+  margin-top: 4px;
+}
+.catchup-ship b { font-weight: 600; }
+.catchup-needs-pr_review { color: var(--ink); }
+.catchup-needs-self_drift { color: var(--bad); }
+.catchup-needs-self_cancel_warn { color: var(--warn); }
+.catchup-needs-hung_run { color: var(--warn); }
+.catchup-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+
+@media (min-width: 600px) {
+  .monday-catchup .catchup-stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
 /* Ticket 0040: Riskiest open PR badge. One inline line above the
  * project grid. Two-line layout on phones (label on top, "tend it
  * now" link below); collapses to a single row with the link right-

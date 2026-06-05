@@ -1,7 +1,7 @@
 ---
 id: 0038
 title: Monday morning catch-up - bridges the weekend gap between Friday wrap and Yesterday glance
-status: proposed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-05
@@ -313,4 +313,12 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-05 — implementation-dev (Opus 4.7): branch `feat/0038-monday-catchup-card`.
+  Writing failing tests for each AC, then implementing `mondayCatchUp(db, now, opts)`
+  + `isMonday` / `weekendWindowStart` helpers in `src/views.ts`, the
+  `/api/fleet/monday-catchup` route + memo cache + last-seen watermark upsert in
+  `src/server.ts`, and the `renderMondayCatchUp(data)` helper in `web/app.js`.
+  Schema reconciliation per the 2026-06-05 LESSONS entry: production ingester
+  writes `pr.state = 'open'` lowercase for open PRs; merged PRs are seeded as
+  `'MERGED'` upper-case (the codebase convention every other view uses). The
+  helper queries match this exact casing.

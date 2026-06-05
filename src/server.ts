@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -387,6 +387,128 @@ function getRiskiestPrCached(db: DB, cfg: FleetConfig, now: Date): RiskiestOpenP
   return value;
 }
 
+// Ticket 0038: "Monday morning catch-up" memo cache.
+//
+// 3-min TTL keyed by `(actor_key, day_iso)`. The catch-up data
+// changes faster than the friday-wrap because new PRs may merge mid-
+// morning, so the AC picks 3 minutes over 10. The day_iso component
+// of the key means a new calendar day always rebuilds even if a
+// stale entry happens to still be inside the TTL window.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetMondayCatchUpCacheForTests()`. Per
+// LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap" we also expose a read-only
+// `_getMondayCatchUpCacheBuildsForTests()` that ticks on every
+// cache MISS so route tests assert hit/miss semantics without
+// stubbing SQL. Production code never reads either.
+interface MondayCatchUpCacheEntry {
+  value: MondayCatchUp & { visible: boolean };
+  expires_at: number;
+}
+const MONDAY_CATCHUP_TTL_MS = 180_000; // 3 minutes per the AC.
+const mondayCatchUpCache = new Map<string, MondayCatchUpCacheEntry>();
+let mondayCatchUpBuildCounter = 0;
+
+export function _resetMondayCatchUpCacheForTests(): void {
+  mondayCatchUpCache.clear();
+  mondayCatchUpBuildCounter = 0;
+}
+
+export function _getMondayCatchUpCacheBuildsForTests(): number {
+  return mondayCatchUpBuildCounter;
+}
+
+/** Resolve the tz string for a /api/fleet/monday-catchup request. Per
+ *  the engineering note in the ticket: `?tz=<iana>` is whitelisted
+ *  against `Intl.supportedValuesOf("timeZone")` before use. An invalid
+ *  tz falls back to the server's local tz so a malformed query
+ *  param can't surface a 500. Identical posture to the friday-wrap
+ *  resolver above. */
+function resolveMondayCatchUpTz(raw: string | null): string {
+  const fallback = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
+  if (!raw) return fallback;
+  const supported = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf;
+  if (typeof supported === "function") {
+    let names: string[];
+    try { names = supported("timeZone"); } catch { return fallback; }
+    if (!names.includes(raw)) return fallback;
+    return raw;
+  }
+  try { new Intl.DateTimeFormat("en-US", { timeZone: raw }); return raw; }
+  catch { return fallback; }
+}
+
+function mondayCatchUpCacheKey(now: Date, tz: string, actorKey: string): string {
+  // (actor_key, day_iso, tz) composite. The actor_key partitions by
+  // who is calling so a loopback hit doesn't share a cache row with a
+  // remote token's hit (the lastSeenAt watermark is per-actor).
+  const ymd = now.toISOString().slice(0, 10);
+  return `${actorKey}|${ymd}|tz=${tz}`;
+}
+
+/** Look up a fresh monday-catchup payload from the memo cache; rebuild
+ *  on miss. The cache key folds the actor (loopback vs token id), the
+ *  calendar day, and the requested tz so two polled refreshes inside
+ *  the 3-min TTL share one build, but a fresh actor — or a fresh day
+ *  — invalidates immediately. */
+function getMondayCatchUpCached(
+  db: DB, now: Date, tz: string, actorKey: string, lastSeenAt: string | null,
+): MondayCatchUp & { visible: boolean } {
+  const key = mondayCatchUpCacheKey(now, tz, actorKey);
+  const hit = mondayCatchUpCache.get(key);
+  if (hit && hit.expires_at > Date.now()) return hit.value;
+  mondayCatchUpBuildCounter += 1;
+  const catchUp = mondayCatchUp(db, now, {
+    tz,
+    lastSeenAt: lastSeenAt ?? undefined,
+  });
+  const value = { ...catchUp, visible: isMonday(now, tz) };
+  mondayCatchUpCache.set(key, { value, expires_at: Date.now() + MONDAY_CATCHUP_TTL_MS });
+  return value;
+}
+
+/** Stable per-actor key used for the home_last_seen_<actor> watermark
+ *  + the monday-catchup cache partition. Loopback is the literal
+ *  string "loopback"; a remote token is the token's id (the SHA-256
+ *  digest of the plaintext — never the plaintext itself). */
+function actorKeyFor(req: any, principal: TokenRecord | null): string {
+  if (principal) return principal.id_prefix;
+  return isLoopback(req) ? "loopback" : "anonymous";
+}
+
+/** Upsert the home_last_seen_<actor> watermark row on every
+ *  authenticated GET to /api/fleet. Reuses the existing watermark
+ *  table (no schema migration). The previous cursor (if any) is
+ *  returned so the monday-catchup helper can consult it on the SAME
+ *  request — that is the value the AC asks for. */
+function upsertHomeLastSeen(
+  db: DB, actorKey: string, nowIso: string,
+): string | null {
+  const source = `home_last_seen_${actorKey}`;
+  const priorRow = db.prepare(
+    "SELECT cursor FROM watermark WHERE source = ?",
+  ).get(source) as { cursor: string } | undefined;
+  const prior = priorRow?.cursor ?? null;
+  db.prepare(
+    "INSERT INTO watermark(source, cursor, updated_at) VALUES (?, ?, ?) "
+    + "ON CONFLICT(source) DO UPDATE SET cursor = excluded.cursor, "
+    + "updated_at = excluded.updated_at",
+  ).run(source, nowIso, nowIso);
+  return prior;
+}
+
+/** Read the current home_last_seen_<actor> cursor without upserting.
+ *  The monday-catchup route reads this on each call so the window
+ *  start is the LATER of (Friday 17:00, last_seen). */
+function readHomeLastSeen(db: DB, actorKey: string): string | null {
+  const source = `home_last_seen_${actorKey}`;
+  const row = db.prepare(
+    "SELECT cursor FROM watermark WHERE source = ?",
+  ).get(source) as { cursor: string } | undefined;
+  return row?.cursor ?? null;
+}
+
 function getLessonsCached(path: string): CrossLessonsLoadResult {
   // Read mtime first so a swap-in of a different file (via the env
   // override) or a `utimesSync` from a test invalidates the cache.
@@ -605,6 +727,17 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
         if (path === "/api/fleet") {
+          // Ticket 0038: every authenticated GET to /api/fleet upserts a
+          // home_last_seen_<actor> watermark row so the Monday catch-up
+          // window can start at the LATER of (Friday 17:00, last-seen).
+          // The watermark table is reused — no new schema. The JSON
+          // shape of /api/fleet is unchanged (the AC is explicit).
+          try {
+            upsertHomeLastSeen(
+              db, actorKeyFor(req, rauth.principal),
+              new Date().toISOString(),
+            );
+          } catch { /* watermark row is best-effort; never block /api/fleet */ }
           const v = fleetView(db, cfg);
           // Ticket 0022: ?sort=health re-orders the project grid
           // ascending by health.score (worst first) so the operator's
@@ -682,6 +815,29 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=600",
+          });
+          return res.end(body);
+        }
+        // Ticket 0038: Monday morning catch-up. Composes pr +
+        // cost_rollup_day + alert + anomaly + ticket_commit_link into
+        // one payload; the route always returns 200 so the SPA can
+        // pre-fetch on any day and decide-to-render via the
+        // `visible` boolean (the day-of-week gate). 3-min memo cache
+        // keyed by (actor_key, day_iso, tz). The `lastSeenAt` value
+        // is read from the watermark row that /api/fleet upserts on
+        // every authenticated GET, so the Monday catch-up window
+        // starts at the LATER of (Friday 17:00, last-seen). Net-new
+        // route; no existing JSON shape to preserve.
+        if (path === "/api/fleet/monday-catchup") {
+          const tz = resolveMondayCatchUpTz(url.searchParams.get("tz"));
+          const actorKey = actorKeyFor(req, rauth.principal);
+          const lastSeen = readHomeLastSeen(db, actorKey);
+          const v = getMondayCatchUpCached(db, new Date(), tz, actorKey, lastSeen);
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=180",
           });
           return res.end(body);
         }

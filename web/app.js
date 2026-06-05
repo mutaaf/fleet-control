@@ -596,6 +596,20 @@ async function fetchFridayWrap() {
   try { return await get("/api/fleet/friday-wrap"); } catch { return null; }
 }
 
+// Ticket 0038: "Monday morning catch-up" card. Bridges the weekend
+// gap between the Friday wrap (0037) and the daily Yesterday glance
+// (0033). One trailing "since Friday 17:00" summary at the absolute
+// top of the home page on MONDAYS ONLY — shipped PRs, dollars
+// spent, waiting PRs, open alerts, plus a biggest_ship line and an
+// optional needs_you item. Lazy-fetched from /api/fleet/monday-
+// catchup; the route always returns 200 so the SPA can pre-fetch on
+// any day and decide-to-render via the `visible` boolean. Errors
+// fall through silently — the card just disappears for that render
+// cycle and the rest of the home page still loads.
+async function fetchMondayCatchUp() {
+  try { return await get("/api/fleet/monday-catchup"); } catch { return null; }
+}
+
 // Ticket 0040: "Riskiest open PR" badge. One-line surface above the
 // project grid (and below any visible 0033/0037/0038 card) that names
 // THE single open agent PR the operator should tend next. Lazy-fetched
@@ -668,6 +682,76 @@ function renderYesterdayGlance(data) {
  *  through redactSecrets before insertion so a future ingest
  *  regression that smuggles a token-shaped substring is defanged at
  *  the render boundary. */
+// Ticket 0038: "Monday morning catch-up" card. Renders ONLY when the
+// API response carries `visible: true` (the day-of-week gate lives
+// on the server). On Tuesday–Sunday the route returns visible:false
+// and this renderer returns "" — no DOM element, no whitespace, the
+// home page is byte-identical to the pre-0038 render.
+//
+// Layout: title "While you were away" + the window range + four
+// inline stats + the biggest-ship line + the needs-you line
+// (omitted when null). Tap-anywhere navigates to /inbox so the
+// operator's first action — "what needs me?" — is one tap from the
+// card.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": the biggest-ship PR title + ticket id AND the
+// needs-you message pass through redactSecrets before insertion.
+function renderMondayCatchUp(data) {
+  if (!data || !data.visible) return "";
+  const merged = Number(data.merged_prs || 0);
+  const spent = Number(data.spent_usd || 0);
+  const waiting = Number(data.waiting_prs || 0);
+  const alerts = Number(data.open_alerts || 0);
+  // Window range copy. We render "Fri 5:00pm → Mon HH:MM · Nh"
+  // matching the user-story mockup; both timestamps are short ISO
+  // slices so the operator reads the spans without timezone math.
+  const windowHours = data.window && Number(data.window.hours);
+  const windowAnchor = data.window && String(data.window.anchor || "");
+  const anchorLabel = windowAnchor === "last_seen"
+    ? "since you last looked"
+    : "Fri 5:00pm → now";
+  const hoursStr = Number.isFinite(windowHours) && windowHours > 0
+    ? Math.round(windowHours) + "h"
+    : "";
+  // biggest_ship line — redacted + escaped before insertion. When
+  // null the line is omitted entirely (no "Biggest ship: —" placeholder).
+  let shipLine = "";
+  if (data.biggest_ship) {
+    const ship = data.biggest_ship;
+    const safeSlug = esc(redactSecrets(String(ship.project_slug || "")));
+    const safeTitle = esc(redactSecrets(String(ship.pr_title || "")));
+    const num = Number(ship.pr_number || 0);
+    const ticket = ship.ticket_id
+      ? ` (${esc(redactSecrets(String(ship.ticket_id)))})`
+      : "";
+    shipLine = `<div class="catchup-ship"><span class="catchup-eyebrow dim">Biggest weekend ship:</span>`
+      + ` <b>${safeSlug}</b> · ${safeTitle} #${num}${ticket}</div>`;
+  }
+  // needs_you line — redacted + escaped before insertion. When null
+  // the line is omitted entirely.
+  let needsLine = "";
+  if (data.needs_you) {
+    const need = data.needs_you;
+    const safeMsg = esc(redactSecrets(String(need.message || "")));
+    const safeKind = esc(String(need.kind || ""));
+    needsLine = `<div class="catchup-needs catchup-needs-${safeKind}">`
+      + `<span class="catchup-eyebrow dim">Needs you now:</span> ${safeMsg}</div>`;
+  }
+  // Tap-anywhere → inbox surface (the "what needs me" deep dive).
+  return `<a class="monday-catchup" data-testid="monday-catchup" href="#inbox" aria-label="While you were away — tap for inbox">
+    <div class="catchup-title">While you were away <span class="catchup-window dim">${esc(anchorLabel)}${hoursStr ? ` · ${esc(hoursStr)}` : ""}</span></div>
+    <div class="catchup-stats">
+      <span class="catchup-stat"><b>${merged}</b> PR${merged === 1 ? "" : "s"} merged</span>
+      <span class="catchup-stat"><b>${usd(spent)}</b> spent</span>
+      <span class="catchup-stat"><b>${waiting}</b> PR${waiting === 1 ? "" : "s"} waiting</span>
+      <span class="catchup-stat"><b>${alerts}</b> alert${alerts === 1 ? "" : "s"}</span>
+    </div>
+    ${shipLine}
+    ${needsLine}
+  </a>`;
+}
+
 function renderFridayWrap(data) {
   if (!data || !data.visible) return "";
   const shipped = Number(data.shipped_count || 0);
@@ -1385,8 +1469,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(),
   ]);
   const alerts = data.alerts || [];
   const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
@@ -1395,6 +1479,7 @@ async function home() {
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
     digestBanner(digestData) +
+    renderMondayCatchUp(mondayCatchUpData) +
     renderFridayWrap(fridayWrapData) +
     renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +

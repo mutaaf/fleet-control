@@ -2450,6 +2450,499 @@ export function fridayWrap(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Monday morning catch-up (ticket 0038).
+//
+// Bridges the weekend gap between Friday wrap (0037) and Yesterday
+// glance (0033). Returns the four weekend headline numbers (merged
+// PRs, dollars spent, waiting PRs, open alerts) for the operator-
+// local "since Friday 17:00 (or last-seen, whichever is later)"
+// window, plus a single biggest_ship PR pick and a single needs_you
+// item drawn from a four-branch priority cascade.
+//
+// Composition only — no schema migration:
+//   - merged_prs : pr WHERE state='MERGED' AND is_agent=1 AND
+//                  fetched_at >= window.start
+//   - spent_usd  : SUM(cost_rollup_day.cost_usd) over the window's
+//                  yyyy-mm-dd buckets
+//   - waiting_prs: pr WHERE state='open' AND is_agent=1
+//   - open_alerts: COUNT(alert) WHERE resolved_at IS NULL
+//
+// Per LESSONS § "groomer prose can disagree with the schema; the
+// schema wins": open PRs use state='open' (lower-case) because
+// src/ingest/prs.ts writes the literal 'open' string on every pass.
+// Merged PRs use 'MERGED' (upper-case) because every other view in
+// this file already filters on that exact casing (fleetStreak,
+// costPerMergedPr, fridayWrap, projectBurndown's siblings) — the
+// repo is internally consistent on uppercase for merged.
+//
+// Window arithmetic (per LESSONS § "julianday() drifts ~10us per
+// timestamp"): we never go through julianday(). The Friday-17:00
+// anchor is computed in JS via Intl.DateTimeFormat (zero new deps,
+// matches isFriday/fridayWrap), then compared as ISO strings against
+// the column timestamps. SQLite's lexicographic string ordering
+// matches chronological order for ISO-8601 strings, so no float
+// arithmetic is needed.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every typed row narrowing here uses the double-cast pattern.
+
+export type MondayWindowAnchor = "friday_17" | "last_seen";
+
+export interface MondayWindow {
+  /** ISO timestamp (UTC). */
+  start: string;
+  /** ISO timestamp (UTC) = `now`. */
+  end: string;
+  /** Window length in hours, rounded to one decimal. */
+  hours: number;
+  /** Which side of the OR won the LATER comparison. */
+  anchor: MondayWindowAnchor;
+}
+
+export interface MondayCatchUpBiggestShip {
+  project_slug: string;
+  pr_number: number;
+  pr_title: string;
+  ticket_id: string | null;
+  merged_at: string;
+  size_score: number;
+}
+
+export type MondayNeedsYouKind =
+  | "pr_review"
+  | "self_drift"
+  | "self_cancel_warn"
+  | "hung_run";
+
+export interface MondayCatchUpNeedsYou {
+  kind: MondayNeedsYouKind;
+  project_slug: string;
+  message: string;
+  link: string;
+  age_hours: number;
+}
+
+export interface MondayCatchUp {
+  window: MondayWindow;
+  merged_prs: number;
+  spent_usd: number;
+  waiting_prs: number;
+  open_alerts: number;
+  biggest_ship: MondayCatchUpBiggestShip | null;
+  needs_you: MondayCatchUpNeedsYou | null;
+  generated_at: string;
+}
+
+export interface MondayCatchUpOptions {
+  /** Operator-local IANA timezone for the Friday-17:00 anchor. Defaults
+   *  to the server's local zone (matches isMonday and fridayWrap). */
+  tz?: string;
+  /** Optional ISO timestamp recorded the last time the operator hit
+   *  the home page. The window's start is the LATER of this and the
+   *  Friday-17:00 anchor — so an operator who skimmed at Sunday 8pm
+   *  doesn't see Friday-night noise on Monday. */
+  lastSeenAt?: string;
+}
+
+/** True when `now`'s day-of-week in `tz` is Monday. Uses
+ *  Intl.DateTimeFormat so we don't need a tz library; an invalid tz
+ *  falls back to UTC so the helper never throws on a malformed
+ *  `?tz=` query param. */
+export function isMonday(now: Date, tz?: string): boolean {
+  const zone = tz && tz.length > 0
+    ? tz
+    : (Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC");
+  let weekday: string;
+  try {
+    weekday = new Intl.DateTimeFormat("en-US", {
+      weekday: "short", timeZone: zone,
+    }).format(now);
+  } catch {
+    weekday = new Intl.DateTimeFormat("en-US", {
+      weekday: "short", timeZone: "UTC",
+    }).format(now);
+  }
+  return weekday === "Mon";
+}
+
+/** Resolve the parts (year, month, day, weekday-short) of `now` as
+ *  observed in `tz`. Uses Intl.DateTimeFormat.formatToParts so the
+ *  output is locale-stable. Falls back to UTC on a malformed tz. */
+interface ZonedParts {
+  year: number; month: number; day: number;
+  weekday: string; // "Mon" .. "Sun"
+  hour: number; minute: number;
+}
+function partsInZone(now: Date, tz: string): ZonedParts {
+  let zone = tz;
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", weekday: "short",
+      hourCycle: "h23",
+    }).formatToParts(now);
+  } catch {
+    zone = "UTC";
+    parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", weekday: "short",
+      hourCycle: "h23",
+    }).formatToParts(now);
+  }
+  const get = (k: string) => parts.find((p) => p.type === k)?.value ?? "";
+  return {
+    year: Number(get("year")),
+    month: Number(get("month")),
+    day: Number(get("day")),
+    weekday: get("weekday"),
+    hour: Number(get("hour")) || 0,
+    minute: Number(get("minute")) || 0,
+  };
+}
+
+/** Convert a wall-clock yyyy-mm-dd HH:00 in `tz` to a UTC ISO string.
+ *  Strategy: build a UTC Date for the same y/m/d/HH and then iterate
+ *  the tz-offset adjustment until the parts in `tz` round-trip. Two
+ *  iterations cover every IANA zone (no zone has a >24h offset). */
+function tzWallToUtcIso(
+  year: number, month: number, day: number,
+  hour: number, minute: number, tz: string,
+): string {
+  // Start with the naive UTC timestamp for the wall-clock values.
+  let utcMs = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+  for (let iter = 0; iter < 4; iter++) {
+    const probe = new Date(utcMs);
+    const p = partsInZone(probe, tz);
+    if (p.year === year && p.month === month && p.day === day
+      && p.hour === hour && p.minute === minute) {
+      return probe.toISOString();
+    }
+    // How far off is the tz wall-clock from our target? Convert the
+    // probe's tz reading back to a UTC ms (using Date.UTC on the
+    // observed parts) and shift utcMs by the delta.
+    const observedUtcMs = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, 0, 0);
+    const targetUtcMs = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+    utcMs += targetUtcMs - observedUtcMs;
+  }
+  return new Date(utcMs).toISOString();
+}
+
+/** Compute the most recent Friday 17:00 in `tz` strictly at-or-before
+ *  `now`. Returned as a UTC ISO timestamp. */
+function fridayFivePmIsoBefore(now: Date, tz: string): string {
+  const parts = partsInZone(now, tz);
+  // Distance back to the most recent Friday wall-clock day.
+  // weekday → index: Mon=0 .. Sun=6 (matches the SQLite-style 1..7
+  // but we keep zero-based to make modular arithmetic easy).
+  const WD: Record<string, number> = {
+    Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6,
+  };
+  const todayIdx = WD[parts.weekday] ?? 0;
+  // Days to subtract to reach Friday. (todayIdx - 4 + 7) % 7. If today
+  // IS Friday and the current zoned-hour < 17, we still need last week's
+  // Friday — that's a 7-day reach-back.
+  let daysBack = (todayIdx - 4 + 7) % 7;
+  if (parts.weekday === "Fri" && parts.hour < 17) daysBack = 7;
+  // Build a UTC Date for the wall-clock at midnight on `now` in tz,
+  // then step back `daysBack` calendar days. Strategy: derive the
+  // target y/m/d by shifting the tz wall-clock day, then convert
+  // wall-clock 17:00 on that day to UTC.
+  const target = new Date(Date.UTC(parts.year, parts.month - 1, parts.day) - daysBack * 86400_000);
+  const y = target.getUTCFullYear();
+  const m = target.getUTCMonth() + 1;
+  const d = target.getUTCDate();
+  return tzWallToUtcIso(y, m, d, 17, 0, tz);
+}
+
+/** Resolve the window start for a Monday catch-up. The start is the
+ *  LATER of (a) the most recent Friday 17:00 in `tz` and (b) the
+ *  optional `lastSeenAt`. When `lastSeenAt` is absent only (a)
+ *  applies; when `tz` is empty/malformed we fall back to UTC. The
+ *  fallback when BOTH are absent is 60h before `now` (a safe
+ *  weekend-ish span the SPA can render without ambiguity). */
+export function weekendWindowStart(
+  now: Date, tz: string, lastSeenAt?: string,
+): { start: string; anchor: MondayWindowAnchor } {
+  const zone = tz && tz.length > 0 ? tz : "UTC";
+  let fri17: string;
+  try {
+    fri17 = fridayFivePmIsoBefore(now, zone);
+  } catch {
+    // Fallback: 60h before now.
+    fri17 = new Date(now.getTime() - 60 * 3600_000).toISOString();
+  }
+  if (lastSeenAt) {
+    const t = Date.parse(lastSeenAt);
+    if (Number.isFinite(t) && t > Date.parse(fri17)) {
+      return { start: new Date(t).toISOString(), anchor: "last_seen" };
+    }
+  }
+  return { start: fri17, anchor: "friday_17" };
+}
+
+interface MondayMergedCountRow { n: number; }
+interface MondaySpentRow { spent_usd: number | null; }
+interface MondayWaitingRow { n: number; }
+interface MondayAlertsRow { n: number; }
+interface MondayBiggestShipRow {
+  project_id: number;
+  project_slug: string;
+  pr_number: number;
+  pr_title: string | null;
+  fetched_at: string;
+  additions: number | null;
+  deletions: number | null;
+}
+interface MondayTicketLinkRow { ticket_id: string; }
+interface MondayPrReviewRow {
+  project_slug: string;
+  pr_number: number;
+  pr_title: string | null;
+  pr_url: string | null;
+  gh_created_at: string | null;
+}
+interface MondayAlertRow {
+  project_slug: string;
+  type: string;
+  title: string | null;
+  detail: string | null;
+  phase: string | null;
+  created_at: string;
+}
+interface MondayDriftSliceRow {
+  project_slug: string;
+  correlation_signature: string | null;
+  created_at: string;
+}
+
+/** Monday morning catch-up (ticket 0038). Composes pr / cost_rollup_day
+ *  / alert / anomaly / ticket_commit_link reads into a single payload
+ *  the SPA renders as one card at the top of the home page. `now`
+ *  defaults to wall-clock; tests pin it. `opts.tz` defaults to the
+ *  server's local zone; `opts.lastSeenAt` (when set) wins over the
+ *  Friday-17:00 anchor IFF it is more recent. */
+export function mondayCatchUp(
+  db: DB, now: Date = new Date(), opts: MondayCatchUpOptions = {},
+): MondayCatchUp {
+  const tz = opts.tz && opts.tz.length > 0
+    ? opts.tz
+    : (Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC");
+  const window = weekendWindowStart(now, tz, opts.lastSeenAt);
+  const nowIso = now.toISOString();
+  const startIso = window.start;
+  const startDate = startIso.slice(0, 10);
+  const endDate = nowIso.slice(0, 10);
+  const hours = Math.round(((Date.parse(nowIso) - Date.parse(startIso)) / 3600_000) * 10) / 10;
+
+  // ── merged_prs: agent PRs merged in window across all projects ──
+  // Same casing the rest of the file uses for merged: 'MERGED' upper.
+  // We compare `fetched_at >= startIso` directly (ISO-8601 sorts
+  // lexicographically). The PK on pr is (project_id, number) so we
+  // count rows without DISTINCT.
+  const mergedRow = db.prepare(
+    "SELECT COUNT(*) AS n FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND fetched_at >= ? AND fetched_at <= ?",
+  ).get(startIso, nowIso) as unknown as MondayMergedCountRow | undefined;
+  const merged_prs = Number(mergedRow?.n ?? 0);
+
+  // ── spent_usd: SUM(cost_rollup_day.cost_usd) over the window's
+  //    yyyy-mm-dd buckets. The rollup day is the SQLite date() of
+  //    started_at; we include the boundary days inclusively. ────────
+  const spentRow = db.prepare(
+    "SELECT SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day <= ?",
+  ).get(startDate, endDate) as unknown as MondaySpentRow | undefined;
+  const spent_usd = Number(spentRow?.spent_usd ?? 0);
+
+  // ── waiting_prs: open agent PRs (state='open' lower-case is what
+  //    src/ingest/prs.ts writes — see the LESSONS schema-vs-prose
+  //    entry from 2026-06-05). ────────────────────────────────────────
+  const waitingRow = db.prepare(
+    "SELECT COUNT(*) AS n FROM pr "
+    + " WHERE state = 'open' AND is_agent = 1",
+  ).get() as unknown as MondayWaitingRow | undefined;
+  const waiting_prs = Number(waitingRow?.n ?? 0);
+
+  // ── open_alerts: alert rows with resolved_at IS NULL. ────────────
+  const alertsRow = db.prepare(
+    "SELECT COUNT(*) AS n FROM alert WHERE resolved_at IS NULL",
+  ).get() as unknown as MondayAlertsRow | undefined;
+  const open_alerts = Number(alertsRow?.n ?? 0);
+
+  // ── biggest_ship: among merged PRs in window across all projects,
+  //    pick the highest (additions + deletions); tie-break newest
+  //    fetched_at. Null when zero merges in window. ──────────────────
+  const winRow = db.prepare(
+    "SELECT p.id AS project_id, p.slug AS project_slug, "
+    + "       pr.number AS pr_number, pr.title AS pr_title, "
+    + "       pr.fetched_at AS fetched_at, "
+    + "       pr.additions AS additions, pr.deletions AS deletions "
+    + "  FROM pr JOIN project p ON p.id = pr.project_id "
+    + " WHERE pr.state = 'MERGED' AND pr.is_agent = 1 "
+    + "   AND pr.fetched_at IS NOT NULL "
+    + "   AND pr.fetched_at >= ? AND pr.fetched_at <= ? "
+    + " ORDER BY (COALESCE(pr.additions,0) + COALESCE(pr.deletions,0)) DESC, "
+    + "          pr.fetched_at DESC "
+    + " LIMIT 1",
+  ).get(startIso, nowIso) as unknown as MondayBiggestShipRow | undefined;
+  let biggest_ship: MondayCatchUpBiggestShip | null = null;
+  if (winRow) {
+    const size_score = (Number(winRow.additions) || 0) + (Number(winRow.deletions) || 0);
+    const linkRow = db.prepare(
+      "SELECT ticket_id FROM ticket_commit_link "
+      + " WHERE project_slug = ? AND pr_number = ? "
+      + " ORDER BY ticket_id ASC LIMIT 1",
+    ).get(winRow.project_slug, winRow.pr_number) as unknown as MondayTicketLinkRow | undefined;
+    biggest_ship = {
+      project_slug: winRow.project_slug,
+      pr_number: winRow.pr_number,
+      pr_title: winRow.pr_title ?? "",
+      ticket_id: linkRow?.ticket_id ?? null,
+      merged_at: winRow.fetched_at,
+      size_score,
+    };
+  }
+
+  // ── needs_you cascade ────────────────────────────────────────────
+  // Priority order: pr_review > self_drift > self_cancel_warn >
+  // hung_run > null. First non-null match wins.
+  let needs_you: MondayCatchUpNeedsYou | null = null;
+
+  // Priority 1: pr_review. Any open agent PR whose gh_created_at age
+  // exceeds 12h (per the AC) qualifies. We take the OLDEST such PR
+  // so the operator triages the most-neglected one first.
+  const prRevRow = db.prepare(
+    "SELECT p.slug AS project_slug, pr.number AS pr_number, "
+    + "       pr.title AS pr_title, pr.url AS pr_url, "
+    + "       pr.gh_created_at AS gh_created_at "
+    + "  FROM pr JOIN project p ON p.id = pr.project_id "
+    + " WHERE pr.state = 'open' AND pr.is_agent = 1 "
+    + "   AND pr.gh_created_at IS NOT NULL "
+    + " ORDER BY pr.gh_created_at ASC LIMIT 1",
+  ).get() as unknown as MondayPrReviewRow | undefined;
+  if (prRevRow && prRevRow.gh_created_at) {
+    const t = Date.parse(prRevRow.gh_created_at);
+    if (Number.isFinite(t)) {
+      const ageHours = Math.max(0, Math.floor((now.getTime() - t) / 3600_000));
+      if (ageHours >= 12) {
+        const link = prRevRow.pr_url
+          ?? `#/p/${encodeURIComponent(prRevRow.project_slug)}?pr=${prRevRow.pr_number}`;
+        needs_you = {
+          kind: "pr_review",
+          project_slug: prRevRow.project_slug,
+          message: `${prRevRow.project_slug} PR #${prRevRow.pr_number} waiting ${ageHours}h`,
+          link,
+          age_hours: ageHours,
+        };
+      }
+    }
+  }
+
+  // Priority 2: self_drift. Any active (non-dismissed) self_drift
+  // anomaly in the trailing 24h. We surface the most recent one and
+  // its metric.
+  if (!needs_you) {
+    const cutoffIso = new Date(now.getTime() - 24 * 3600_000).toISOString();
+    const driftRow = db.prepare(
+      "SELECT p.slug AS project_slug, "
+      + "       a.correlation_signature AS correlation_signature, "
+      + "       a.created_at AS created_at "
+      + "  FROM anomaly a "
+      + "  JOIN run r ON r.id = a.run_id "
+      + "  JOIN project p ON p.id = r.project_id "
+      + "  LEFT JOIN inbox_dismissal d "
+      + "         ON d.kind = 'self_drift' "
+      + "        AND d.project_slug = p.slug "
+      + "        AND d.payload_id = a.correlation_signature "
+      + "        AND d.dismissed_at >= a.created_at "
+      + " WHERE a.kind = 'self_drift' "
+      + "   AND a.correlation_signature IS NOT NULL "
+      + "   AND a.created_at >= ? "
+      + "   AND d.dismissed_at IS NULL "
+      + " ORDER BY a.created_at DESC LIMIT 1",
+    ).get(cutoffIso) as unknown as MondayDriftSliceRow | undefined;
+    if (driftRow && driftRow.correlation_signature) {
+      const ageHours = Math.max(0,
+        Math.floor((now.getTime() - Date.parse(driftRow.created_at)) / 3600_000));
+      needs_you = {
+        kind: "self_drift",
+        project_slug: driftRow.project_slug,
+        message: `${driftRow.project_slug} ${driftRow.correlation_signature} drift`,
+        link: `#/project/${encodeURIComponent(driftRow.project_slug)}/drift`,
+        age_hours: ageHours,
+      };
+    }
+  }
+
+  // Priority 3: self_cancel_warn. An open alert of type='self_cancel'
+  // and severity='warn'. The dedup_key encodes the days remaining
+  // (e.g. "self_cancel:<slug>:3"); we surface that.
+  if (!needs_you) {
+    const scRow = db.prepare(
+      "SELECT p.slug AS project_slug, a.type AS type, a.title AS title, "
+      + "       a.detail AS detail, a.phase AS phase, a.created_at AS created_at "
+      + "  FROM alert a JOIN project p ON p.id = a.project_id "
+      + " WHERE a.resolved_at IS NULL AND a.type = 'self_cancel' "
+      + "   AND a.severity = 'warn' "
+      + " ORDER BY a.created_at DESC LIMIT 1",
+    ).get() as unknown as MondayAlertRow | undefined;
+    if (scRow) {
+      const ageHours = Math.max(0,
+        Math.floor((now.getTime() - Date.parse(scRow.created_at)) / 3600_000));
+      const titleText = scRow.title ?? `${scRow.project_slug} self-cancel approaching`;
+      needs_you = {
+        kind: "self_cancel_warn",
+        project_slug: scRow.project_slug,
+        message: titleText,
+        link: `#/p/${encodeURIComponent(scRow.project_slug)}`,
+        age_hours: ageHours,
+      };
+    }
+  }
+
+  // Priority 4: hung_run. An open alert of type='hung_run'. The
+  // message carries the phase and age.
+  if (!needs_you) {
+    const hungRow = db.prepare(
+      "SELECT p.slug AS project_slug, a.type AS type, a.title AS title, "
+      + "       a.detail AS detail, a.phase AS phase, a.created_at AS created_at "
+      + "  FROM alert a JOIN project p ON p.id = a.project_id "
+      + " WHERE a.resolved_at IS NULL AND a.type = 'hung_run' "
+      + " ORDER BY a.created_at DESC LIMIT 1",
+    ).get() as unknown as MondayAlertRow | undefined;
+    if (hungRow) {
+      const ageHours = Math.max(0,
+        Math.floor((now.getTime() - Date.parse(hungRow.created_at)) / 3600_000));
+      const phase = hungRow.phase ?? "run";
+      needs_you = {
+        kind: "hung_run",
+        project_slug: hungRow.project_slug,
+        message: `${hungRow.project_slug} ${phase} hung ${ageHours}h`,
+        link: `#/p/${encodeURIComponent(hungRow.project_slug)}`,
+        age_hours: ageHours,
+      };
+    }
+  }
+
+  return {
+    window: { start: startIso, end: nowIso, hours, anchor: window.anchor },
+    merged_prs,
+    spent_usd,
+    waiting_prs,
+    open_alerts,
+    biggest_ship,
+    needs_you,
+    generated_at: nowIso,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Riskiest open PR (ticket 0040).
 //
 // One fleet-wide helper that ranks open agent PRs by a deterministic
