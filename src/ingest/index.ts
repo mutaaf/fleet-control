@@ -61,5 +61,21 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     db.exec("ROLLBACK");
     throw e;
   }
+  // Ticket 0039: changelog page memo cache lives in src/server.ts but
+  // its invalidation chokepoint is here — completing an ingest pass
+  // means the `pr` table may have new rows, and a freshly-merged PR
+  // must surface on the next render without waiting out the 60s TTL.
+  // We import lazily (via a dynamic call shape that avoids a cycle
+  // with src/server.ts importing from src/ingest/index.ts) — the
+  // helper is a no-op when the server module hasn't loaded.
+  try {
+    // Late-bind via the already-loaded module cache so the daemon
+    // (which doesn't import server.ts) just skips this step. Using
+    // a synchronous `await import()` here would block the ingest
+    // pass; instead we read the live binding off the cached module
+    // object set up by server.ts at load time.
+    const hook = (globalThis as { __fleet_changelog_invalidate__?: () => void }).__fleet_changelog_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

@@ -11,7 +11,7 @@ import { loadConfig } from "./config.ts";
 import * as auth from "./auth.ts";
 import { cleanCheckouts, safeRmUnder } from "./infra.ts";
 import { createSnapshot, revokeSnapshot } from "./snapshot.ts";
-import { fleetView } from "./views.ts";
+import { fleetView, fleetChangelog } from "./views.ts";
 
 const UID = process.getuid?.() ?? 0;
 const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
@@ -456,11 +456,22 @@ function snapshotAction(db: DB, action: string, body: any, actor: string, actorN
       // one — we compute it here from the live DB + config.
       const view = body?.fleet_view ?? fleetView(db, loadConfig());
       const baseUrl = typeof body?.base_url === "string" ? body.base_url : undefined;
+      // Ticket 0039: optional changelog embed. The CLI/route caller
+      // sets `include_changelog: true` to opt in; we compute the
+      // top-50 chronological window server-side here (same shape
+      // the /api/fleet/changelog route returns) so the recipient
+      // sees the same numbers the operator just shared.
+      const includeChangelog = body?.include_changelog === true;
+      const changelog = includeChangelog
+        ? fleetChangelog(db, { limit: 50 })
+        : undefined;
       const m = createSnapshot(db, {
         name,
         fleetView: view,
         ttl_hours: body?.ttl_hours,
         baseUrl,
+        include_changelog: includeChangelog,
+        changelog,
       });
       // Audit args carry the id_prefix + name + ttl — NEVER the plaintext
       // token. We construct the audit args explicitly so a careless

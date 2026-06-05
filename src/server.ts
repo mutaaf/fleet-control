@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -468,6 +468,83 @@ function getMondayCatchUpCached(
   return value;
 }
 
+// Ticket 0039: "Fleet changelog" memo cache.
+//
+// 60s TTL keyed by the FULL query-param tuple (limit + cursor +
+// project + from + to + search). The PR table changes on every
+// ingest tick — completing a runIngestPass() calls the reset helper
+// below as the explicit invalidation hook, so a freshly-merged PR
+// surfaces on the next render even when the TTL hasn't expired.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetChangelogCacheForTests()`. Per LESSONS
+// § "expose a build counter for cache-hit tests, not a fetcher swap"
+// we also expose a read-only `_getChangelogCacheBuildsForTests()`
+// that ticks on every cache MISS so route tests assert hit/miss
+// semantics without stubbing SQL. Production code never reads either.
+interface ChangelogCacheEntry {
+  value: FleetChangelog;
+  expires_at: number;
+}
+const CHANGELOG_TTL_MS = 60_000;
+const changelogCache = new Map<string, ChangelogCacheEntry>();
+let changelogBuildCounter = 0;
+
+export function _resetChangelogCacheForTests(): void {
+  changelogCache.clear();
+  changelogBuildCounter = 0;
+}
+
+export function _getChangelogCacheBuildsForTests(): number {
+  return changelogBuildCounter;
+}
+
+/** Production cache-invalidation hook — called from the
+ *  `runIngestPass` post-COMMIT tail. We clear the whole map (one
+ *  PR-table change can move any cached row); the build counter is
+ *  NOT cleared here — only the cache map — so tests can observe a
+ *  counter increment on the next call after an ingest. */
+export function _invalidateChangelogCacheAfterIngest(): void {
+  changelogCache.clear();
+}
+
+// Register the changelog invalidation hook on the global object so
+// `runIngestPass` (in src/ingest/index.ts) can call it without
+// importing this module (which would create a cycle — server.ts
+// imports runIngestPass at the top). The global slot's name is
+// suffix-prefix'd with underscores so it can't accidentally collide
+// with a future builtin.
+(globalThis as { __fleet_changelog_invalidate__?: () => void })
+  .__fleet_changelog_invalidate__ = _invalidateChangelogCacheAfterIngest;
+
+function changelogCacheKey(opts: FleetChangelogOptions): string {
+  // Stable key over the full query-param tuple. We JSON-stringify the
+  // sanitised opts object — Map keys are strings so a single
+  // serialisation is the simplest correct shape (per LESSONS § cache-
+  // key from the full tuple).
+  return JSON.stringify({
+    limit: opts.limit ?? null,
+    cursor: opts.cursor ?? null,
+    projectSlug: opts.projectSlug ?? null,
+    from: opts.from ?? null,
+    to: opts.to ?? null,
+    search: opts.search ?? null,
+  });
+}
+
+/** Look up a fresh changelog from the memo cache; rebuild on miss.
+ *  Any throw from `fleetChangelog` (malformed cursor, invalid date
+ *  string) propagates so the route can surface 400. */
+function getChangelogCached(db: DB, opts: FleetChangelogOptions): FleetChangelog {
+  const key = changelogCacheKey(opts);
+  const hit = changelogCache.get(key);
+  if (hit && hit.expires_at > Date.now()) return hit.value;
+  changelogBuildCounter += 1;
+  const value = fleetChangelog(db, opts);
+  changelogCache.set(key, { value, expires_at: Date.now() + CHANGELOG_TTL_MS });
+  return value;
+}
+
 /** Stable per-actor key used for the home_last_seen_<actor> watermark
  *  + the monday-catchup cache partition. Loopback is the literal
  *  string "loopback"; a remote token is the token's id (the SHA-256
@@ -858,6 +935,48 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=30",
+          });
+          return res.end(body);
+        }
+        // Ticket 0039: fleet changelog — one chronological page of
+        // every merged agent PR across every project, ticket-linked.
+        // Composes pr + project + ticket_commit_link — no schema
+        // migration. Query params: limit, cursor, project, from, to,
+        // search. The 60s memo cache is keyed by the full param tuple;
+        // a runIngestPass() tail call to
+        // `_invalidateChangelogCacheAfterIngest()` clears the map the
+        // moment a freshly-merged PR lands. Malformed cursor / invalid
+        // date strings surface as 400 (not 500) — `fleetChangelog`
+        // throws and the catch below maps that to a JSON 400. Net-new
+        // route; no existing JSON shape to preserve.
+        if (path === "/api/fleet/changelog") {
+          const params = url.searchParams;
+          const optsForChangelog: FleetChangelogOptions = {};
+          const rawLimit = params.get("limit");
+          if (rawLimit != null) optsForChangelog.limit = Number(rawLimit);
+          const rawCursor = params.get("cursor");
+          if (rawCursor) optsForChangelog.cursor = rawCursor;
+          const rawProject = params.get("project");
+          if (rawProject) optsForChangelog.projectSlug = rawProject;
+          const rawFrom = params.get("from");
+          if (rawFrom) optsForChangelog.from = rawFrom;
+          const rawTo = params.get("to");
+          if (rawTo) optsForChangelog.to = rawTo;
+          const rawSearch = params.get("search");
+          if (rawSearch) optsForChangelog.search = rawSearch;
+          let value: FleetChangelog;
+          try { value = getChangelogCached(db, optsForChangelog); }
+          catch (e: any) {
+            // Malformed cursor / invalid date → 400 with the
+            // helper's error message ("invalid cursor", "invalid
+            // from date: banana", …).
+            return json(res, { error: String(e?.message ?? e) }, 400);
+          }
+          const body = JSON.stringify(value);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=60",
           });
           return res.end(body);
         }
