@@ -2448,3 +2448,333 @@ export function fridayWrap(
     generated_at: nowIso,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Riskiest open PR (ticket 0040).
+//
+// One fleet-wide helper that ranks open agent PRs by a deterministic
+// risk score so the home page can name THE single PR the operator
+// should tend next. Composes existing tables: pr (state/is_agent/
+// fetched_at/ci_state/first_fail_check), project (slug/name), and
+// control_audit (action='heal' rows whose stdout_tail surfaces the
+// infra-flake substrings catalogued in the cross-fleet LESSONS file).
+// No schema migration, no new ingest — pure composition.
+//
+// Score formula (per AC2 — exact integer arithmetic so the test can
+// assert the score on the returned row):
+//
+//   score = heal_attempts * 4
+//         + fail_kind_weight[fail_kind]
+//         + Math.floor(age_hours / 6)
+//
+// fail_kind_weight is the literal map FAIL_KIND_WEIGHT below.
+//
+// Tiebreaker: score DESC, then age DESC. Two PRs that score the same
+// but differ in age push the older one to the top — older PRs hurt
+// more (the operator's mental cost of context-switching grows with
+// stale PRs, per the user story).
+//
+// fail_kind classification (per AC3):
+//   1. If the latest control_audit row for (action='heal',
+//      target='pr-<number>') exists, scan its stdout_tail against
+//      INFRA_FLAKE_PATTERNS. First match → infra_flake.
+//   2. Else fall back to pr.ci_state:
+//        - 'red'              → red_test (detail = first_fail_check)
+//        - 'green' / 'pending' → green
+//        - everything else    → red_check_unknown
+//
+// The INFRA_FLAKE_PATTERNS array lives at module scope so future
+// patterns from CROSS_LESSONS.md (account suspension, supabase port
+// bind, etc. — see LESSONS § "infra flakes shouldn't trigger code
+// fixes") are one-line additions. Each pattern is a JS RegExp tested
+// against the stdout_tail in JavaScript — never composed into SQL
+// (per AGENTS.md § "Never compose a shell string from input" and the
+// SQL analogue: substring matches stay JS-side, parameterised
+// queries stay parameterised).
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every typed-row narrowing here uses the double-cast pattern.
+// Per LESSONS § "julianday() drifts ~10us per timestamp": age math
+// stays JS-side (integer ms diff floored to hours).
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests": cache reset + build counter live on the server route
+// (ticket-0036/0037 pattern).
+//
+// Quiet-hours integration (AC10): an optional { quietHoursActive }
+// option suppresses the top row when its fail_kind is infra_flake —
+// matches 0030's "non-critical pushes are demoted overnight" rule
+// (an infra flake is a re-run, not a wake-the-operator event).
+
+export type RiskiestPrFailKind =
+  | "infra_flake"
+  | "red_test"
+  | "red_check_unknown"
+  | "green";
+
+export interface RiskiestPrTop {
+  project_slug: string;
+  project_name: string;
+  pr_number: number;
+  pr_title: string;
+  pr_url: string;
+  heal_attempts: number;
+  fail_kind: RiskiestPrFailKind;
+  fail_detail: string | null;
+  age_hours: number;
+  score: number;
+}
+
+export interface RiskiestOpenPr {
+  open_count: number;
+  all_healthy: boolean;
+  top: RiskiestPrTop | null;
+  generated_at: string;
+}
+
+export interface RiskiestOpenPrOptions {
+  /** When true, suppress the top row IFF its fail_kind is
+   *  `infra_flake`. The operator opted into quiet hours for non-
+   *  critical pings; infra flakes resolve themselves with a re-run.
+   *  Critical kinds (red_test / red_check_unknown / green) are
+   *  always surfaced. */
+  quietHoursActive?: boolean;
+}
+
+export interface ClassifyPrFailure {
+  kind: RiskiestPrFailKind;
+  detail: string | null;
+}
+
+// fail-kind score weights. Literal map — the test asserts arithmetic
+// against these exact integers (AC2).
+const FAIL_KIND_WEIGHT: Record<RiskiestPrFailKind, number> = {
+  infra_flake: 1,
+  red_test: 3,
+  red_check_unknown: 2,
+  green: 0,
+};
+
+// Infra-flake substring patterns. Each entry { re, label } — `re` is
+// the test against stdout_tail; `label` is the short operator-facing
+// summary the badge UI displays. The actual classification `detail`
+// returned by classifyPrFailure carries the LITERAL matched
+// substring (AC3 § "returning `infra_flake` with the matched substring
+// as `detail`"), so a future cross-fleet pattern from CROSS_LESSONS
+// surfaces verbatim. Labels are kept short for the SPA's parenthetical
+// rendering (`renderRiskiestPr` may render `label` directly when the
+// matched substring is too long for the badge line).
+//
+// The list comes straight from CROSS_LESSONS.md infra-flake entries
+// (account suspension, supabase port-bind, 502 Bad Gateway, runner-
+// level port conflicts, actions/checkout 403 retry-loop). Future
+// additions land here as one-liners. Per LESSONS § "no shell-string
+// composition" (and its SQL analogue), each pattern is a JS RegExp
+// tested in JavaScript — never composed into the SQL itself.
+const INFRA_FLAKE_PATTERNS: Array<{ re: RegExp; label: string }> = [
+  // supabase start: "failed to bind host port for 0.0.0.0:54322"
+  // (LESSONS#0029) — must come before the generic "address in use"
+  // so we surface the more specific supabase substring.
+  { re: /supabase[\s\S]{0,120}failed\s+to\s+bind/i, label: "supabase port-bind" },
+  // Generic port conflict — the launchd / docker daemon / dev server
+  // case. Anything matching "address already in use" not caught above.
+  { re: /address\s+already\s+in\s+use/i, label: "port-bind" },
+  // GitHub account suspended → actions/checkout retries 3x and gives
+  // up with HTTP 403 (LESSONS#0036 "account is suspended"). The
+  // remote-suspended message is the canonical form.
+  { re: /account\s+is\s+suspended/i, label: "account suspended" },
+  // actions/checkout 403 (post-suspension OR a transient repo perms
+  // issue) — distinct from "account is suspended" because the
+  // checkout retry loop may exit with just "403" in some workflows.
+  { re: /actions\/checkout[\s\S]{0,120}\b403\b/i, label: "checkout 403" },
+  // GitHub GraphQL 502 (LESSONS#0012 "gh pr checks --watch died on
+  // 502 Bad Gateway"). Treat as transient.
+  { re: /502\s+Bad\s+Gateway/i, label: "502 Bad Gateway" },
+];
+
+interface RiskiestPrRow {
+  project_slug: string;
+  project_name: string | null;
+  project_id: number;
+  pr_number: number;
+  pr_title: string | null;
+  pr_url: string | null;
+  ci_state: string | null;
+  first_fail_check: string | null;
+  heal_attempts: number | null;
+  fetched_at: string | null;
+}
+
+interface HealAuditRow {
+  stdout_tail: string | null;
+}
+
+/** Classify a single PR's failure mode. Reads the latest
+ *  `control_audit` row where action='heal' and target='pr-<number>'
+ *  for the project; if found, scans its `stdout_tail` against
+ *  INFRA_FLAKE_PATTERNS. Otherwise falls back to pr.ci_state.
+ *
+ *  Pure-SQL helper: no shell-out, no network, no transcript I/O.
+ *  The substring match runs in JS (per AGENTS.md § "Never compose a
+ *  shell string from input" — and the SQL analogue: never compose
+ *  pattern matches into the SQL itself).
+ *
+ *  Signature: `(db, projectId, prNumber)`. The route handler resolves
+ *  `projectId` from the slug; tests can pass the integer directly. */
+export function classifyPrFailure(
+  db: DB, projectId: number, prNumber: number,
+): ClassifyPrFailure {
+  // Latest heal-audit row for this PR. We don't filter by project_id
+  // on control_audit because target='pr-<number>' is fleet-unique only
+  // when paired with the project's repo; in practice agents lock the
+  // `pr-N` form to one project at a time, but a future cross-project
+  // collision would simply return the most-recent matching row — the
+  // operator-visible classification stays correct (an infra flake is
+  // an infra flake regardless of which project owns the PR).
+  const auditRow = db.prepare(
+    "SELECT stdout_tail FROM control_audit "
+    + " WHERE action = 'heal' AND target = ? "
+    + " ORDER BY ts DESC LIMIT 1",
+  ).get(`pr-${prNumber}`) as unknown as HealAuditRow | undefined;
+
+  if (auditRow && auditRow.stdout_tail) {
+    const tail = String(auditRow.stdout_tail);
+    for (const p of INFRA_FLAKE_PATTERNS) {
+      const m = p.re.exec(tail);
+      if (m) {
+        // Per AC3 § "returning `infra_flake` with the matched
+        // substring as `detail`": surface the literal matched
+        // substring so the SPA reads true to the heal log. The
+        // pattern's friendly `label` is also useful for terse
+        // rendering — we expose the substring directly so a future
+        // SPA tweak can format/elide as it chooses.
+        return { kind: "infra_flake", detail: m[0] };
+      }
+    }
+    // A heal-audit exists but isn't an infra match — fall through to
+    // the ci_state lookup so we surface red_test with the failing
+    // check name (operator's first question is "which check?").
+  }
+
+  // Fall back to the PR's ci_state. The ingester writes one of
+  // 'red' | 'pending' | 'green' | 'none'.
+  const prRow = db.prepare(
+    "SELECT ci_state, first_fail_check FROM pr "
+    + " WHERE project_id = ? AND number = ?",
+  ).get(projectId, prNumber) as unknown as {
+    ci_state: string | null;
+    first_fail_check: string | null;
+  } | undefined;
+  if (!prRow) return { kind: "red_check_unknown", detail: null };
+  const ci = String(prRow.ci_state ?? "");
+  if (ci === "red") {
+    return { kind: "red_test", detail: prRow.first_fail_check ?? null };
+  }
+  if (ci === "green" || ci === "pending") {
+    return { kind: "green", detail: null };
+  }
+  return { kind: "red_check_unknown", detail: null };
+}
+
+/** Compute the riskiest open agent PR across the fleet. `now` is the
+ *  wall-clock anchor for age math (tests pin it; production passes
+ *  `new Date()`). Returns the documented `{open_count, all_healthy,
+ *  top, generated_at}` shape.
+ *
+ *  Per AC1's "ignore non-agent PRs entirely" intent: only rows with
+ *  state='open' AND is_agent=1 contribute. (The production ingester
+ *  writes lowercase 'open' — see src/ingest/prs.ts. The ticket's
+ *  prose used 'OPEN'; reality is lowercase. We honour the schema.)
+ *
+ *  Quiet-hours suppression (AC10): when `quietHoursActive` is true,
+ *  a winning row whose fail_kind is `infra_flake` is suppressed
+ *  (top → null) — but open_count and all_healthy still reflect the
+ *  underlying state so the SPA's "Open PRs (N): all healthy"
+ *  fallback line remains accurate. */
+export function riskiestOpenPr(
+  db: DB, now: Date = new Date(),
+  opts: RiskiestOpenPrOptions = {},
+): RiskiestOpenPr {
+  const generatedAt = now.toISOString();
+
+  // One JOIN over pr + project, restricted to open agent PRs. The
+  // small N (typically <50 across the fleet) makes JS-side scoring
+  // cheaper than a CTE — see the perf AC.
+  const rows = db.prepare(
+    "SELECT "
+    + "  p.slug AS project_slug, p.name AS project_name, p.id AS project_id, "
+    + "  pr.number AS pr_number, pr.title AS pr_title, pr.url AS pr_url, "
+    + "  pr.ci_state AS ci_state, pr.first_fail_check AS first_fail_check, "
+    + "  pr.heal_attempts AS heal_attempts, pr.fetched_at AS fetched_at "
+    + "FROM pr JOIN project p ON p.id = pr.project_id "
+    + "WHERE pr.state = 'open' AND pr.is_agent = 1",
+  ).all() as unknown as RiskiestPrRow[];
+
+  const open_count = rows.length;
+  if (open_count === 0) {
+    return { open_count: 0, all_healthy: false, top: null, generated_at: generatedAt };
+  }
+
+  // Score every open PR. JS-side: keeps the SQL boring and lets the
+  // fail-kind classifier reuse its substring scan unchanged.
+  interface Scored extends RiskiestPrTop { _ageHoursRaw: number; }
+  const scored: Scored[] = rows.map((r) => {
+    // Age: integer ms diff → integer hours via Math.floor. Negative
+    // (clock-skew → future fetched_at) clamps to 0 so the score
+    // never goes negative.
+    let ageHours = 0;
+    if (r.fetched_at) {
+      const ageMs = now.getTime() - new Date(r.fetched_at).getTime();
+      ageHours = Math.max(0, Math.floor(ageMs / 3600_000));
+    }
+    const cls = classifyPrFailure(db, r.project_id, r.pr_number);
+    const heal = Math.max(0, Number(r.heal_attempts ?? 0) || 0);
+    const score = heal * 4
+      + FAIL_KIND_WEIGHT[cls.kind]
+      + Math.floor(ageHours / 6);
+    return {
+      project_slug: r.project_slug,
+      project_name: r.project_name ?? r.project_slug,
+      pr_number: r.pr_number,
+      pr_title: r.pr_title ?? "",
+      pr_url: r.pr_url ?? "",
+      heal_attempts: heal,
+      fail_kind: cls.kind,
+      fail_detail: cls.detail,
+      age_hours: ageHours,
+      score,
+      _ageHoursRaw: ageHours,
+    };
+  });
+
+  // all_healthy: every row scored 0. Independent of quiet-hours
+  // suppression (which is a render decision, not a state question).
+  const all_healthy = scored.every((s) => s.score === 0);
+  if (all_healthy) {
+    return { open_count, all_healthy: true, top: null, generated_at: generatedAt };
+  }
+
+  // Sort: score DESC, then age DESC (older wins ties). Stable
+  // tiebreak via pr_number ASC to keep deterministic ordering across
+  // re-fetches (matches the leaderboard/inbox conventions).
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b._ageHoursRaw !== a._ageHoursRaw) return b._ageHoursRaw - a._ageHoursRaw;
+    return a.pr_number - b.pr_number;
+  });
+
+  const top = scored[0];
+  // Quiet-hours demotion (AC10): only infra_flake hides.
+  if (opts.quietHoursActive && top.fail_kind === "infra_flake") {
+    return { open_count, all_healthy: false, top: null, generated_at: generatedAt };
+  }
+
+  // Strip the helper-only field before returning to the caller.
+  const { _ageHoursRaw: _unused, ...publicTop } = top;
+  void _unused;
+  return {
+    open_count,
+    all_healthy: false,
+    top: publicTop,
+    generated_at: generatedAt,
+  };
+}
