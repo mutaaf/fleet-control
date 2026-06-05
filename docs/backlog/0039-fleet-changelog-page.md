@@ -1,7 +1,7 @@
 ---
 id: 0039
 title: Fleet changelog - one chronological page of every merged PR across every project, ticket-linked
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-05
