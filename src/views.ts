@@ -3271,3 +3271,303 @@ export function riskiestOpenPr(
     generated_at: generatedAt,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Fleet changelog (ticket 0039).
+//
+// One chronological page of every merged agent PR across every
+// project, ticket-linked. Composes the existing `pr`, `project`, and
+// `ticket_commit_link` tables — no schema migration. The query is a
+// plain JOIN with newest-first ordering by `fetched_at` (the merged-at
+// proxy the existing ingest pipeline stamps on every sync — same
+// column `fleetStreak`, `costPerMergedPr`, `fridayWrap`, and
+// `mondayCatchUp` already read for merged-at semantics).
+//
+// Per LESSONS § "groomer prose can disagree with the schema; the
+// schema wins": every reader of merged PRs in this file uses
+// `state = 'MERGED'` (upper-case); the changelog matches.
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// the row narrowing uses the double-cast pattern.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// every SQL string is plain string concatenation; identifiers stay
+// unquoted single words.
+// Per AGENTS.md § "Never compose a shell string from input" — and its
+// SQL analogue: every WHERE filter is a parameterised `?` placeholder.
+// The search LIKE pattern escapes `%`, `_`, and `\` in the input
+// before binding.
+//
+// Pagination cursor: base64 of `${merged_at}|${pr_number}`. The
+// decoder rejects anything else by throwing — the route handler maps
+// the throw to a 400 so the SPA can render a friendly error.
+
+export interface FleetChangelogRow {
+  project_slug: string;
+  project_name: string;
+  pr_number: number;
+  pr_title: string;
+  pr_url: string;
+  merged_at: string;
+  additions: number;
+  deletions: number;
+  ticket_id: string | null;
+}
+
+export interface FleetChangelog {
+  rows: FleetChangelogRow[];
+  next_cursor: string | null;
+  total: number;
+  generated_at: string;
+}
+
+export interface FleetChangelogOptions {
+  limit?: number;
+  cursor?: string;
+  projectSlug?: string;
+  /** Inclusive lower bound (ISO date or full ISO datetime). */
+  from?: string;
+  /** Inclusive upper bound by calendar day: rows with
+   *  `fetched_at < to + 1d` are included. ISO date or datetime. */
+  to?: string;
+  /** Substring match (case-insensitive) over PR title and ticket id. */
+  search?: string;
+  /** Test seam: pin the wall-clock anchor for `generated_at`. */
+  now?: string;
+}
+
+const CHANGELOG_DEFAULT_LIMIT = 50;
+const CHANGELOG_MAX_LIMIT = 200;
+
+interface FleetChangelogRawRow {
+  project_slug: string;
+  project_name: string | null;
+  pr_number: number;
+  pr_title: string | null;
+  pr_url: string | null;
+  merged_at: string;
+  additions: number | null;
+  deletions: number | null;
+  ticket_id: string | null;
+}
+
+interface FleetChangelogCountRow { n: number | null; }
+
+/** Clamp a `limit` value to [1, 200] with default 50. Garbage
+ *  (NaN, 0, negative, non-numeric) falls back to the default. */
+function clampChangelogLimit(raw: unknown): number {
+  if (raw == null || raw === "") return CHANGELOG_DEFAULT_LIMIT;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return CHANGELOG_DEFAULT_LIMIT;
+  const i = Math.floor(n);
+  if (i <= 0) return CHANGELOG_DEFAULT_LIMIT;
+  if (i > CHANGELOG_MAX_LIMIT) return CHANGELOG_MAX_LIMIT;
+  return i;
+}
+
+/** Validate an ISO date or datetime string. Returns the normalised
+ *  full-ISO timestamp; throws on garbage so the route handler can
+ *  surface a 400. The minimum surface is "YYYY-MM-DD" (10 chars). */
+function parseChangelogDate(raw: string, side: "from" | "to"): Date {
+  if (typeof raw !== "string" || raw.length < 10) {
+    throw new Error(`invalid ${side} date: ${raw}`);
+  }
+  // Accept both date-only (YYYY-MM-DD) and full ISO datetime. We're
+  // strict about the date-only shape — Date.parse() tolerates
+  // ridiculous shapes ("banana") only inconsistently across runtimes,
+  // so we verify the shape FIRST.
+  const datePart = raw.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+    throw new Error(`invalid ${side} date: ${raw}`);
+  }
+  const t = Date.parse(raw);
+  if (!Number.isFinite(t)) throw new Error(`invalid ${side} date: ${raw}`);
+  return new Date(t);
+}
+
+/** Decode a cursor back to its (merged_at, pr_number) pair. Throws on
+ *  garbage so the route handler can surface a 400. */
+function decodeChangelogCursor(raw: string): { mergedAt: string; prNumber: number } {
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new Error("invalid cursor");
+  }
+  // base64 alphabet check — Buffer.from is permissive (it silently
+  // discards out-of-alphabet bytes) so a hand-validation step is
+  // mandatory before we trust the result.
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(raw)) throw new Error("invalid cursor");
+  let decoded: string;
+  try { decoded = Buffer.from(raw, "base64").toString("utf8"); }
+  catch { throw new Error("invalid cursor"); }
+  const pipe = decoded.indexOf("|");
+  if (pipe <= 0 || pipe === decoded.length - 1) throw new Error("invalid cursor");
+  const mergedAt = decoded.slice(0, pipe);
+  const prNumberStr = decoded.slice(pipe + 1);
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(mergedAt)) throw new Error("invalid cursor");
+  const prNumber = Number(prNumberStr);
+  if (!Number.isFinite(prNumber) || !Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error("invalid cursor");
+  }
+  return { mergedAt, prNumber };
+}
+
+/** Encode a (merged_at, pr_number) pair into an opaque cursor string. */
+function encodeChangelogCursor(mergedAt: string, prNumber: number): string {
+  return Buffer.from(`${mergedAt}|${prNumber}`, "utf8").toString("base64");
+}
+
+/** Escape LIKE meta-characters in a search input so a `%` in the
+ *  operator's query string can't widen into a wildcard. We pair the
+ *  pattern with `ESCAPE '\\'` in the SQL. Backslash itself is escaped
+ *  first to avoid double-substitution. */
+function escapeLikePattern(raw: string): string {
+  return raw
+    .replace(/\\/g, "\\\\")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+}
+
+export function fleetChangelog(
+  db: DB, opts: FleetChangelogOptions = {},
+): FleetChangelog {
+  const limit = clampChangelogLimit(opts.limit);
+  const nowIso = opts.now ?? new Date().toISOString();
+
+  // ── Cursor decoding (throws on garbage) ─────────────────────────
+  let cursorPair: { mergedAt: string; prNumber: number } | null = null;
+  if (opts.cursor) cursorPair = decodeChangelogCursor(opts.cursor);
+
+  // ── Date-range validation (throws on garbage) ───────────────────
+  let fromIso: string | null = null;
+  let toExclusiveIso: string | null = null;
+  if (opts.from) {
+    const fromDate = parseChangelogDate(opts.from, "from");
+    // If the operator passed a date-only string we anchor at midnight
+    // UTC; full ISO inputs round-trip exactly.
+    fromIso = opts.from.length === 10
+      ? new Date(opts.from + "T00:00:00.000Z").toISOString()
+      : fromDate.toISOString();
+  }
+  if (opts.to) {
+    parseChangelogDate(opts.to, "to"); // validates
+    if (opts.to.length === 10) {
+      // Per the AC: `to + 1d` so the operator-friendly inclusive
+      // calendar bound covers the entire `to` day.
+      const t = new Date(opts.to + "T00:00:00.000Z").getTime() + 24 * 3600_000;
+      toExclusiveIso = new Date(t).toISOString();
+    } else {
+      // Full ISO datetime: take the literal value as the EXCLUSIVE
+      // upper bound. (Caller is being precise; we respect it.)
+      toExclusiveIso = new Date(opts.to).toISOString();
+    }
+  }
+
+  // ── Build WHERE clause + bindings. Plain string concat (no
+  //    backticks per LESSONS); identifiers are unquoted single
+  //    words; every value is a parameterised `?`. ──────────────────
+  const where: string[] = [
+    "pr.state = 'MERGED'",
+    "pr.is_agent = 1",
+    "pr.fetched_at IS NOT NULL",
+  ];
+  const bindings: Array<string | number> = [];
+
+  if (opts.projectSlug) {
+    where.push("project.slug = ?");
+    bindings.push(opts.projectSlug);
+  }
+  if (fromIso) {
+    where.push("pr.fetched_at >= ?");
+    bindings.push(fromIso);
+  }
+  if (toExclusiveIso) {
+    where.push("pr.fetched_at < ?");
+    bindings.push(toExclusiveIso);
+  }
+  if (opts.search) {
+    // ESCAPE '\' so the meta-char escapes above survive into SQL.
+    where.push(
+      "(LOWER(pr.title) LIKE ? ESCAPE '\\' "
+      + "OR LOWER(COALESCE(ticket_commit_link.ticket_id, '')) LIKE ? ESCAPE '\\')",
+    );
+    const pat = "%" + escapeLikePattern(opts.search.toLowerCase()) + "%";
+    bindings.push(pat, pat);
+  }
+  if (cursorPair) {
+    // Strictly OLDER than the last row of the previous page; tiebreak
+    // by pr_number DESC (so a same-merged_at sibling with a smaller
+    // pr_number lands on the next page).
+    where.push("(pr.fetched_at < ? OR (pr.fetched_at = ? AND pr.number < ?))");
+    bindings.push(cursorPair.mergedAt, cursorPair.mergedAt, cursorPair.prNumber);
+  }
+
+  const whereSql = " WHERE " + where.join(" AND ") + " ";
+
+  // ── Total: COUNT(*) over the same filters (cursor excluded —
+  //    "total" is the dataset size, not the remaining page count). ─
+  const totalWhere: string[] = where.filter((c) =>
+    // Drop the cursor pagination predicate from the count.
+    !c.startsWith("(pr.fetched_at < ? OR ")
+  );
+  const totalBindings = bindings.slice(
+    0, bindings.length - (cursorPair ? 3 : 0),
+  );
+  const totalSql =
+    "SELECT COUNT(*) AS n "
+    + "  FROM pr "
+    + "  JOIN project ON project.id = pr.project_id "
+    + "  LEFT JOIN ticket_commit_link "
+    + "    ON ticket_commit_link.pr_number = pr.number "
+    + "   AND ticket_commit_link.project_slug = project.slug "
+    + " WHERE " + totalWhere.join(" AND ");
+  const totalRow = db.prepare(totalSql).get(...totalBindings) as unknown as FleetChangelogCountRow | undefined;
+  const total = Number(totalRow?.n ?? 0);
+
+  // ── Page query. One row over-fetch so we know whether to emit a
+  //    next_cursor — same trick the leaderboard / digest helpers use. ──
+  const pageSql =
+    "SELECT "
+    + "  project.slug AS project_slug, "
+    + "  project.name AS project_name, "
+    + "  pr.number AS pr_number, "
+    + "  pr.title AS pr_title, "
+    + "  pr.url AS pr_url, "
+    + "  pr.fetched_at AS merged_at, "
+    + "  pr.additions AS additions, "
+    + "  pr.deletions AS deletions, "
+    + "  ticket_commit_link.ticket_id AS ticket_id "
+    + "FROM pr "
+    + "JOIN project ON project.id = pr.project_id "
+    + "LEFT JOIN ticket_commit_link "
+    + "  ON ticket_commit_link.pr_number = pr.number "
+    + " AND ticket_commit_link.project_slug = project.slug "
+    + whereSql
+    + "ORDER BY pr.fetched_at DESC, pr.number DESC "
+    + "LIMIT ?";
+  const overFetch = limit + 1;
+  const pageBindings = [...bindings, overFetch];
+  const rawRows = db.prepare(pageSql).all(...pageBindings) as unknown as FleetChangelogRawRow[];
+
+  let nextCursor: string | null = null;
+  const trimmed = rawRows.length > limit ? rawRows.slice(0, limit) : rawRows;
+  if (rawRows.length > limit) {
+    const last = trimmed[trimmed.length - 1];
+    nextCursor = encodeChangelogCursor(last.merged_at, last.pr_number);
+  }
+
+  const rows: FleetChangelogRow[] = trimmed.map((r) => ({
+    project_slug: r.project_slug,
+    project_name: r.project_name ?? r.project_slug,
+    pr_number: r.pr_number,
+    pr_title: r.pr_title ?? "",
+    pr_url: r.pr_url ?? "",
+    merged_at: r.merged_at,
+    additions: Number(r.additions ?? 0),
+    deletions: Number(r.deletions ?? 0),
+    ticket_id: r.ticket_id ?? null,
+  }));
+
+  return {
+    rows,
+    next_cursor: nextCursor,
+    total,
+    generated_at: nowIso,
+  };
+}

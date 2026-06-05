@@ -2647,6 +2647,174 @@ async function backlog(id) {
   foot.textContent = "";
 }
 
+// ---- Fleet changelog page (ticket 0039) -------------------------------
+//
+// Reads `/api/fleet/changelog` and renders one chronological page of
+// every merged agent PR across every project. Rows group by calendar
+// date. Search filters by substring (case-insensitive) over the
+// current page client-side; project + date filters re-fetch with new
+// params.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string passes through
+// `redactSecrets` before HTML interpolation. PR titles historically
+// carry repo URLs and SHAs which the redactor must NOT trip on, AND
+// any future leak of an actual token in a PR title is silently
+// stripped at the boundary.
+
+function renderChangelogRow(row) {
+  // PR title + ticket id pass through redactSecrets per the
+  // renderer-boundary discipline. Sizes (additions/deletions) are
+  // server-derived integers but still routed through esc for
+  // belt-and-braces — a future schema slip can't smuggle markup.
+  const safeSlug = esc(redactSecrets(String(row.project_slug || "")));
+  const safeTitle = esc(redactSecrets(String(row.pr_title || "")));
+  const adds = Number(row.additions) || 0;
+  const dels = Number(row.deletions) || 0;
+  const num = Number(row.pr_number) || 0;
+  const prUrl = String(row.pr_url || "");
+  // PR url goes through redactSecrets so a future token-bearing
+  // host in the URL is stripped at the renderer boundary. We then
+  // re-validate against an https://github.com/ prefix before
+  // interpolating into href — a URL whose host got redacted gets
+  // routed to a safe "#" anchor.
+  const safePrUrl = redactSecrets(prUrl);
+  const prHref = /^https:\/\/github\.com\//.test(safePrUrl) ? esc(safePrUrl) : "#";
+  const ticketHtml = row.ticket_id
+    ? `<a class="changelog-ticket" href="#/p/${safeSlug}/backlog/${esc(redactSecrets(String(row.ticket_id)))}">ticket ${esc(redactSecrets(String(row.ticket_id)))}</a>`
+    : `<span class="changelog-ticket dim">—</span>`;
+  return `<div class="changelog-row">
+    <a class="changelog-slug" href="#/p/${safeSlug}"><b>${safeSlug}</b></a>
+    <span class="changelog-title">${safeTitle}</span>
+    <a class="changelog-pr" href="${prHref}" target="_blank" rel="noopener">#${num}</a>
+    <span class="changelog-size mono">+${adds}/-${dels}</span>
+    ${ticketHtml}
+  </div>`;
+}
+
+function renderChangelogPage(data) {
+  // The empty state is the same renderer for both branches — the
+  // distinguishing copy is decided by whether the operator has any
+  // active filters.
+  if (!data || !Array.isArray(data.rows) || data.rows.length === 0) {
+    const safeCopy = esc(redactSecrets(
+      "No merged PRs match these filters yet. "
+      + "Clear the filters above to see every shipped PR across the fleet.",
+    ));
+    return `<div class="changelog-empty">${safeCopy}</div>`;
+  }
+  // Group rows by calendar date (YYYY-MM-DD slice of merged_at).
+  const byDay = new Map();
+  for (const r of data.rows) {
+    const day = String(r.merged_at || "").slice(0, 10);
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day).push(r);
+  }
+  // Map preserves insertion order; the SQL already returns
+  // newest-first so the grouping carries the same chronological order.
+  const sections = [];
+  for (const [day, rows] of byDay.entries()) {
+    const safeDay = esc(redactSecrets(day || "undated"));
+    sections.push(`<section class="changelog-day">
+      <h2 class="changelog-day-header">${safeDay}</h2>
+      ${rows.map(renderChangelogRow).join("")}
+    </section>`);
+  }
+  return `<div class="changelog-list">${sections.join("")}</div>`;
+}
+
+function wireChangelogFilters(container, ctx) {
+  // Search filters client-side over the current page only — same
+  // pattern as the lessons page's search (cheap on 50 rows, snappy
+  // even on a phone).
+  const search = container.querySelector('input[data-testid="changelog-search"]');
+  const project = container.querySelector('select[data-testid="changelog-project"]');
+  const from = container.querySelector('input[data-testid="changelog-from"]');
+  const to = container.querySelector('input[data-testid="changelog-to"]');
+  const applySearch = () => {
+    const q = (search && search.value || "").trim().toLowerCase();
+    const sections = container.querySelectorAll(".changelog-day");
+    for (const section of sections) {
+      let anyVisible = false;
+      const rows = section.querySelectorAll(".changelog-row");
+      for (const row of rows) {
+        const title = (row.querySelector(".changelog-title")?.textContent || "").toLowerCase();
+        const ticket = (row.querySelector(".changelog-ticket")?.textContent || "").toLowerCase();
+        const text = title + " " + ticket;
+        let visible = true;
+        if (q && text.indexOf(q) === -1) visible = false;
+        row.hidden = !visible;
+        if (visible) anyVisible = true;
+      }
+      section.hidden = !anyVisible;
+    }
+  };
+  if (search) search.addEventListener("input", applySearch);
+  // Project / date filters re-fetch with new params per the AC.
+  const refetch = () => {
+    const params = new URLSearchParams();
+    if (project && project.value) params.set("project", project.value);
+    if (from && from.value) params.set("from", from.value);
+    if (to && to.value) params.set("to", to.value);
+    const qs = params.toString();
+    const next = qs ? `#/changelog?${qs}` : "#/changelog";
+    if (location.hash !== next) location.hash = next;
+    else changelog(parseHash(next).params).catch(() => {});
+  };
+  if (project) project.addEventListener("change", refetch);
+  if (from) from.addEventListener("change", refetch);
+  if (to) to.addEventListener("change", refetch);
+}
+
+async function changelog(params) {
+  summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
+  const query = new URLSearchParams();
+  const project = params && params.get && params.get("project");
+  const from = params && params.get && params.get("from");
+  const to = params && params.get && params.get("to");
+  if (project) query.set("project", project);
+  if (from) query.set("from", from);
+  if (to) query.set("to", to);
+  const qs = query.toString();
+  let data = null;
+  try { data = await get("/api/fleet/changelog" + (qs ? "?" + qs : "")); }
+  catch (e) {
+    app.innerHTML = `<div class="loading">couldn't load the fleet changelog.<br><span class="dim">${esc(e.message)}</span></div>`;
+    return;
+  }
+  // Project options: derive from the rows themselves (good enough for
+  // v1 — a fresh install with zero rows just shows "all").
+  const projects = new Map();
+  for (const r of (data.rows || [])) {
+    if (r.project_slug && !projects.has(r.project_slug)) {
+      projects.set(r.project_slug, r.project_name || r.project_slug);
+    }
+  }
+  const projectOptions = [`<option value="">all projects</option>`]
+    .concat([...projects.entries()].map(([slug, name]) =>
+      `<option value="${esc(slug)}"${project === slug ? " selected" : ""}>${esc(name)}</option>`));
+  const total = (data && data.total) || 0;
+  const shown = (data && data.rows && data.rows.length) || 0;
+  const safeShown = esc(redactSecrets(String(shown)));
+  const safeTotal = esc(redactSecrets(String(total)));
+  app.innerHTML = `<div class="changelog-page" data-testid="fleet-changelog">
+    <a class="back" href="#/">‹ all projects</a>
+    <div class="changelog-head">
+      <h1 class="changelog-title">CHANGELOG <span class="dim">showing ${safeShown} of ${safeTotal}</span></h1>
+      <div class="changelog-filters">
+        <input type="search" class="changelog-search" placeholder="search title or ticket…" data-testid="changelog-search" autocomplete="off" />
+        <select class="changelog-project-select" data-testid="changelog-project">${projectOptions.join("")}</select>
+        <label class="changelog-date"><span class="dim">from</span> <input type="date" data-testid="changelog-from" value="${esc(from || "")}" /></label>
+        <label class="changelog-date"><span class="dim">to</span> <input type="date" data-testid="changelog-to" value="${esc(to || "")}" /></label>
+      </div>
+    </div>
+    ${renderChangelogPage(data)}
+  </div>`;
+  foot.textContent = "";
+  const container = app.querySelector('[data-testid="fleet-changelog"]');
+  if (container) wireChangelogFilters(container, { params });
+}
+
 // ---- Cross-fleet lessons portal view (ticket 0036) ---------------------
 //
 // Reads `~/.local/share/agent-fleet/CROSS_LESSONS.md` via the new
@@ -2849,6 +3017,12 @@ async function route() {
       // DOM, no polling timer needed (the 2-min route cache + the
       // server-side mtime memo handle re-loads inside the window).
       await lessons(params);
+    } else if (path === "changelog" || path.startsWith("changelog")) {
+      // Ticket 0039: fleet changelog page. One-shot render — search
+      // is client-side over the current page; project + date
+      // filters re-fetch with new params. The 60s route cache +
+      // the SW (0029) handle polled refreshes inside the window.
+      await changelog(params);
     } else if (path.startsWith("project/") && path.endsWith("/drift")) {
       // Ticket 0034: self-baseline drift detail view. One-shot render
       // — the operator is reading static contributors, not monitoring

@@ -1,7 +1,7 @@
 ---
 id: 0039
 title: Fleet changelog - one chronological page of every merged PR across every project, ticket-linked
-status: proposed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-05
@@ -350,4 +350,63 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-05 — implementation-dev: branch `feat/0039-fleet-changelog-page`
+  opened. Mark ticket in-progress, sync README. Schema-vs-prose
+  reconciliation (per LESSONS § "groomer prose can disagree with the
+  schema; the schema wins"): grepped every `INSERT INTO pr ...` writer
+  + every existing WHERE-state read in `src/views.ts`. Two findings:
+  (a) `src/ingest/prs.ts` only writes OPEN PRs (state literal `'open'`
+  lower-case) — it never inserts MERGED rows; (b) every existing
+  reader in `src/views.ts` that targets merged PRs uses `state =
+  'MERGED'` (UPPER-case). So MERGED rows are seeded externally
+  (tests, future ingest, fixtures) and the repo-wide convention is
+  uppercase `'MERGED'`. The ticket's prose is correct here. The
+  changelog WHERE clause uses `pr.state = 'MERGED' AND pr.is_agent = 1`
+  to match this convention. Same casing the rest of the file uses
+  (`fleetStreak`, `costPerMergedPr`, `fridayWrap`, `mondayCatchUp`).
+- 2026-06-05 — implementation-dev: ticket_commit_link join columns
+  verified against `src/db.ts` lines 226-238: PK is (project_slug,
+  commit_sha, ticket_id) with optional pr_number — same join keys the
+  `mondayCatchUp` biggest-ship lookup uses (`project_slug + pr_number`).
+  Cache-invalidation hook lives in `src/ingest/index.ts`
+  `runIngestPass()` post-COMMIT tail; we wire it via a single
+  `globalThis.__fleet_changelog_invalidate__` slot (registered by
+  `src/server.ts` on load) so the ingest module doesn't import the
+  server module — avoids the cycle that would otherwise arise from
+  `src/server.ts` already importing `runIngestPass`. The daemon
+  (which doesn't import the server) cleanly skips the call.
+- 2026-06-05 — implementation-dev: `fleetChangelog(db, opts)` lives
+  at the bottom of `src/views.ts`. Cursor encoding is base64 of
+  `${merged_at}|${pr_number}`; the decoder validates the alphabet,
+  the pipe position, the ISO timestamp shape, and the integer
+  pr_number — any drift throws and the route handler maps the throw
+  to a 400 response (NOT 500). Search LIKE meta-chars (`%`, `_`,
+  `\`) are escaped before binding and the SQL uses
+  `LIKE ? ESCAPE '\\'` so the operator's literal '100%' query
+  doesn't wildcard. Snapshot integration: a new
+  `include_changelog?: boolean` flag on `SnapshotCreateOpts`
+  defaults to false — when off the payload is byte-identical to
+  today's (no `changelog` key); when on, the rows are walked through
+  a new `anonymizeChangelog()` that replaces slugs with the same
+  `project-N` surrogates `anonymize()` uses for the fleet-view side.
+- 2026-06-05 — implementation-dev: SPA. `#/changelog` route added.
+  `web/index.html` grew a `CHANGELOG` top-bar link with
+  `data-testid="topbar-changelog"`; `web/app.js` got
+  `renderChangelogPage` + `renderChangelogRow` + a route handler
+  that fetches `/api/fleet/changelog` and emits a
+  `data-testid="fleet-changelog"` container. PR titles + ticket ids
+  + project slugs pass through `redactSecrets` per LESSONS § secret
+  redaction at the renderer boundary. `web/style.css` got a new
+  `.changelog-*` selector group with a >=600px breakpoint per AC10
+  (mobile-first: row collapses to two lines at 375px, one line at
+  600px; filters stack on mobile, single row on desktop).
+- 2026-06-05 — implementation-dev: full local gate green
+  (`npm ci && npx tsc --noEmit && node scripts/check-backlog.mjs`)
+  plus the changelog test file passes (23/23 + 1 PERF=1 skipped).
+  Spot-checked the related suites
+  (snapshot/riskiest-pr/monday-catchup/friday-wrap/glance): 129
+  passing, 0 failing, 4 PERF skipped. Pre-existing failures on
+  `tests/prs-merged.test.ts` and the welcome/quiet-hours subprocess
+  tests reproduce on main and predate this PR (per LESSONS §
+  "time-pinned tests must NOT derive seed timestamps from
+  new Date()" — those tests are NOT gating checks).

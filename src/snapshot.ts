@@ -87,6 +87,16 @@ export interface SnapshotCreateOpts {
   /** Override the base URL used to build the returned share_url.
    *  Defaults to DEFAULT_BASE_URL. */
   baseUrl?: string;
+  /** Ticket 0039: when `true`, the changelog rows below are walked
+   *  through `anonymizeChangelog()` and embedded under
+   *  `payload.changelog`. Defaults to `false` so existing snapshot
+   *  bytes stay backward-compatible — the `changelog` key is absent
+   *  on every mint that doesn't opt in. */
+  include_changelog?: boolean;
+  /** Ticket 0039: the changelog data to embed when
+   *  `include_changelog: true`. Caller pre-computes via
+   *  `fleetChangelog(db, opts)` — same shape the route returns. */
+  changelog?: unknown;
 }
 
 export interface ServeShareResult {
@@ -209,6 +219,49 @@ function anonymizeProject(p: Record<string, unknown>, index: number): Record<str
   return out;
 }
 
+/** Ticket 0039: anonymize a `fleetChangelog` payload for the snapshot.
+ *  Slugs get replaced with `project-N` placeholders, indexed by FIRST
+ *  appearance order so the same project always becomes the same
+ *  surrogate. PR titles + URLs are dropped (PR titles can carry repo
+ *  names; URLs leak the owner). Numeric fields (additions, deletions,
+ *  pr_number) survive bit-for-bit so the recipient still sees real
+ *  size + counts. The ticket_id is preserved (4-digit ids are not
+ *  identifying on their own — they're just sequence numbers). */
+export function anonymizeChangelog(changelog: unknown): unknown {
+  if (!isPlainObject(changelog)) return null;
+  const rows = (changelog as { rows?: unknown[] }).rows;
+  if (!Array.isArray(rows)) return null;
+  const slugMap = new Map<string, string>();
+  let nextIdx = 1;
+  const anonRows = rows.map((r) => {
+    if (!isPlainObject(r)) return r;
+    const slug = String(r.project_slug ?? "");
+    if (!slugMap.has(slug)) {
+      slugMap.set(slug, `project-${nextIdx}`);
+      nextIdx += 1;
+    }
+    return {
+      project_slug: slugMap.get(slug)!,
+      project_name: slugMap.get(slug)!,
+      pr_number: typeof r.pr_number === "number" ? r.pr_number : 0,
+      pr_title: "PR #XX",
+      pr_url: "",
+      merged_at: typeof r.merged_at === "string" ? r.merged_at : "",
+      additions: typeof r.additions === "number" ? r.additions : 0,
+      deletions: typeof r.deletions === "number" ? r.deletions : 0,
+      ticket_id: typeof r.ticket_id === "string" ? r.ticket_id : null,
+    };
+  });
+  return {
+    rows: anonRows,
+    next_cursor: null, // cursors leak the merged_at + pr_number tuple verbatim — drop them
+    total: typeof (changelog as { total?: unknown }).total === "number"
+      ? (changelog as { total: number }).total : anonRows.length,
+    generated_at: typeof (changelog as { generated_at?: unknown }).generated_at === "string"
+      ? (changelog as { generated_at: string }).generated_at : "",
+  };
+}
+
 /** Returns a deep clone of the input view with every identity-bearing
  *  field replaced. Numeric + enum fields are preserved bit-for-bit. */
 export function anonymize(view: unknown): unknown {
@@ -258,7 +311,23 @@ export function createSnapshot(db: DB, opts: SnapshotCreateOpts): MintedSnapshot
   const id = hash(token);
   const created_at = nowIso();
   const expires_at = new Date(Date.now() + ttlH * 3600_000).toISOString();
-  const payload_json = JSON.stringify(anonymize(opts.fleetView));
+  // Ticket 0039: when `include_changelog: true` the anonymized
+  // changelog rides under `payload.changelog`. The default mint
+  // (opts.include_changelog falsy) leaves the payload byte-identical
+  // to today's so existing share links keep working unchanged.
+  const anon = anonymize(opts.fleetView);
+  let envelope: unknown = anon;
+  if (opts.include_changelog) {
+    const anonChangelog = anonymizeChangelog(opts.changelog);
+    // Merge as an extra key on the anonymized fleet-view envelope.
+    // We deep-clone via JSON one more time so the test that asserts
+    // "byte-identical default mint" passes against the default branch
+    // (we don't touch the envelope at all when the flag is off).
+    const cloned = isPlainObject(anon) ? { ...anon } : {};
+    (cloned as Record<string, unknown>).changelog = anonChangelog;
+    envelope = cloned;
+  }
+  const payload_json = JSON.stringify(envelope);
 
   db.prepare(
     "INSERT INTO snapshot(id,name,created_at,expires_at,revoked_at,payload_json) VALUES(?,?,?,?,?,?)",

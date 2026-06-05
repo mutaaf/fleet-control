@@ -440,6 +440,43 @@ that race the kernel's listen callback in unpredictable order. Same
 trap will bite future subcommands (`fleetctl serve --json-logs`,
 `fleetctl serve --quiet`, etc.) that want to control startup output.
 
+## 2026-06-05 — break ingest↔server cache-invalidation cycles via a globalThis slot, not a circular import
+
+Symptom: while shipping ticket 0039 (fleet changelog page) I needed
+the 60s changelog memo cache (defined in `src/server.ts`) to be
+invalidated the moment `runIngestPass()` (in `src/ingest/index.ts`)
+commits a tick — so a freshly-merged PR surfaces on the next
+render instead of waiting out the TTL. The first instinct was the
+direct route: `import { _invalidateChangelogCacheAfterIngest } from
+"../server.ts"` inside `runIngestPass`. That immediately deadlocks
+node's ESM cycle detector — `src/server.ts` already
+`import { runIngestPass } from "./ingest/index.ts"` at the top, so a
+return-trip import would create a cycle whose evaluation order is
+runtime-undefined (one side sees `undefined` for the symbol it
+needs). Cause: the cache lives on the consumer side (server) but
+the invalidation trigger lives on the producer side (ingest);
+making either side import the other creates a cycle the moment they
+both load at boot. Fix: register the invalidation function on
+`globalThis` from `src/server.ts` on module load
+(`(globalThis as { __fleet_changelog_invalidate__?: () => void })
+.__fleet_changelog_invalidate__ = _invalidateChangelogCacheAfterIngest`),
+and have `runIngestPass` read it lazily off `globalThis` after the
+COMMIT — typed `as { __fleet_changelog_invalidate__?: () => void }`
+so tsc still type-checks the call. The hook is a no-op when the
+server module hasn't loaded (e.g. the launchd daemon imports the
+ingest module but not the server), which is exactly the right
+behaviour: no server, no cache, no invalidation needed. General
+rule for this repo: when module A owns a cache that module B's
+side-effect must invalidate AND B is already imported by A, do NOT
+introduce a B→A import — register the invalidation function on a
+documented `globalThis.__fleet_<feature>_<verb>__` slot from A's
+load-time and have B late-bind via the slot. The leading-and-
+trailing-double-underscore convention signals "do not collide" the
+same way `_resetXForTests` signals "do not call in production."
+Same trap will bite any future feature where an ingest tick (or
+any "the world changed" trigger that fires from a producer module
+the server already depends on) needs to wake a consumer-side memo.
+
 ## 2026-06-05 — groomer prose can disagree with the schema; the schema wins
 
 Symptom: ticket 0040 (riskiest open PR badge) specified the helper's

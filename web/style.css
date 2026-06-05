@@ -1161,3 +1161,69 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .lessons-controls { grid-template-columns: 1fr auto; }
   .lessons-controls input[type="search"] { max-width: 480px; }
 }
+
+/* ── Fleet changelog page (ticket 0039) ─────────────────────────────
+ * Mobile-first: filters stack (search on its own line, project + date
+ * dropdowns on the next), rows collapse to two lines (title on top,
+ * slug + PR + size + ticket on the bottom). At >=600px the row is
+ * one line and the filter bar is a single row. No horizontal scroll
+ * at 375px per the 0011 mobile-portal CSS contract. */
+.changelog-page { padding: 8px 0 40px; }
+.changelog-head { margin: 4px 0 18px; }
+.changelog-title { font-family: var(--sans); font-size: 22px; font-weight: 600; margin: 4px 0 12px; }
+.changelog-title .dim { font-family: var(--mono); font-size: 12px; font-weight: 400; margin-left: 8px; }
+.changelog-filters { display: grid; gap: 8px; grid-template-columns: 1fr; }
+.changelog-filters input[type="search"],
+.changelog-filters select,
+.changelog-filters input[type="date"] {
+  background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+  border-radius: var(--r); padding: 7px 10px; font-family: var(--mono); font-size: 13px;
+  min-height: var(--tap-min);
+}
+.changelog-filters .changelog-date { display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 12px; color: var(--dim); }
+.changelog-list { margin-top: 18px; }
+.changelog-day { margin-bottom: 22px; }
+.changelog-day-header { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--faint); margin: 0 0 8px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--line); }
+.changelog-row { display: grid; grid-template-columns: 1fr; gap: 4px 12px;
+  padding: 10px 4px; border-bottom: 1px solid #1f201c; font-family: var(--mono); font-size: 13px; }
+.changelog-row:last-child { border-bottom: 0; }
+.changelog-row .changelog-title { color: var(--ink); font-size: 14px; }
+.changelog-row .changelog-slug { color: var(--accent); }
+.changelog-row .changelog-pr { color: var(--dim); }
+.changelog-row .changelog-pr:hover { color: var(--accent); }
+.changelog-row .changelog-size { color: var(--faint); }
+.changelog-row .changelog-ticket { color: var(--dim); }
+.changelog-row .changelog-ticket:hover { color: var(--accent); }
+.changelog-empty { padding: 24px 8px; color: var(--dim); font-size: 13.5px; line-height: 1.55; }
+
+/* Mobile-first row layout (default, <600px): title on its own line at
+ * the top, the meta strip (slug · PR · size · ticket) on the second.
+ * Filters stack into one column. */
+.changelog-row { grid-template-areas:
+  "title"
+  "meta"; }
+.changelog-row .changelog-title { grid-area: title; }
+.changelog-row .changelog-slug,
+.changelog-row .changelog-pr,
+.changelog-row .changelog-size,
+.changelog-row .changelog-ticket { grid-area: meta; display: inline-block; margin-right: 12px; }
+
+/* Desktop upgrade at >=600px: one row per PR, filter bar on a single
+ * row. No horizontal scroll because the title gets the flex space and
+ * everything else is its natural width. */
+@media (min-width: 600px) {
+  .changelog-filters { grid-template-columns: 2fr 1fr auto auto; align-items: center; }
+  .changelog-row {
+    grid-template-columns: auto 1fr auto auto auto;
+    grid-template-areas: "slug title pr size ticket";
+    align-items: baseline;
+  }
+  .changelog-row .changelog-slug { grid-area: slug; margin-right: 0; }
+  .changelog-row .changelog-title { grid-area: title; }
+  .changelog-row .changelog-pr { grid-area: pr; margin-right: 0; }
+  .changelog-row .changelog-size { grid-area: size; margin-right: 0; }
+  .changelog-row .changelog-ticket { grid-area: ticket; margin-right: 0; }
+}
