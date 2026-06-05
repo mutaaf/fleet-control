@@ -596,6 +596,15 @@ async function fetchFridayWrap() {
   try { return await get("/api/fleet/friday-wrap"); } catch { return null; }
 }
 
+// Ticket 0040: "Riskiest open PR" badge. One-line surface above the
+// project grid (and below any visible 0033/0037/0038 card) that names
+// THE single open agent PR the operator should tend next. Lazy-fetched
+// from /api/fleet/riskiest-pr; errors fall through silently so the
+// rest of the home page still loads when the endpoint is unreachable.
+async function fetchRiskiestPr() {
+  try { return await get("/api/fleet/riskiest-pr"); } catch { return null; }
+}
+
 /** Skeleton block shown while /api/fleet/glance is in flight. Carries
  *  `aria-busy="true"` so screen readers announce the loading state;
  *  the pulsing animation flattens under
@@ -700,6 +709,78 @@ function renderFridayWrap(data) {
     </div>
     ${winLine}
     ${watchLine}
+  </a>`;
+}
+
+// Ticket 0040: "Riskiest open PR" badge. One inline line ABOVE the
+// project grid (and BELOW the 0033/0037/0038 cards) that names THE
+// single PR most likely to hurt the operator next.
+//
+// Three render modes, per AC7:
+//   - open_count === 0           → return ""  (no DOM element)
+//   - all_healthy === true       → "Open PRs (N): all healthy" linked
+//                                  to the inbox
+//   - top !== null               → "<slug> #<n> (<heals> heals, <kind>,
+//                                  <age> old) [tend it now →]" linked
+//                                  to /p/<slug>?pr=<n>
+//
+// fail-kind label map mirrors the user-story copy: infra_flake →
+// "infra flake (<detail>)" (the matched substring becomes the
+// parenthetical so the operator sees the literal log signal); red_test
+// → "failing test"; red_check_unknown → "red check"; green →
+// "awaiting review".
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string (project slug, PR title,
+// fail detail) passes through redactSecrets before HTML interpolation.
+// Critical because fail_detail can carry stdout substrings — a future
+// log that includes a leaked PAT would otherwise survive to the DOM.
+function renderRiskiestPr(data) {
+  if (!data) return "";
+  const openCount = Number(data.open_count || 0);
+  if (openCount === 0) return "";
+  if (data.all_healthy && !data.top) {
+    return `<a class="riskiest-pr riskiest-pr-healthy" data-testid="riskiest-pr" href="#inbox" aria-label="Open PRs — tap to see the inbox">
+      <span class="riskiest-pr-label"><b>Open PRs (${openCount}):</b> all healthy</span>
+      <span class="riskiest-pr-link dim">see inbox →</span>
+    </a>`;
+  }
+  const top = data.top;
+  if (!top) return "";
+  const slug = String(top.project_slug || "");
+  const safeSlug = esc(redactSecrets(slug));
+  const safeTitle = esc(redactSecrets(String(top.pr_title || "")));
+  const num = Number(top.pr_number || 0);
+  const heals = Number(top.heal_attempts || 0);
+  const ageHours = Number(top.age_hours || 0);
+  const ageStr = ageHours >= 24
+    ? Math.floor(ageHours / 24) + "d"
+    : Math.max(0, ageHours) + "h";
+  const FAIL_KIND_LABELS = {
+    infra_flake: "infra flake",
+    red_test: "failing test",
+    red_check_unknown: "red check",
+    green: "awaiting review",
+  };
+  const kindLabel = FAIL_KIND_LABELS[String(top.fail_kind)] || "red check";
+  let kindRendered = esc(kindLabel);
+  if (top.fail_kind === "infra_flake" && top.fail_detail) {
+    const safeDetail = esc(redactSecrets(String(top.fail_detail)));
+    kindRendered = `${esc(kindLabel)} (${safeDetail})`;
+  }
+  const healsText = `${heals} heal${heals === 1 ? "" : "s"}`;
+  const route = "#/p/" + encodeURIComponent(slug) + "?pr=" + num;
+  // Single-line layout on >=600px (CSS); wraps to two on phones with
+  // the link on its own row. Tap-anywhere navigates to the project
+  // page deep-linked to the PR card via ?pr=<n>.
+  return `<a class="riskiest-pr" data-testid="riskiest-pr" href="${esc(route)}" aria-label="Riskiest open PR — tend it now">
+    <span class="riskiest-pr-label">
+      <span class="riskiest-pr-eyebrow dim">Riskiest open PR:</span>
+      <b>${safeSlug}</b> #${num}
+      ${safeTitle ? `<span class="riskiest-pr-title dim">${safeTitle}</span>` : ""}
+      <span class="riskiest-pr-meta">(${esc(healsText)}, ${kindRendered}, ${esc(ageStr)} old)</span>
+    </span>
+    <span class="riskiest-pr-link">tend it now →</span>
   </a>`;
 }
 
@@ -1304,8 +1385,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(),
   ]);
   const alerts = data.alerts || [];
   const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
@@ -1317,6 +1398,7 @@ async function home() {
     renderFridayWrap(fridayWrapData) +
     renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +
+    renderRiskiestPr(riskiestPrData) +
     renderStreak(streakData) +
     renderInbox(inboxData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
@@ -1679,6 +1761,25 @@ async function project(slug, params) {
   // tokens actually went). Lazy fetch — keeps /api/project/:slug
   // additive-only and the home payload small.
   loadToolMixSection(slug);
+  // Ticket 0040: when the URL hash carries `?pr=<n>`, scroll the
+  // matching PR card into view and briefly flash it with the
+  // `pr-card-flash` class so the operator's eye lands on the right
+  // row immediately after tapping the home-page badge. The class is a
+  // 2-second CSS fade — no JS animation library. We re-run on every
+  // poll re-render because the timer also re-renders the PR card
+  // markup; the matching card always reads the same data-number.
+  try {
+    const prParam = params && params.get && params.get("pr");
+    if (prParam) {
+      const matching = app.querySelector('[data-pr-card][data-number="' + String(prParam).replace(/"/g, "") + '"]');
+      if (matching && !matching._riskiestFlashed) {
+        matching._riskiestFlashed = true;
+        matching.classList.add("pr-card-flash");
+        try { matching.scrollIntoView({ block: "center", behavior: "smooth" }); } catch { /* older browsers */ }
+        setTimeout(() => { matching.classList.remove("pr-card-flash"); }, 2200);
+      }
+    }
+  } catch { /* never let the highlight crash the project page */ }
 }
 
 // ---- Tool-mix sparkline (ticket 0031) ------------------------------------

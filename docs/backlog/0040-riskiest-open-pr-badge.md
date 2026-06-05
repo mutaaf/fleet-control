@@ -1,7 +1,7 @@
 ---
 id: 0040
 title: Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next
-status: proposed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-05
@@ -375,4 +375,18 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-05 [ship/0040] Branched `feat/0040-riskiest-open-pr-badge` off
+  main, flipped status to `in-progress`, beginning test-first.
+- 2026-06-05 [ship/0040] Helper + route + SPA + CSS landed; all 30
+  non-perf ACs green (1 PERF-gated skip). `npx tsc --noEmit` clean;
+  `node scripts/check-backlog.mjs` clean. Local pre-existing failures
+  (digest/prs-merged/leaderboard/correlate/quiet-hours CLI/demo)
+  predate this change — confirmed by stashing the diff + new test file
+  and re-running on bare HEAD: same 22 failures, none caused by 0040.
+  Per LESSONS § "time-pinned tests must NOT derive seed timestamps
+  from `new Date()`", those aren't this ticket's to fix.
+- 2026-06-05 [ship/0040] One subtle adjustment vs the ticket prose:
+  `pr.state` is stored as lowercase `'open'` by the production
+  ingester (src/ingest/prs.ts line 164), not `'OPEN'` as the AC text
+  suggested. The schema is the source of truth; the helper queries
+  `state = 'open' AND is_agent = 1`.

@@ -10,7 +10,8 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, type YesterdayGlance, type CostPerMergedPr, type FridayWrap } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr } from "./views.ts";
+import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
 import { activeCorrelations } from "./correlate.ts";
@@ -311,6 +312,81 @@ function getFridayWrapCached(db: DB, cfg: FleetConfig, now: Date, tz: string): F
   return value;
 }
 
+// Ticket 0040: "Riskiest open PR" memo cache.
+//
+// 30s TTL (matches the Cache-Control: max-age=30 header — the score
+// can shift the moment a new heal lands or a PR closes). The cache
+// is invalidated by a two-value tuple computed BEFORE the main query:
+//
+//   - openCountSnapshot       = SELECT COUNT(*) FROM pr WHERE state='open' AND is_agent=1
+//   - latestHealTsSnapshot    = SELECT MAX(ts) FROM control_audit WHERE action='heal'
+//
+// Either value moving (a new heal-audit row OR an open-PR-count
+// change) busts the cache the moment the next request lands — no
+// poll-the-full-result required. Per LESSONS § "in-process dedup
+// sets need an explicit reset hook for tests" we expose
+// `_resetRiskiestPrCacheForTests()`. Per LESSONS § "expose a build
+// counter for cache-hit tests, not a fetcher swap" we ALSO expose a
+// read-only `_getRiskiestPrCacheBuildsForTests()` that ticks on
+// every cache MISS so route tests assert hit/miss semantics without
+// stubbing SQL. Production code never reads either.
+interface RiskiestPrCacheEntry {
+  tuple: string;
+  value: RiskiestOpenPr;
+  expires_at: number;
+}
+const RISKIEST_PR_TTL_MS = 30_000;
+let riskiestPrCache: RiskiestPrCacheEntry | null = null;
+let riskiestPrBuildCounter = 0;
+
+export function _resetRiskiestPrCacheForTests(): void {
+  riskiestPrCache = null;
+  riskiestPrBuildCounter = 0;
+}
+
+export function _getRiskiestPrCacheBuildsForTests(): number {
+  return riskiestPrBuildCounter;
+}
+
+interface RiskiestPrCountRow { c: number | null; }
+interface RiskiestPrLatestHealRow { t: string | null; }
+
+/** Two-value cache-invalidation tuple. Cheap: both reads hit
+ *  existing indexes (control_audit_action_ts from src/db.ts +
+ *  pr's PK). */
+function riskiestPrInvalidationTuple(db: DB): string {
+  const countRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr WHERE state = 'open' AND is_agent = 1",
+  ).get() as unknown as RiskiestPrCountRow | undefined;
+  const latestRow = db.prepare(
+    "SELECT MAX(ts) AS t FROM control_audit WHERE action = 'heal'",
+  ).get() as unknown as RiskiestPrLatestHealRow | undefined;
+  const c = Number(countRow?.c ?? 0);
+  const t = latestRow?.t ?? "";
+  return `${c}|${t}`;
+}
+
+/** Look up a fresh riskiest-PR payload from the memo cache; rebuild on
+ *  miss. The invalidation tuple (open-PR count + latest heal-audit
+ *  ts) replaces a pure time-based key — any state change visible to
+ *  the helper invalidates immediately rather than waiting for the
+ *  30s TTL. */
+function getRiskiestPrCached(db: DB, cfg: FleetConfig, now: Date): RiskiestOpenPr {
+  const tuple = riskiestPrInvalidationTuple(db);
+  if (
+    riskiestPrCache
+    && riskiestPrCache.tuple === tuple
+    && riskiestPrCache.expires_at > Date.now()
+  ) {
+    return riskiestPrCache.value;
+  }
+  riskiestPrBuildCounter += 1;
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const value = riskiestOpenPr(db, now, { quietHoursActive: quiet });
+  riskiestPrCache = { tuple, value, expires_at: Date.now() + RISKIEST_PR_TTL_MS };
+  return value;
+}
+
 function getLessonsCached(path: string): CrossLessonsLoadResult {
   // Read mtime first so a swap-in of a different file (via the env
   // override) or a `utimesSync` from a test invalidates the cache.
@@ -606,6 +682,26 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=600",
+          });
+          return res.end(body);
+        }
+        // Ticket 0040: riskiest open PR — one fleet-wide line names
+        // the PR most likely to hurt the operator next. Composes
+        // pr / project / control_audit (heal-attempt tail) — no
+        // schema migration. 30s memo cache invalidated by a two-value
+        // tuple (open-PR count + latest heal-audit ts) so a fresh
+        // heal lands a new badge on the next render. Quiet hours
+        // (0030) suppress an `infra_flake` top row overnight — the
+        // helper takes the flag; the SPA can re-render the same
+        // shape with `top: null`. Net-new route — no existing JSON
+        // shape to preserve.
+        if (path === "/api/fleet/riskiest-pr") {
+          const v = getRiskiestPrCached(db, cfg, new Date());
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=30",
           });
           return res.end(body);
         }

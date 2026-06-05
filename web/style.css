@@ -736,6 +736,73 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   }
 }
 
+/* Ticket 0040: Riskiest open PR badge. One inline line above the
+ * project grid. Two-line layout on phones (label on top, "tend it
+ * now" link below); collapses to a single row with the link right-
+ * aligned at >=600px. Reuses the existing palette tokens — no new
+ * variables. The fail-kind colour cue rides on a modifier class
+ * (default = warn amber for a working triage signal; healthy = good
+ * green; the renderer reads fail_kind and could add e.g. `riskiest-
+ * pr-red` for red_test in a future tweak — base rule keeps the
+ * surface readable either way). */
+.riskiest-pr {
+  display: flex;
+  flex-direction: column;
+  gap: 4px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r);
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  transition: border-color .15s, background .15s;
+}
+.riskiest-pr:hover { border-color: #3a3b34; background: var(--panel2); }
+.riskiest-pr-healthy { border-left-color: var(--good); }
+.riskiest-pr-eyebrow {
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+.riskiest-pr-label { color: var(--ink); line-height: 1.45; }
+.riskiest-pr-label b { color: var(--ink); font-weight: 600; }
+.riskiest-pr-title { margin-left: 4px; }
+.riskiest-pr-meta { color: var(--dim); margin-left: 4px; }
+.riskiest-pr-link {
+  color: var(--accent);
+  font-size: 12.5px;
+  align-self: flex-end;
+  white-space: nowrap;
+}
+
+@media (min-width: 600px) {
+  .riskiest-pr {
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .riskiest-pr-link { align-self: auto; }
+}
+
+/* Ticket 0040: PR-card highlight flash. When the project page is
+ * deep-linked with `?pr=<n>` (from the riskiest-PR badge), the
+ * matching card briefly glows so the operator's eye lands on it.
+ * 2-second fade — pure CSS, no JS animation library. Reuses --warn
+ * for the highlight ring to match the badge's left-border colour. */
+.pr-card-flash {
+  animation: pr-card-flash 2s ease-out 1;
+}
+@keyframes pr-card-flash {
+  0%   { box-shadow: 0 0 0 2px rgba(217, 138, 43, .55); border-color: rgba(217, 138, 43, .65); }
+  100% { box-shadow: 0 0 0 0 rgba(217, 138, 43, 0);    border-color: var(--line); }
+}
+
 /* Ticket 0034: self-baseline drift detail view. Three rows stacked
  * single-column on phones; each row carries the metric label, the
  * baseline mean/sigma + current value as a numeric line, and an

@@ -340,5 +340,18 @@ export function openDb(path: string): DB {
       + "WHERE kind = 'fleet_correlated'",
     );
   } catch { /* index exists or older sqlite */ }
+  // Ticket 0040: lookup index for classifyPrFailure() — the riskiest-
+  // open-PR helper reads the latest heal-audit row by (action, ts)
+  // for every open PR on every render. Indexing (action, ts DESC)
+  // turns the per-PR ORDER BY ts DESC LIMIT 1 into a constant-time
+  // probe so the helper's perf budget (<25ms over 50 PRs × 10 heal
+  // audits each per AC11) holds. Per LESSONS § no backticks inside
+  // template-literal SQL strings, identifiers stay plain.
+  try {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS control_audit_action_ts "
+      + "ON control_audit(action, ts DESC)",
+    );
+  } catch { /* index exists or older sqlite */ }
   return db;
 }
