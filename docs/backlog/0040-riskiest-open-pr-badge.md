@@ -1,7 +1,7 @@
 ---
 id: 0040
 title: Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next
-status: proposed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-05
@@ -375,4 +375,5 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-05 [ship/0040] Branched `feat/0040-riskiest-open-pr-badge` off
+  main, flipped status to `in-progress`, beginning test-first.

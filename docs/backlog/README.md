@@ -19,7 +19,7 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
-| 0040 | Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next | P1 | proposed | observability |
+| 0040 | Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next | P1 | in-progress | observability |
 | 0039 | Fleet changelog - one chronological page of every merged PR across every project, ticket-linked | P1 | proposed | portal |
 | 0038 | Monday morning catch-up - bridges the weekend gap between Friday wrap and Yesterday glance | P1 | proposed | portal |
 | 0037 | Friday wrap - one weekly card recaps the fleet's week so the operator closes the laptop on a high | P2 | shipped | portal |
