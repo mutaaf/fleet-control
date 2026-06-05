@@ -21,7 +21,7 @@ proposes new ones, `review` grades them.
 |----|-------|----------|--------|------|
 | 0040 | Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next | P1 | shipped | observability |
 | 0039 | Fleet changelog - one chronological page of every merged PR across every project, ticket-linked | P1 | proposed | portal |
-| 0038 | Monday morning catch-up - bridges the weekend gap between Friday wrap and Yesterday glance | P1 | in-progress | portal |
+| 0038 | Monday morning catch-up - bridges the weekend gap between Friday wrap and Yesterday glance | P1 | shipped | portal |
 | 0037 | Friday wrap - one weekly card recaps the fleet's week so the operator closes the laptop on a high | P2 | shipped | portal |
 | 0036 | Cross-fleet lessons portal view - the file the operator never sees becomes a daily surface | P1 | shipped | portal |
 | 0035 | Cost per merged PR - the single number that frames spend in value terms | P1 | shipped | observability |

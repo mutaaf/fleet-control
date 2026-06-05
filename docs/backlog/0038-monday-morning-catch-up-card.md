@@ -1,7 +1,7 @@
 ---
 id: 0038
 title: Monday morning catch-up - bridges the weekend gap between Friday wrap and Yesterday glance
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-05
@@ -322,3 +322,5 @@ Each box maps 1:1 to a test scenario.
   writes `pr.state = 'open'` lowercase for open PRs; merged PRs are seeded as
   `'MERGED'` upper-case (the codebase convention every other view uses). The
   helper queries match this exact casing.
+- 2026-06-05 — Shipped via PR #93 (squash-merged into main). CI green
+  (typecheck + validate). All 24 monday-catchup tests pass locally.
