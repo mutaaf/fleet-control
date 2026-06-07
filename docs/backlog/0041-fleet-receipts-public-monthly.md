@@ -1,7 +1,7 @@
 ---
 id: 0041
 title: Fleet receipts - public monthly artifact at a stable URL the prospective operator sees first
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-07
@@ -17,6 +17,12 @@ owner: gtm-innovation
   returns `'red'`/`'pending'`/`'green'`/`'none'` (lowercase). receipts
   implementation mirrors these casings exactly per LESSONS 2026-06-05
   "groomer prose can disagree with the schema; the schema wins".
+- 2026-06-07 ship — PR #98 merged. Both gating checks (typecheck +
+  validate) green. Status flipped to `shipped` via the separate
+  chore/0041-mark-shipped branch per LESSON ship/0020 ("when
+  auto-merge fires while you're still in --watch, the feature
+  branch is squashed-and-gone; the shipped flip must be a separate
+  chore PR").
 
 ## User story
 
