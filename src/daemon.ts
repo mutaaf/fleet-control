@@ -13,7 +13,9 @@ import { evalAlerts } from "./alerts.ts";
 import { runBudgetGuards } from "./budget_guard.ts";
 import { runCorrelationHook } from "./correlate.ts";
 import { runDriftHook } from "./drift.ts";
-import { runLessonsHook } from "./lessons.ts";
+import {
+  runLessonsHook, loadCrossLessons, defaultLessonsPath, attributeHealsToLessons,
+} from "./lessons.ts";
 
 const UID = process.getuid?.() ?? 0;
 const LABEL = "com.fleet.control.fleetd";
@@ -79,6 +81,25 @@ export async function runDaemon(intervalSec = 60): Promise<void> {
         const inserted = runLessonsHook(db, new Date());
         if (inserted) console.log(`${new Date().toISOString()} ${inserted} new fleet-lessons batch detected`);
       } catch (e) { console.error("lessons hook error:", e); }
+      // Ticket 0042: lesson credit ledger. Once per tick, attribute
+      // any new heal-audit rows to the cross-fleet lesson whose
+      // symptom substring matches the heal's stdout_tail. Idempotent
+      // across ticks via the composite PK on lesson_credit
+      // (lesson_slug, lesson_date, heal_audit_id) — re-running over
+      // the same heal-audit row is a silent no-op. Guarded by the
+      // same source_present / oversized checks the 0036 lessons hook
+      // uses: a missing file is a fresh-install signal (no lessons
+      // to attribute against) and an oversized file is a runaway-log
+      // signal (the parser already skips it).
+      try {
+        const parsed = loadCrossLessons(defaultLessonsPath());
+        if (parsed.source_present && !parsed.oversized) {
+          const r = attributeHealsToLessons(db, parsed, new Date());
+          if (r.credits_inserted) {
+            console.log(`${new Date().toISOString()} ${r.credits_inserted} new lesson credit(s)`);
+          }
+        }
+      } catch (e) { console.error("lesson-credit hook error:", e); }
     } catch (e) { console.error("pass error:", e); }
     await sleep(intervalSec);
   }

@@ -421,3 +421,276 @@ export function runLessonsHook(db: DB, now: Date): number {
   writeWatermark(db, LESSONS_TOTAL_KEY, String(current), nowIso);
   return 1;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0042 — Lesson credit ledger.
+//
+// Two pure helpers turn the parsed CROSS_LESSONS.md file into an
+// attribution ledger over control_audit's heal rows:
+//
+//   extractSymptomPatterns(parsed)   → per-lesson distinctive substrings
+//   attributeHealsToLessons(db, ...) → walks heal-audit rows, runs
+//                                      each lesson's patterns through
+//                                      String.prototype.includes() on
+//                                      the stdout_tail, writes one
+//                                      lesson_credit row per first
+//                                      matching (lesson, heal) pair.
+//
+// PRODUCER-VS-SPEC reconciliation (per LESSONS 2026-06-05 "groomer
+// prose can disagree with the schema; the schema wins"): the
+// production heal row is INSERTed with action='heal' (lowercase) and
+// target='pr-<number>' — confirmed against src/control.ts:230 (the
+// audit() helper that every doAction("heal", …) hits) and the
+// riskiest-pr classifier in src/views.ts:3128. We SELECT against the
+// same casing here.
+//
+// Per AGENTS.md Hard NO "never compose a shell string from input"
+// (and its SQL analogue): every pattern lives in JS as a literal
+// string; we never push it into a SQL LIKE / GLOB. The SQL surface
+// is a single parameterised prepared statement bound to the
+// (lesson_slug, lesson_date, heal_audit_id, …) tuple.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every typed-row narrowing here uses the double-cast pattern.
+// ────────────────────────────────────────────────────────────────────
+
+/** Minimum length for a candidate substring to be considered
+ *  "distinctive enough" to act as a match key. 12 chars filters
+ *  out common English words and short tool names so a pattern like
+ *  "the run" doesn't credit half the heals in the fleet. */
+const MIN_PATTERN_LEN = 12;
+
+/** Per-lesson cap. The attributor iterates patterns in order and
+ *  stops on the first match per heal — three is plenty of coverage
+ *  for the body+title variants of a single lesson without inflating
+ *  the inner loop. */
+const MAX_PATTERNS_PER_LESSON = 3;
+
+/** Default attribution window in days. The route + the daemon hook
+ *  both accept an opts override; the constant lives here so test
+ *  fixtures can import it later if needed. */
+export const LESSON_CREDIT_DEFAULT_WINDOW_DAYS = 30;
+
+/** Hard-coded module-level stoplist of common English words and short
+ *  generic terms. Kept tight — anything we miss is filtered out by
+ *  the >= 12 char length check anyway, so this list focuses on the
+ *  multi-word junk fragments that would otherwise sneak through
+ *  (e.g. "the GitHub Actions sometimes" → if a stoplist token sits
+ *  at the start, we recompose from the next word). The list is a
+ *  Set for O(1) lookup. */
+const STOPLIST = new Set<string>([
+  "the", "and", "with", "from", "into", "your", "this", "that",
+  "have", "been", "when", "what", "while", "where", "which",
+  "these", "those", "their", "there", "would", "could", "should",
+  "about", "after", "before", "above", "below", "again", "still",
+  "some", "such", "than", "then", "them", "they", "were", "will",
+  "just", "only", "very", "also", "even", "more", "most", "much",
+  "other", "over", "same", "into", "onto", "upon", "each", "every",
+  "any", "all", "for", "but", "not", "now", "out", "via", "per",
+  "lesson", "lessons", "symptom", "cause", "fix", "trace", "log",
+]);
+
+export interface LessonSymptomPatterns {
+  slug: string;
+  date: string;
+  title: string;
+  patterns: string[];
+}
+
+/** Tokenise + filter a single lesson title/body pair into 1-3
+ *  distinctive substrings. The first candidate is always the lesson
+ *  title (most distinctive by construction — the operator authored
+ *  it as a one-line "here's the symptom" headline). Subsequent
+ *  candidates are the first sentence of the body and the first
+ *  sentence after the body's "Cause:" / "Fix:" tokens when present.
+ *
+ *  Each candidate is trimmed to a single line and clipped to <= 200
+ *  chars so the SQL row stays small. Candidates whose every word is
+ *  in the STOPLIST OR whose length is below MIN_PATTERN_LEN are
+ *  dropped. */
+function patternsForLesson(title: string, body: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const cleaned = raw.replace(/\s+/g, " ").trim();
+    if (cleaned.length < MIN_PATTERN_LEN) return;
+    if (cleaned.length > 200) return;
+    // All-stoplist test: every space-split token is in the stoplist.
+    const tokens = cleaned.toLowerCase().split(/[\s\W]+/).filter(Boolean);
+    const informative = tokens.some((t) => !STOPLIST.has(t) && t.length >= 4);
+    if (!informative) return;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(cleaned);
+  };
+  // 1. The title (most distinctive — operator-authored headline).
+  push(title);
+  // 2. First sentence of the body. We split on `.\s` or newline so a
+  //    multi-paragraph body still yields a tight first candidate.
+  const firstLine = body.split(/[.\n]/).find((s) => s.trim().length >= MIN_PATTERN_LEN);
+  if (firstLine) push(firstLine);
+  // 3. The text immediately following the body's `Cause:` token —
+  //    this is the lesson's "what went wrong" summary, the part
+  //    most likely to mirror an upstream heal's stdout tail.
+  const causeMatch = body.match(/Cause:\s*([^.\n]+)/i);
+  if (causeMatch) push(causeMatch[1]);
+  return out.slice(0, MAX_PATTERNS_PER_LESSON);
+}
+
+/** Derive per-lesson match keys from a parsed CROSS_LESSONS.md.
+ *  Dated-less entries are skipped (the lesson_credit PK requires
+ *  lesson_date). Returns lessons whose patterns array is non-empty —
+ *  a lesson with no usable substrings can't match anything anyway,
+ *  so dropping it from the output keeps the attributor's inner loop
+ *  short. */
+export function extractSymptomPatterns(
+  parsed: CrossLessonsLoadResult,
+): LessonSymptomPatterns[] {
+  const out: LessonSymptomPatterns[] = [];
+  for (const p of parsed.projects) {
+    for (const l of p.lessons) {
+      if (!l.date) continue;
+      const patterns = patternsForLesson(l.title ?? "", l.body ?? "");
+      if (patterns.length === 0) continue;
+      out.push({
+        slug: p.slug,
+        date: l.date,
+        title: l.title,
+        patterns,
+      });
+    }
+  }
+  return out;
+}
+
+interface HealAuditRowForAttribution {
+  id: number;
+  ts: string;
+  target: string | null;
+  stdout_tail: string | null;
+}
+
+interface ProjectByPrRow {
+  number: number;
+  project_slug: string;
+}
+
+export interface AttributeHealsResult {
+  credits_inserted: number;
+  heals_examined: number;
+}
+
+export interface AttributeHealsOptions {
+  /** Window in days for the heal lookback. Defaults to
+   *  LESSON_CREDIT_DEFAULT_WINDOW_DAYS (30). */
+  windowDays?: number;
+}
+
+/** Walk every heal-audit row in the window, match its stdout_tail
+ *  against every lesson's patterns (first-match-wins per heal), and
+ *  INSERT OR IGNORE one lesson_credit row per (lesson, heal) pair.
+ *
+ *  Idempotent on re-run: the composite PK on lesson_credit
+ *  (lesson_slug, lesson_date, heal_audit_id) blocks duplicates so a
+ *  second invocation in the same daemon loop is a silent no-op.
+ *
+ *  Pure-SQL + JS substring helper — no shell-out, no network, no
+ *  LLM. Per AGENTS.md Hard NOs the stdout_tail match runs in JS via
+ *  String.prototype.includes(); the only SQL the helper issues is
+ *  parameterised reads and writes against lesson_credit / pr /
+ *  control_audit. */
+export function attributeHealsToLessons(
+  db: DB,
+  parsed: CrossLessonsLoadResult,
+  now: Date,
+  opts: AttributeHealsOptions = {},
+): AttributeHealsResult {
+  const windowDays = Math.max(
+    1, Math.floor(opts.windowDays ?? LESSON_CREDIT_DEFAULT_WINDOW_DAYS));
+  // When the parsed file is empty / oversized / missing there's
+  // nothing to attribute against; the daemon hook also short-circuits
+  // before calling us, but this guard keeps the helper safe for
+  // direct callers (tests etc.).
+  if (!parsed.source_present || parsed.oversized) {
+    return { credits_inserted: 0, heals_examined: 0 };
+  }
+  const patternsByLesson = extractSymptomPatterns(parsed);
+  if (patternsByLesson.length === 0) {
+    return { credits_inserted: 0, heals_examined: 0 };
+  }
+
+  const cutoffIso = new Date(now.getTime() - windowDays * 24 * 3600_000).toISOString();
+  // PRODUCER-VS-SPEC: action='heal' (lowercase) per src/control.ts.
+  const healRows = db.prepare(
+    "SELECT id, ts, target, stdout_tail FROM control_audit "
+    + " WHERE action = 'heal' AND ts >= ? "
+    + " ORDER BY id ASC",
+  ).all(cutoffIso) as unknown as HealAuditRowForAttribution[];
+
+  if (healRows.length === 0) {
+    return { credits_inserted: 0, heals_examined: 0 };
+  }
+
+  // Pre-load the PR → project_slug map so we attribute the credit to
+  // the right project without an N+1 join. target follows the
+  // 'pr-<number>' convention (per src/views.ts:3128); rows whose
+  // target doesn't match that shape simply attribute to project_slug
+  // = '' (still a valid credit; the rollup just counts it under the
+  // empty slug, which is the right thing for non-PR-scoped heals).
+  const prMapRows = db.prepare(
+    "SELECT pr.number AS number, project.slug AS project_slug "
+    + " FROM pr JOIN project ON project.id = pr.project_id",
+  ).all() as unknown as ProjectByPrRow[];
+  const slugByPrNumber = new Map<number, string>();
+  for (const r of prMapRows) slugByPrNumber.set(Number(r.number), String(r.project_slug));
+
+  const insert = db.prepare(
+    "INSERT OR IGNORE INTO lesson_credit("
+    + "lesson_slug, lesson_date, lesson_title, heal_audit_id, "
+    + "project_slug, matched_substring, created_at"
+    + ") VALUES (?,?,?,?,?,?,?)",
+  );
+
+  let inserted = 0;
+  const nowIso = now.toISOString();
+  for (const heal of healRows) {
+    const tail = String(heal.stdout_tail ?? "");
+    if (!tail) continue;
+    // Resolve project_slug from the target shape. We accept
+    // 'pr-<N>' explicitly; anything else (e.g. '<slug>/<phase>'
+    // from auto-kill rows) falls back to the slug component when
+    // present, otherwise the empty string.
+    let projectSlug = "";
+    const target = String(heal.target ?? "");
+    const prMatch = target.match(/^pr-(\d+)$/);
+    if (prMatch) {
+      projectSlug = slugByPrNumber.get(Number(prMatch[1])) ?? "";
+    } else if (target.includes("/")) {
+      projectSlug = target.split("/")[0] ?? "";
+    }
+    // First-match-wins per heal. We iterate lessons in source order
+    // (extractSymptomPatterns preserves it); within a lesson the
+    // patterns are also iterated in order (title first, then body
+    // sentences). The credit attributes to the FIRST lesson whose
+    // any pattern is a substring of the tail.
+    let matchedLesson: LessonSymptomPatterns | null = null;
+    let matchedSubstring = "";
+    outer: for (const lesson of patternsByLesson) {
+      for (const p of lesson.patterns) {
+        if (tail.includes(p)) {
+          matchedLesson = lesson;
+          matchedSubstring = p;
+          break outer;
+        }
+      }
+    }
+    if (!matchedLesson) continue;
+    const r = insert.run(
+      matchedLesson.slug, matchedLesson.date, matchedLesson.title,
+      heal.id, projectSlug, matchedSubstring, nowIso,
+    );
+    if (r.changes > 0) inserted += 1;
+  }
+  return { credits_inserted: inserted, heals_examined: healRows.length };
+}

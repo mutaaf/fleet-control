@@ -269,6 +269,27 @@ CREATE TABLE IF NOT EXISTS receipts_published (
   payload_json  TEXT NOT NULL,
   PRIMARY KEY (project_slug, month_iso)
 );
+
+-- Lesson credit ledger (ticket 0042). One row per (lesson, heal-audit)
+-- attribution. Composite PK is also the idempotency guard: re-running
+-- attributeHealsToLessons() over the same heal-audit row is a silent
+-- no-op (the INSERT OR IGNORE upstream relies on the PK). The
+-- lesson_credit_created_at index supports the "last 30 days" rollup
+-- (lessonCreditRollup() in src/views.ts) so the daemon-tick attribute
+-- pass plus the route's read-side rollup both stay O(log n). Per
+-- LESSONS no backticks inside template-literal SQL strings, all
+-- identifiers stay plain words.
+CREATE TABLE IF NOT EXISTS lesson_credit (
+  lesson_slug       TEXT NOT NULL,
+  lesson_date       TEXT NOT NULL,
+  lesson_title      TEXT NOT NULL,
+  heal_audit_id     INTEGER NOT NULL REFERENCES control_audit(id) ON DELETE CASCADE,
+  project_slug      TEXT NOT NULL,
+  matched_substring TEXT NOT NULL,
+  created_at        TEXT NOT NULL,
+  PRIMARY KEY (lesson_slug, lesson_date, heal_audit_id)
+);
+CREATE INDEX IF NOT EXISTS lesson_credit_created_at ON lesson_credit(created_at DESC);
 `;
 
 export type DB = DatabaseSync;

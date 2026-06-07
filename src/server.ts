@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -26,6 +26,7 @@ import { fetchPrDiff } from "./diff.ts";
 import { weeklyDigest } from "./digest.ts";
 import {
   loadCrossLessons, defaultLessonsPath, newThisWeekCount,
+  attributeHealsToLessons,
   type CrossLessonsLoadResult,
 } from "./lessons.ts";
 import { statSync } from "node:fs";
@@ -220,6 +221,85 @@ export function _resetLessonsCacheForTests(): void {
 
 export function _getLessonsCacheBuildsForTests(): number {
   return lessonsBuildCounter;
+}
+
+// Ticket 0042: lesson credit ledger memo cache.
+//
+// 5-minute TTL keyed by the three-value tuple
+// (window_days, latest_heal_audit_id, lessons_total) — either component
+// moving invalidates the cache the moment the next request lands so a
+// freshly-landed heal credit surfaces without waiting out the TTL.
+// Per LESSONS § "in-process dedup sets need an explicit reset hook for
+// tests" we expose `_resetLessonCreditCacheForTests()`. Per LESSONS §
+// "expose a build counter for cache-hit tests, not a fetcher swap" we
+// also expose a read-only `_getLessonCreditCacheBuildsForTests()` that
+// ticks on every cache MISS so route tests can assert hit/miss
+// semantics without stubbing SQL.
+interface LessonCreditCacheEntry {
+  tuple: string;
+  value: LessonCreditRollup;
+  expires_at: number;
+}
+const LESSON_CREDIT_TTL_MS = 300_000; // 5 minutes per the AC
+const lessonCreditCache = new Map<string, LessonCreditCacheEntry>();
+let lessonCreditBuildCounter = 0;
+
+export function _resetLessonCreditCacheForTests(): void {
+  lessonCreditCache.clear();
+  lessonCreditBuildCounter = 0;
+}
+
+export function _getLessonCreditCacheBuildsForTests(): number {
+  return lessonCreditBuildCounter;
+}
+
+interface LessonCreditLatestHealRow { id: number | null; }
+
+/** Three-value cache-invalidation tuple. Cheap: both DB reads hit
+ *  existing primary keys / indexes; the lessons-total read is a
+ *  memoised parse (the lessons cache above). */
+function lessonCreditInvalidationTuple(
+  db: DB, windowDays: number, lessonsTotal: number,
+): string {
+  const latest = db.prepare(
+    "SELECT MAX(id) AS id FROM control_audit WHERE action = 'heal'",
+  ).get() as unknown as LessonCreditLatestHealRow | undefined;
+  const id = Number(latest?.id ?? 0);
+  return `w=${windowDays}|h=${id}|n=${lessonsTotal}`;
+}
+
+/** Look up a fresh lesson-credit rollup from the memo cache;
+ *  attribute + rebuild on miss. The attribution step runs on the
+ *  same tick as the rollup so a freshly-landed heal that pattern-
+ *  matches a lesson gets credited inside the TTL without waiting for
+ *  the daemon hook to fire. */
+function getLessonCreditCached(
+  db: DB, windowDays: number, parsed: CrossLessonsLoadResult, now: Date,
+): LessonCreditRollup {
+  const tuple = lessonCreditInvalidationTuple(db, windowDays, parsed.total);
+  const hit = lessonCreditCache.get(tuple);
+  if (hit && hit.expires_at > Date.now()) return hit.value;
+  lessonCreditBuildCounter += 1;
+  // Run the attributor on cache miss so newly-landed heals get
+  // credited within the TTL. Skipped silently when the file is
+  // missing/oversized — attributeHealsToLessons itself short-circuits
+  // in those cases (same guard as the daemon hook).
+  try {
+    attributeHealsToLessons(db, parsed, now, { windowDays });
+  } catch { /* keep serving — the rollup below will surface whatever is in the table */ }
+  const value = lessonCreditRollup(db, now, { windowDays });
+  lessonCreditCache.set(tuple, { tuple, value, expires_at: Date.now() + LESSON_CREDIT_TTL_MS });
+  return value;
+}
+
+/** Parse + clamp the ?window=<days> query param. Defaults to 30;
+ *  clamps to [1, 90]. Same shape as clampDays() in views.ts but
+ *  inlined here so the route stays a one-liner. */
+function clampLessonCreditWindow(raw: string | null): number {
+  if (!raw) return 30;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 30;
+  return Math.max(1, Math.min(90, n));
 }
 
 // Ticket 0037: "Friday wrap" memo cache.
@@ -1220,6 +1300,28 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=120",
+          });
+          return res.end(body);
+        }
+        // Ticket 0042: lesson credit ledger. Returns the rollup over
+        // the requested window (default 30 days, clamped to [1,90]).
+        // Composes lesson_credit (populated by the daemon hook +
+        // route-side attribution on cache miss) and the cross-fleet
+        // lessons file (parsed via the existing getLessonsCached memo).
+        // Cache-Control: max-age=300 mirrors the route's 5-min TTL;
+        // the memo invalidates the moment a new heal lands OR the
+        // lessons file's total entry count changes (per the
+        // three-value tuple in lessonCreditInvalidationTuple).
+        if (path === "/api/fleet/lesson-credits") {
+          const windowDays = clampLessonCreditWindow(url.searchParams.get("window"));
+          const lessonsPath = defaultLessonsPath();
+          const parsed = getLessonsCached(lessonsPath);
+          const value = getLessonCreditCached(db, windowDays, parsed, new Date());
+          const body = JSON.stringify(value);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=300",
           });
           return res.end(body);
         }

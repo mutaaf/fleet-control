@@ -3316,15 +3316,108 @@ function wireLessonsFilters(container, opts) {
   apply();
 }
 
+// ---- Lesson credit ledger (ticket 0042) --------------------------------
+//
+// One summary line + per-row chip on the /lessons page that surfaces
+// which lessons earned heal-saves across the fleet in the last 30
+// days. Pure read-side composition over the new
+// /api/fleet/lesson-credits route. Per LESSONS §
+// "defence-in-depth secret redaction at the renderer boundary" every
+// operator-visible string passes through redactSecrets before any
+// HTML interpolation — the credit detail surfaces matched_substring
+// drawn from upstream heal stdout tails which can in theory carry a
+// leaked token, so the renderer-boundary backstop matters here.
+
+/** Render the summary line shown above the per-project lesson
+ *  sections. When totals.total_credits is zero the line is the
+ *  "0 credits" prompt — visible enough that the operator sees the
+ *  ledger is wired up but blank. */
+function renderLessonCreditSummary(rollup) {
+  const totals = (rollup && rollup.totals) || { total_credits: 0, total_projects: 0, top_earner: null };
+  const credits = Number(totals.total_credits || 0);
+  const projects = Number(totals.total_projects || 0);
+  const safeCredits = esc(redactSecrets(String(credits)));
+  const safeProjects = esc(redactSecrets(String(projects)));
+  if (credits === 0) {
+    return `<div class="lesson-credit-summary" data-testid="lesson-credit-summary">
+      <span class="dim">Lessons earned ${safeCredits} credits across ${safeProjects} projects in the last 30 days.</span>
+    </div>`;
+  }
+  const top = totals.top_earner;
+  const safeTopTitle = top ? esc(redactSecrets(String(top.lesson_title || ""))) : "";
+  const safeTopSaves = top ? esc(redactSecrets(String(top.saves || 0))) : "";
+  const tailHtml = top
+    ? ` &mdash; top earner: <b>${safeTopTitle}</b> (${safeTopSaves} saves)`
+    : "";
+  return `<div class="lesson-credit-summary" data-testid="lesson-credit-summary">
+    Lessons earned <b>${safeCredits}</b> credits across <b>${safeProjects}</b> projects in the last 30 days${tailHtml}
+  </div>`;
+}
+
+/** Render an inline credit chip for a single lesson row. Called from
+ *  decorateLessonRowsWithCredits() once the chips are attached to the
+ *  existing DOM after renderLessonsPage runs. Returns the chip's
+ *  HTML; the caller appends it to the lesson summary. */
+function renderLessonCreditChip(credit) {
+  const saves = Number(credit && credit.saves || 0);
+  const projects = Number(credit && credit.projects || 0);
+  const safeSaves = esc(redactSecrets(String(saves)));
+  const safeProjects = esc(redactSecrets(String(projects)));
+  // Operator-facing copy passes through redactSecrets so a future
+  // numeric formatter change can't smuggle a token shape into the DOM.
+  const label = redactSecrets(`saved ${saves} heal${saves === 1 ? "" : "s"}, ${projects} project${projects === 1 ? "" : "s"}`);
+  const safeLabel = esc(label);
+  return `<span class="lesson-credit-chip" data-testid="lesson-credit-chip"
+    data-saves="${safeSaves}" data-projects="${safeProjects}">${safeLabel}</span>`;
+}
+
+/** Walk the freshly-rendered .lesson nodes and attach a chip to any
+ *  whose (lesson_slug, lesson_date) tuple shows up in the rollup with
+ *  saves > 0. Lessons with zero credits get no chip (absence is the
+ *  signal, per the ticket's user story). */
+function decorateLessonRowsWithCredits(container, rollup) {
+  if (!container || !rollup || !Array.isArray(rollup.by_lesson)) return;
+  // Index the rollup by (slug|date) for O(1) lookup. Title is NOT
+  // part of the key — two lessons can share a date+slug but the
+  // renderer cares only about the saves count.
+  const bySlugDate = new Map();
+  for (const row of rollup.by_lesson) {
+    if (!row || !row.lesson_slug || !row.lesson_date) continue;
+    const key = `${row.lesson_slug}|${row.lesson_date}`;
+    bySlugDate.set(key, row);
+  }
+  const projects = container.querySelectorAll(".lessons-project");
+  for (const section of projects) {
+    const slug = section.getAttribute("data-lessons-project") || "";
+    const entries = section.querySelectorAll(".lesson");
+    for (const entry of entries) {
+      const date = entry.getAttribute("data-lesson-date") || "";
+      if (!date) continue;
+      const credit = bySlugDate.get(`${slug}|${date}`);
+      if (!credit || !credit.saves) continue;
+      const sum = entry.querySelector("summary");
+      if (!sum) continue;
+      sum.insertAdjacentHTML("beforeend", " " + renderLessonCreditChip(credit));
+    }
+  }
+}
+
 async function lessons(params) {
   summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
   let data = null;
+  let credits = null;
   try {
     data = await get("/api/fleet/lessons");
   } catch (e) {
     app.innerHTML = `<div class="loading">couldn't load fleet lessons.<br><span class="dim">${esc(e.message)}</span></div>`;
     return;
   }
+  // Lesson credit ledger (ticket 0042) — best-effort fetch. A failure
+  // here MUST NOT block the lessons page rendering; absence of the
+  // summary line is the right degraded state.
+  try {
+    credits = await get("/api/fleet/lesson-credits");
+  } catch { credits = null; }
   const newThisWeek = (data && data.new_this_week) || 0;
   const total = (data && data.total) || 0;
   const projectCount = (data && data.projects && data.projects.length) || 0;
@@ -3341,6 +3434,7 @@ async function lessons(params) {
   const safeTotal = esc(redactSecrets(String(total)));
   const safeProjectCount = esc(redactSecrets(String(projectCount)));
   const safeNewThisWeek = esc(redactSecrets(String(newThisWeek)));
+  const creditSummaryHtml = credits ? renderLessonCreditSummary(credits) : "";
   app.innerHTML = `<div class="cross-lessons" data-testid="cross-lessons">
     <a class="back" href="#/">‹ all projects</a>
     <div class="lessons-head">
@@ -3352,12 +3446,16 @@ async function lessons(params) {
           new this week (${safeNewThisWeek})
         </label>
       </div>
+      ${creditSummaryHtml}
     </div>
     ${renderLessonsPage(data)}
   </div>`;
   foot.textContent = "";
   const container = app.querySelector('[data-testid="cross-lessons"]');
-  if (container) wireLessonsFilters(container, { initialFilterNew });
+  if (container) {
+    wireLessonsFilters(container, { initialFilterNew });
+    if (credits) decorateLessonRowsWithCredits(container, credits);
+  }
 }
 
 async function route() {
