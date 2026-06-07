@@ -1,7 +1,7 @@
 ---
 id: 0042
 title: Lesson credit ledger - attribute heal saves to the cross-fleet lesson that caught them
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-07
@@ -18,6 +18,8 @@ owner: gtm-innovation
   the same casing/target convention; project_slug is recovered by joining
   the `pr-<N>` target back to `pr.project_id → project.slug` so we keep one
   source of truth for the slug rather than duplicating it on the audit row.
+- 2026-06-07: Shipped via PR #102. Both gating checks (typecheck + validate)
+  green; 22 new tests in `tests/lesson-credit.test.ts` exercise every AC.
 
 ## User story
 
