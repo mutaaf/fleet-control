@@ -1,7 +1,7 @@
 ---
 id: 0043
 title: New-since-last-visit diff - mark every home-page item the operator has not yet seen
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-07
@@ -379,3 +379,21 @@ the schema wins": the producer is the contract.
   the within-day counterpart), 0030 (quiet hours
   styling), and 0011 (the mobile-portal CSS
   contract).
+
+## Implementation log
+
+- 2026-06-07 implementation-dev — picked up groomed
+  ticket; branch feat/0043-new-since-last-visit-diff
+  opened off main. Status flipped to in-progress.
+  Producer-vs-spec audit: open PRs use `state='open'`
+  lower-case (matches `src/ingest/prs.ts` line 164);
+  merged PRs use `'MERGED'` upper-case (matches every
+  other view in `views.ts`); `pr.fetched_at` is the
+  merged-at proxy. Anomalies surface via the inbox
+  pattern (created_at > last_seen AND dismissed_at IS
+  NULL); inbox items reuse the existing fleetInbox
+  rows (`payload.id` is the dedup key already).
+  Alerts use `alert.created_at` and `resolved_at IS
+  NULL` to surface only live alerts. No schema
+  migration — reuses `watermark(source, cursor,
+  updated_at)` exactly as 0038 did.
