@@ -3930,3 +3930,135 @@ export function markSectionSeen(
   ).run(source, JSON.stringify(capped), nowIso);
   return { upserted };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0042 — Lesson credit ledger rollup.
+//
+// Groups lesson_credit rows over the last N days into the documented
+// `{by_lesson, totals, generated_at}` shape. by_lesson is sorted by
+// saves DESC (tiebreak by last_seen DESC); top_earner is by_lesson[0]
+// when non-empty, null otherwise. Lessons with zero credits in the
+// window are omitted from by_lesson (the renderer treats absence as
+// the no-chip signal).
+//
+// Per LESSONS § "julianday() drifts ~10us per timestamp" any
+// timestamp comparison stays JS-side (compare ISO strings; the
+// rollup's cutoff is computed in JS and passed as a bind parameter).
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing here uses the double-cast pattern. Per
+// LESSONS § "groomer prose can disagree with the schema; the schema
+// wins": the column casing here mirrors the SCHEMA template in
+// src/db.ts exactly (lesson_slug, lesson_date, etc. — lowercase).
+// ────────────────────────────────────────────────────────────────────
+
+export interface LessonCreditByLesson {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  saves: number;
+  projects: number;
+  last_seen: string;
+}
+
+export interface LessonCreditTopEarner {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  saves: number;
+}
+
+export interface LessonCreditTotals {
+  total_credits: number;
+  total_projects: number;
+  top_earner: LessonCreditTopEarner | null;
+}
+
+export interface LessonCreditRollup {
+  by_lesson: LessonCreditByLesson[];
+  totals: LessonCreditTotals;
+  generated_at: string;
+}
+
+export interface LessonCreditRollupOptions {
+  /** Window in days for the rollup lookback. Defaults to 30. The
+   *  route handler clamps to [1, 90] before passing through. */
+  windowDays?: number;
+}
+
+interface LessonCreditByLessonRow {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  saves: number;
+  projects: number;
+  last_seen: string;
+}
+
+interface LessonCreditTotalsRow {
+  total_credits: number;
+  total_projects: number;
+}
+
+/** Compose the lesson-credit rollup for the SPA's `/lessons` page +
+ *  the `/api/fleet/lesson-credits` route. `now` is the wall-clock
+ *  anchor for the window cutoff — tests pin it; production passes
+ *  `new Date()`. */
+export function lessonCreditRollup(
+  db: DB,
+  now: Date,
+  opts: LessonCreditRollupOptions = {},
+): LessonCreditRollup {
+  const windowDays = Math.max(1, Math.floor(opts.windowDays ?? 30));
+  const cutoffIso = new Date(now.getTime() - windowDays * 24 * 3600_000).toISOString();
+  const nowIso = now.toISOString();
+  // by_lesson: group by (lesson_slug, lesson_date, lesson_title) so
+  // two distinct lessons that share a slug/date but differ in title
+  // stay distinct rows. saves counts distinct heal_audit_id (the PK
+  // already guarantees one row per heal per lesson, so a COUNT(*) is
+  // equivalent; we use COUNT(DISTINCT heal_audit_id) for clarity).
+  // projects counts distinct project_slug; last_seen is MAX(created_at).
+  const byLessonRows = db.prepare(
+    "SELECT lesson_slug, lesson_date, lesson_title, "
+    + "  COUNT(DISTINCT heal_audit_id) AS saves, "
+    + "  COUNT(DISTINCT project_slug) AS projects, "
+    + "  MAX(created_at) AS last_seen "
+    + "FROM lesson_credit "
+    + "WHERE created_at >= ? "
+    + "GROUP BY lesson_slug, lesson_date, lesson_title "
+    + "ORDER BY saves DESC, last_seen DESC",
+  ).all(cutoffIso) as unknown as LessonCreditByLessonRow[];
+
+  const byLesson: LessonCreditByLesson[] = byLessonRows.map((r) => ({
+    lesson_slug: String(r.lesson_slug),
+    lesson_date: String(r.lesson_date),
+    lesson_title: String(r.lesson_title),
+    saves: Number(r.saves) || 0,
+    projects: Number(r.projects) || 0,
+    last_seen: String(r.last_seen ?? ""),
+  }));
+
+  const totalsRow = db.prepare(
+    "SELECT COUNT(*) AS total_credits, "
+    + "  COUNT(DISTINCT project_slug) AS total_projects "
+    + "FROM lesson_credit WHERE created_at >= ?",
+  ).get(cutoffIso) as unknown as LessonCreditTotalsRow | undefined;
+
+  const totalCredits = Number(totalsRow?.total_credits ?? 0);
+  const totalProjects = Number(totalsRow?.total_projects ?? 0);
+  const topEarner: LessonCreditTopEarner | null = byLesson.length === 0 ? null : {
+    lesson_slug: byLesson[0].lesson_slug,
+    lesson_date: byLesson[0].lesson_date,
+    lesson_title: byLesson[0].lesson_title,
+    saves: byLesson[0].saves,
+  };
+
+  return {
+    by_lesson: byLesson,
+    totals: {
+      total_credits: totalCredits,
+      total_projects: totalProjects,
+      top_earner: topEarner,
+    },
+    generated_at: nowIso,
+  };
+}

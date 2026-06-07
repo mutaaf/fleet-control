@@ -1229,6 +1229,35 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .lessons-controls input[type="search"] { max-width: 480px; }
 }
 
+/* ── Lesson credit ledger (ticket 0042) ─────────────────────────────
+ * Mobile-first: the summary line wraps to two lines if needed and
+ * the per-row chip stacks under the lesson title. At >=600px the
+ * chip floats right of the title on the same row. Horizontal scroll
+ * is forbidden at 375px per the 0011 mobile-portal CSS contract. */
+.lesson-credit-summary { font-family: var(--mono); font-size: 12.5px;
+  color: var(--ink); margin: 8px 0 4px; line-height: 1.45;
+  padding: 6px 8px; border-left: 2px solid var(--accent);
+  background: rgba(200, 132, 30, 0.06); word-break: break-word; }
+.lesson-credit-summary b { color: var(--ink); font-weight: 600; }
+.lesson-credit-summary .dim { color: var(--dim); }
+.lesson-credit-chip { display: inline-block; font-family: var(--mono);
+  font-size: 11.5px; color: var(--accent); padding: 1px 6px;
+  border: 1px solid rgba(200, 132, 30, 0.45); border-radius: 10px;
+  margin-left: 8px; white-space: nowrap; }
+@media (max-width: 599px) {
+  /* Chip wraps under the lesson title rather than into the body. The
+   * summary already lays out as flex with flex-wrap; the chip gets a
+   * margin-top on phones so it sits below the title visually. */
+  .lesson-credit-chip { margin-top: 4px; margin-left: 0; }
+}
+@media (min-width: 600px) {
+  /* Push the chip to the right edge of the lesson summary at desktop
+   * widths. The .lesson > summary rule above is flex with
+   * flex-wrap:wrap; margin-left:auto pushes the chip to the right. */
+  .lesson-credit-chip { margin-left: auto; }
+  .lesson-credit-summary { font-size: 13px; }
+}
+
 /* ── Fleet changelog page (ticket 0039) ─────────────────────────────
  * Mobile-first: filters stack (search on its own line, project + date
  * dropdowns on the next), rows collapse to two lines (title on top,
