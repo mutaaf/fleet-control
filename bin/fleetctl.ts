@@ -14,6 +14,10 @@ import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
 import { resolveWindow, isQuietNow, nextWindowEnd } from "../src/quiet_hours.ts";
 import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
 import { listSnapshots } from "../src/snapshot.ts";
+import {
+  computeReceipts, persistReceipts, unpublishReceipts,
+  listPublishedReceipts, isValidMonthIso,
+} from "../src/receipts.ts";
 import { doAction } from "../src/control.ts";
 import { defaultDeps, runDoctor, renderHuman, renderJson, exitCodeFor } from "../src/doctor.ts";
 import { loadDemoFixture, DEMO_BANNER, DEMO_DEFAULT_PORT } from "../src/demo/fixture.ts";
@@ -326,6 +330,83 @@ async function snapshot() {
   process.exitCode = 1;
 }
 
+/** `fleetctl receipts <publish <slug> <month> | unpublish <slug> <month> |
+ *   list>` — ticket 0041. Publishes / unpublishes / lists the public
+ *  monthly-receipts artifacts surfaced at /receipts/<slug>/<YYYY-MM>.
+ *  Per LESSONS § "CLI subprocess tests need a FLEET_DB_PATH env seam":
+ *  the helper uses the same DB the rest of the CLI does (driven by
+ *  FLEET_DB_PATH in tests). The publish path is the OFFLINE direct-
+ *  write shape — no HTTP round-trip required — so this CLI works
+ *  whether or not `fleetctl serve` is running.
+ *
+ *  Why the CLI doesn't auto-detect a running server: the production
+ *  use case is "operator runs fleetctl on the laptop where serve is
+ *  also running" — both processes open the same SQLite file via WAL
+ *  (single-writer with non-blocking readers, per src/db.ts), so a
+ *  direct write here is correctly serialised against the server's
+ *  reads. The shape stays simple and the same `FLEET_DB_PATH` seam
+ *  drives both the test path and the production path. */
+function receipts() {
+  const sub = arg;
+  if (sub === "publish") {
+    const slug = argv[2];
+    const month = argv[3];
+    if (!slug || !month) {
+      console.log("usage: fleetctl receipts publish <slug> <YYYY-MM>");
+      process.exitCode = 1; return;
+    }
+    if (!isValidMonthIso(month)) {
+      console.error(`${c.red}error:${c.rst} bad month_iso (expected YYYY-MM); got ${month}`);
+      process.exitCode = 1; return;
+    }
+    if (slug !== "fleet") {
+      const exists = db.prepare("SELECT 1 FROM project WHERE slug = ?").get(slug);
+      if (!exists) {
+        console.error(`${c.red}error:${c.rst} unknown project slug '${slug}'`);
+        process.exitCode = 1; return;
+      }
+    }
+    const baseUrl = process.env.FLEET_BASE_URL || "http://127.0.0.1:7070";
+    const payload = computeReceipts(db, slug, month, new Date());
+    persistReceipts(db, payload);
+    const url = `${baseUrl.replace(/\/+$/, "")}/receipts/${slug}/${month}`;
+    console.log(`${c.grn}published${c.rst} ${c.bold}${slug}${c.rst} ${c.dim}(${month})${c.rst}`);
+    console.log(`  URL: ${url}`);
+    console.log(`  ${c.dim}${payload.merged_prs} PR${payload.merged_prs === 1 ? "" : "s"} merged · ${usd(payload.total_spend_usd)} spent · ${usd(payload.cost_per_pr_usd)}/PR · ${payload.red_days} red day${payload.red_days === 1 ? "" : "s"}${c.rst}`);
+    return;
+  }
+  if (sub === "unpublish") {
+    const slug = argv[2];
+    const month = argv[3];
+    if (!slug || !month) {
+      console.log("usage: fleetctl receipts unpublish <slug> <YYYY-MM>");
+      process.exitCode = 1; return;
+    }
+    const n = unpublishReceipts(db, slug, month);
+    if (n > 0) console.log(`${c.grn}unpublished${c.rst} ${slug} (${month})`);
+    else console.log(`${c.dim}no published row for ${slug} (${month}); nothing to do${c.rst}`);
+    return;
+  }
+  if (sub === "list" || sub === undefined) {
+    const rows = listPublishedReceipts(db);
+    if (!rows.length) {
+      console.log(`${c.dim}no published receipts. publish one with: fleetctl receipts publish <slug> <YYYY-MM>${c.rst}`);
+      return;
+    }
+    const baseUrl = process.env.FLEET_BASE_URL || "http://127.0.0.1:7070";
+    console.log(`\n${c.bold}SLUG            MONTH     PUBLISHED         URL${c.rst}`);
+    console.log(c.dim + "─".repeat(72) + c.rst);
+    for (const r of rows) {
+      const url = `${baseUrl.replace(/\/+$/, "")}/receipts/${r.project_slug}/${r.month_iso}`;
+      console.log(`${r.project_slug.padEnd(15)} ${r.month_iso}  ${ago(r.published_at).padEnd(14)}    ${url}`);
+    }
+    console.log();
+    return;
+  }
+  console.log("usage: fleetctl receipts <publish <slug> <YYYY-MM> | unpublish <slug> <YYYY-MM> | list>");
+  process.exitCode = 1;
+}
+
 switch (cmd) {
   case "backfill": backfill(); break;
   case "status": case undefined: status(); break;
@@ -333,6 +414,7 @@ switch (cmd) {
   case "show": show(arg ?? ""); break;
   case "pricing": pricing(); break;
   case "snapshot": await snapshot(); break;
+  case "receipts": receipts(); break;
   case "serve": {
     db.close(); // server opens its own handle
     const serveCfg = loadConfig();
@@ -614,6 +696,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|doctor [--json]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|doctor [--json]]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run" && cmd !== "demo") db.close();

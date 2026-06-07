@@ -22,7 +22,7 @@ proposes new ones, `review` grades them.
 | 0044 | Spend-efficiency ranking - rank projects by $/merged-PR and diagnose the laggard | P2 | groomed | observability |
 | 0043 | New-since-last-visit diff - mark every home-page item the operator has not yet seen | P1 | groomed | portal |
 | 0042 | Lesson credit ledger - attribute heal saves to the cross-fleet lesson that caught them | P2 | groomed | observability |
-| 0041 | Fleet receipts - public monthly artifact at a stable URL the prospective operator sees first | P1 | groomed | portal |
+| 0041 | Fleet receipts - public monthly artifact at a stable URL the prospective operator sees first | P1 | in-progress | portal |
 | 0040 | Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next | P1 | shipped | observability |
 | 0039 | Fleet changelog - one chronological page of every merged PR across every project, ticket-linked | P1 | shipped | portal |
 | 0038 | Monday morning catch-up - bridges the weekend gap between Friday wrap and Yesterday glance | P1 | shipped | portal |

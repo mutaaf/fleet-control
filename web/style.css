@@ -1227,3 +1227,64 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .changelog-row .changelog-size { grid-area: size; margin-right: 0; }
   .changelog-row .changelog-ticket { grid-area: ticket; margin-right: 0; }
 }
+
+/* Ticket 0041: public monthly receipts layout (/receipts/<slug>/<month>).
+ *
+ * Mobile-first single column at 375px: the four stats stack vertically,
+ * each with a big headline number. Headline is 36px at 375px (AC10
+ * floor). At >=600px the four stats become a 2x2 grid. The receipts
+ * page uses the same --bg/--ink palette as the rest of the portal so
+ * a screenshot reads as part of the fleet-control surface. */
+.receipts-page { background: var(--bg); color: var(--ink); }
+.receipts-main { max-width: 640px; margin: 0 auto; padding: 36px 20px; }
+.receipts-eyebrow { font-family: var(--mono); font-size: 13px; letter-spacing: .08em;
+  color: var(--dim); text-transform: uppercase; }
+.receipts-slug-dim { color: var(--faint); font-weight: 400; }
+.receipts-month { font-family: var(--sans); font-size: 22px; font-weight: 600;
+  margin: 4px 0 26px; color: var(--ink); }
+.receipts-stats { display: grid; grid-template-columns: 1fr; gap: 18px;
+  margin: 18px 0 28px; }
+.receipts-stat { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 18px 20px; }
+.receipts-headline { font-family: var(--mono); font-weight: 700;
+  font-variant-numeric: tabular-nums; font-size: 44px; color: var(--accent);
+  line-height: 1.05; }
+.receipts-stat-value { font-family: var(--mono); font-weight: 700;
+  font-variant-numeric: tabular-nums; font-size: 36px; color: var(--ink);
+  line-height: 1.1; }
+.receipts-stat-label { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); margin-top: 6px; text-transform: lowercase; }
+.receipts-mover { font-family: var(--mono); font-size: 13px; color: var(--good);
+  margin: 0 0 22px; }
+.receipts-foot { font-family: var(--mono); font-size: 11px; color: var(--faint);
+  border-top: 1px solid var(--line); padding-top: 16px; margin-top: 28px; }
+.receipts-foot a { color: var(--accent); text-decoration: underline; }
+.receipts-empty .receipts-empty-title { font-family: var(--sans); font-size: 20px;
+  font-weight: 600; }
+.receipts-empty .receipts-empty-body { color: var(--dim); margin: 8px 0 18px; }
+
+/* >=600px: four stats lay out as a 2x2 grid; headline ticks up to 44px. */
+@media (min-width: 600px) {
+  .receipts-stats { grid-template-columns: repeat(2, 1fr); gap: 18px; }
+  .receipts-headline { font-size: 56px; }
+}
+
+/* Ticket 0041: portal-side publish button + preview modal. The button
+ * sits inside the existing digest banner; the modal fills the viewport
+ * on phones (mobile-first per the 0011 portal contract). */
+.digest-receipts-row { margin-top: 8px; }
+.receipts-publish-btn { font-family: var(--mono); }
+.receipts-modal { position: fixed; inset: 0; z-index: 100;
+  background: rgba(14,15,13,.86); display: flex; align-items: center;
+  justify-content: center; padding: 16px; }
+.receipts-modal .modal-body { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 20px 22px; max-width: 560px; width: 100%;
+  max-height: 90vh; overflow: auto; }
+.receipts-modal h2 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
+.receipts-preview { width: 100%; min-height: 360px; border: 1px solid var(--line);
+  border-radius: var(--r); background: var(--bg); margin: 12px 0 16px; }
+.receipts-modal .actions { display: flex; gap: 10px; }
+@media (max-width: 599px) {
+  .receipts-modal .modal-body { width: 100%; height: 100%; max-height: 100vh;
+    border-radius: 0; }
+}

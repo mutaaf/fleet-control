@@ -30,6 +30,10 @@ import {
 } from "./lessons.ts";
 import { statSync } from "node:fs";
 import { serveShare } from "./snapshot.ts";
+import {
+  serveReceipts, computeReceipts, persistReceipts, unpublishReceipts,
+  isValidMonthIso, type ReceiptsPayload, type ServeReceiptsResult,
+} from "./receipts.ts";
 import { renderBadge, projectBadge, parseMetric } from "./badge.ts";
 import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
@@ -310,6 +314,64 @@ function getFridayWrapCached(db: DB, cfg: FleetConfig, now: Date, tz: string): F
   const value = { ...wrap, visible: isFriday(now, tz) };
   fridayWrapCache.set(key, { value, expires_at: Date.now() + FRIDAY_WRAP_TTL_MS });
   return value;
+}
+
+// Ticket 0041: receipts page memo cache.
+//
+// 10-minute TTL keyed by `(slug, month_iso)` per the AC. The cache
+// entry stores the full ServeReceiptsResult so both 200-with-HTML
+// hits AND 404-no-row hits are memoised; the unpublish handler
+// invalidates the key explicitly (per AC7) so an operator who
+// unpublishes mid-window sees the URL 404 on the next fetch without
+// waiting for natural TTL expiry. Per LESSONS § "in-process dedup
+// sets need an explicit reset hook for tests" we expose
+// `_resetReceiptsCacheForTests()`. Per LESSONS § "expose a build
+// counter for cache-hit tests, not a fetcher swap" we expose a
+// read-only `_getReceiptsCacheBuildsForTests()` that ticks ONLY on a
+// successful (200) rebuild — a 404-hit doesn't increment the
+// counter because the cache invalidation path itself is a tested
+// observable, not the rebuild count.
+interface ReceiptsCacheEntry {
+  result: ServeReceiptsResult;
+  expires_at: number;
+}
+const RECEIPTS_TTL_MS = 600_000; // 10 minutes per the AC
+const receiptsCache = new Map<string, ReceiptsCacheEntry>();
+let receiptsBuildCounter = 0;
+
+export function _resetReceiptsCacheForTests(): void {
+  receiptsCache.clear();
+  receiptsBuildCounter = 0;
+}
+
+export function _getReceiptsCacheBuildsForTests(): number {
+  return receiptsBuildCounter;
+}
+
+function receiptsCacheKey(slug: string, monthIso: string): string {
+  return `${slug}|${monthIso}`;
+}
+
+/** Look up a receipts page via the memo cache; rebuild on miss. The
+ *  result is the full ServeReceiptsResult including the 404 path,
+ *  but only a successful rebuild (status===200) ticks the build
+ *  counter — the counter answers the question "did this re-render?"
+ *  not "did this re-query?". */
+function getReceiptsCached(db: DB, slug: string, monthIso: string): ServeReceiptsResult {
+  const key = receiptsCacheKey(slug, monthIso);
+  const hit = receiptsCache.get(key);
+  if (hit && hit.expires_at > Date.now()) return hit.result;
+  const result = serveReceipts(db, slug, monthIso);
+  if (result.status === 200) receiptsBuildCounter += 1;
+  receiptsCache.set(key, { result, expires_at: Date.now() + RECEIPTS_TTL_MS });
+  return result;
+}
+
+/** Drop a receipts cache entry. Called by the unpublish handler so a
+ *  subsequent GET returns 404 immediately instead of waiting for the
+ *  10-minute TTL to elapse. */
+function invalidateReceiptsCache(slug: string, monthIso: string): void {
+  receiptsCache.delete(receiptsCacheKey(slug, monthIso));
 }
 
 // Ticket 0040: "Riskiest open PR" memo cache.
@@ -728,6 +790,59 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         return readBody(req).then((body) => {
           const r = dismissInboxItem(db, body as DismissRequest);
           return json(res, r, r.ok ? 200 : 400);
+        });
+      }
+      // Ticket 0041: receipts publish / unpublish.
+      // POST /api/receipts/publish  body {project_slug, month_iso}
+      // POST /api/receipts/unpublish body {project_slug, month_iso}
+      // Both require `admin` scope (publishing a stable public URL is
+      // an admin-level privacy decision; unpublishing kills it). The
+      // routes live OUTSIDE the /api/control/<verb> dispatcher because
+      // they don't follow the shell-out-via-doAction shape — they're
+      // pure SQL persistence + cache invalidation.
+      if (path === "/api/receipts/publish" && req.method === "POST") {
+        const pauth = requireAuth(db, req, "admin", url);
+        if (!pauth.ok) return json(res, { ok: false, message: pauth.message }, pauth.status);
+        return readBody(req).then((body) => {
+          const slug = String(body?.project_slug ?? "");
+          const monthIso = String(body?.month_iso ?? "");
+          if (!isValidMonthIso(monthIso)) {
+            return json(res, { ok: false, message: "bad month_iso (expected YYYY-MM)" }, 400);
+          }
+          // Validate the slug against the project table OR the literal
+          // "fleet" form (the cross-project rollup).
+          if (slug !== "fleet") {
+            const exists = db.prepare("SELECT 1 FROM project WHERE slug = ?").get(slug);
+            if (!exists) return json(res, { ok: false, message: "unknown project slug" }, 400);
+          }
+          const payload: ReceiptsPayload = computeReceipts(db, slug, monthIso, new Date());
+          persistReceipts(db, payload);
+          // Bust the receipts cache so the next GET re-reads the fresh
+          // frozen payload.
+          invalidateReceiptsCache(slug, monthIso);
+          // Build the public URL from the incoming Host header so the
+          // operator's network can resolve it (matches the snapshot
+          // share_url derivation pattern).
+          const host = String(req.headers["host"] ?? "127.0.0.1:7070");
+          const published_url = `http://${host}/receipts/${slug}/${monthIso}`;
+          return json(res, { ok: true, published_url, payload }, 200);
+        });
+      }
+      if (path === "/api/receipts/unpublish" && req.method === "POST") {
+        const uauth = requireAuth(db, req, "admin", url);
+        if (!uauth.ok) return json(res, { ok: false, message: uauth.message }, uauth.status);
+        return readBody(req).then((body) => {
+          const slug = String(body?.project_slug ?? "");
+          const monthIso = String(body?.month_iso ?? "");
+          if (!isValidMonthIso(monthIso)) {
+            return json(res, { ok: false, message: "bad month_iso (expected YYYY-MM)" }, 400);
+          }
+          unpublishReceipts(db, slug, monthIso);
+          // Per AC7 unpublish invalidates the cache key so a fetch
+          // inside the 10-minute TTL window 404s immediately instead
+          // of returning the now-stale page.
+          invalidateReceiptsCache(slug, monthIso);
+          return json(res, { ok: true }, 200);
         });
       }
       // Live SSE tool-call stream (ticket 0002). Plain text/event-stream; tails
@@ -1265,6 +1380,20 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       const shm = path.match(/^\/share\/([0-9a-fA-F]+)$/);
       if (shm && req.method === "GET") {
         const result = serveShare(db, shm[1]);
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0041: public monthly fleet receipts.
+      // GET /receipts/<slug>/<YYYY-MM> renders a self-contained
+      // single-column HTML page from the frozen `receipts_published`
+      // payload. NO auth middleware — the URL is intentionally
+      // public; missing rows yield 404. The route is mounted here
+      // alongside /share/<token> so it shares the no-token bypass
+      // posture but never carries operator state. Per AC7 the
+      // response sets Cache-Control: public, max-age=600.
+      const rm = path.match(/^\/receipts\/([\w-]+)\/(\d{4}-\d{2})$/);
+      if (rm && req.method === "GET") {
+        const result = getReceiptsCached(db, rm[1], rm[2]);
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }
