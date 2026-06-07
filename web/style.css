@@ -813,6 +813,73 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   }
 }
 
+/* Ticket 0043: New-since-last-visit banner + pip. Renders at the
+ * absolute top of the home page when the operator has unseen items
+ * since their last visit. Reuses the existing palette tokens — no
+ * new variables. The pip is a tiny coloured dot that fades out
+ * (via the .new-pip-seen modifier) once the IntersectionObserver
+ * has confirmed the item entered the viewport for the dwell
+ * threshold. The .quiet-hours-mode variant mutes the banner to
+ * neutral colours so the pull surface still renders during the
+ * 0030 sleep window without competing for attention. */
+.new-since-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink);
+}
+.new-since-banner .new-since-label { color: var(--dim); }
+.new-since-banner .new-since-label b { color: var(--ink); font-weight: 600; }
+.new-since-banner .new-since-toggle {
+  white-space: nowrap;
+}
+.new-since-banner.quiet-hours-mode {
+  border-left-color: var(--faint);
+  color: var(--dim);
+  background: var(--panel2);
+}
+
+.new-pip {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 6px;
+  vertical-align: middle;
+  transition: opacity .6s ease;
+}
+.new-pip.new-pip-seen {
+  opacity: 0;
+}
+.new-since-banner.quiet-hours-mode + * .new-pip,
+.new-since-banner.quiet-hours-mode ~ * .new-pip {
+  background: transparent;
+  border: 1px solid var(--faint);
+}
+
+@media (max-width: 480px) {
+  .new-since-banner {
+    padding: 8px 12px;
+    font-size: 12.5px;
+  }
+  .new-since-banner .new-since-label b { font-size: 13px; }
+  .new-pip {
+    width: 6px;
+    height: 6px;
+    margin-left: 4px;
+  }
+}
+
 /* Ticket 0040: Riskiest open PR badge. One inline line above the
  * project grid. Two-line layout on phones (label on top, "tend it
  * now" link below); collapses to a single row with the link right-
