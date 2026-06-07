@@ -1,12 +1,23 @@
 ---
 id: 0042
 title: Lesson credit ledger - attribute heal saves to the cross-fleet lesson that caught them
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-07
 owner: gtm-innovation
 ---
+
+## Implementation log
+
+- 2026-06-07: Branch `feat/0042-lesson-credit-ledger` opened. PRODUCER-VS-SPEC
+  reconciliation: grepped `src/control.ts` + `src/views.ts` + `src/server.ts`
+  — production heal rows are written with `action = 'heal'` (lowercase) and
+  `target = 'pr-<number>'`, confirmed against the `riskiestOpenPr` helper and
+  the test seeder in `tests/riskiest-pr.test.ts`. The new attributor reuses
+  the same casing/target convention; project_slug is recovered by joining
+  the `pr-<N>` target back to `pr.project_id → project.slug` so we keep one
+  source of truth for the slug rather than duplicating it on the audit row.
 
 ## User story
 
