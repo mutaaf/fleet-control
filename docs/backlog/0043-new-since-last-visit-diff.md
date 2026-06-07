@@ -1,7 +1,7 @@
 ---
 id: 0043
 title: New-since-last-visit diff - mark every home-page item the operator has not yet seen
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-07
