@@ -1,12 +1,22 @@
 ---
 id: 0041
 title: Fleet receipts - public monthly artifact at a stable URL the prospective operator sees first
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-07
 owner: gtm-innovation
 ---
+
+## Implementation log
+
+- 2026-06-07 ship — picked up; branched `feat/0041-fleet-receipts`. Producer
+  verification: `src/ingest/prs.ts:164` writes `pr.state='open'` lowercase
+  for open PRs; the existing views (`src/views.ts:706`, `:1925`, `:2213`,
+  `:3466`) use `pr.state='MERGED'` upper-case for merged PRs; `ciState()`
+  returns `'red'`/`'pending'`/`'green'`/`'none'` (lowercase). receipts
+  implementation mirrors these casings exactly per LESSONS 2026-06-05
+  "groomer prose can disagree with the schema; the schema wins".
 
 ## User story
 
