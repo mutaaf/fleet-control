@@ -1417,6 +1417,74 @@ document.addEventListener("click", (e) => {
   dismissInbox(b.dataset.kind, b.dataset.slug, b.dataset.payloadId);
 });
 
+// Ticket 0041: receipts publish / unpublish click handlers.
+document.addEventListener("click", async (e) => {
+  // 1. Publish button — open the preview modal.
+  const open = e.target.closest("[data-receipts-publish]");
+  if (open) {
+    e.preventDefault();
+    e.stopPropagation();
+    openReceiptsModal(open.dataset.slug, open.dataset.month);
+    return;
+  }
+  // 2. Confirm button inside the modal — POST /api/receipts/publish.
+  const confirm = e.target.closest("[data-receipts-confirm]");
+  if (confirm) {
+    e.preventDefault();
+    e.stopPropagation();
+    const slug = confirm.dataset.slug;
+    const month = confirm.dataset.month;
+    try {
+      const r = await fetch("/api/receipts/publish", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project_slug: slug, month_iso: month }),
+      });
+      const j = await r.json();
+      if (r.ok) {
+        const url = redactSecrets(String(j.published_url || ""));
+        toast("published — " + url, true);
+        const modal = document.querySelector('[data-testid="receipts-modal"]');
+        if (modal) modal.remove();
+      } else {
+        toast(redactSecrets(String(j.message || "couldn't publish")), false);
+      }
+    } catch {
+      toast("couldn't reach the server", false);
+    }
+    return;
+  }
+  // 3. Cancel button inside the modal — close.
+  const cancel = e.target.closest("[data-receipts-cancel]");
+  if (cancel) {
+    e.preventDefault();
+    e.stopPropagation();
+    const modal = document.querySelector('[data-testid="receipts-modal"]');
+    if (modal) modal.remove();
+    return;
+  }
+  // 4. Unpublish button — POST /api/receipts/unpublish.
+  const un = e.target.closest("[data-receipts-unpublish]");
+  if (un) {
+    e.preventDefault();
+    e.stopPropagation();
+    const slug = un.dataset.slug;
+    const month = un.dataset.month;
+    try {
+      const r = await fetch("/api/receipts/unpublish", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project_slug: slug, month_iso: month }),
+      });
+      const j = await r.json();
+      if (r.ok) toast("unpublished", true);
+      else toast(redactSecrets(String(j.message || "couldn't unpublish")), false);
+    } catch {
+      toast("couldn't reach the server", false);
+    }
+  }
+});
+
 /** Render the "Last week" banner at the top of the home view from a
  *  /api/digest/week payload. Returns an HTML string. Tap-to-expand is
  *  handled by a document-level listener registered once at bottom of file. */
@@ -1444,17 +1512,77 @@ function digestBanner(d) {
       + `</li>`;
   }).join("");
   const narrative = (d.narrative || []).map((b) => `<li>${esc(b)}</li>`).join("");
+  // Ticket 0041: the prior calendar month is the natural anchor for
+  // "publish receipts" — the operator's most-likely thing to share is
+  // "look what we shipped last month". We derive it from the digest's
+  // period.start so a future digest-week refactor doesn't strand this
+  // surface. Format: YYYY-MM (a slice of the ISO start date string).
+  const monthIso = d.period && typeof d.period.start === "string"
+    ? d.period.start.slice(0, 7)
+    : new Date().toISOString().slice(0, 7);
+  const receiptsBtn = renderReceiptsButton("fleet", monthIso);
   return `<div class="digest-banner" data-digest-banner>
     <div class="digest-head" data-digest-toggle>
       <span class="digest-eyebrow">Last week</span>
       <span class="digest-stats">${headline}</span>
       <span class="digest-caret">▸</span>
     </div>
+    <div class="digest-receipts-row">${receiptsBtn}</div>
     <div class="digest-body hidden">
       ${rows ? `<ul class="digest-list">${rows}</ul>` : `<div class="faint">no projects ran last week</div>`}
       ${narrative ? `<div class="digest-eyebrow">Narrative</div><ul class="digest-narrative">${narrative}</ul>` : ""}
     </div>
   </div>`;
+}
+
+// Ticket 0041: receipts publish button + preview modal.
+//
+// Renders a one-tap "Publish receipts" button alongside the weekly
+// digest banner (the existing 0012 surface — the digest's monthly
+// roll is the natural anchor for "publish this month"). Tapping
+// surfaces a modal that previews the public URL via a sandboxed
+// iframe (sandbox="allow-same-origin" — NO scripts permitted), lists
+// the fields the public will see, and requires a confirm tap before
+// POSTing to /api/receipts/publish. After publish the button text
+// becomes "Unpublish" and the row shows the stable URL + a copy
+// button. Per LESSONS § "defence-in-depth secret redaction at the
+// renderer boundary" every operator-visible string passes through
+// redactSecrets before insertion.
+function renderReceiptsButton(slug, monthIso) {
+  // monthIso is the ISO month label the operator is publishing (e.g.
+  // "2026-05"). The button carries data-attrs so the click handler
+  // can wire up POST /api/receipts/publish without re-deriving them
+  // from the DOM tree.
+  const safeSlug = esc(redactSecrets(String(slug || "fleet")));
+  const safeMonth = esc(redactSecrets(String(monthIso || "")));
+  return `<button class="btn sm receipts-publish-btn" data-receipts-publish data-slug="${safeSlug}" data-month="${safeMonth}">Publish receipts</button>`;
+}
+
+/** Open the receipts preview modal. The iframe loads the public URL
+ *  with `sandbox="allow-same-origin"` so no scripts inside it run
+ *  (the public page is no-script HTML anyway; the sandbox is
+ *  defence-in-depth). The confirm button POSTs to /api/receipts/publish;
+ *  on success the modal swaps to a "Published" card with the URL and
+ *  a copy button. */
+async function openReceiptsModal(slug, monthIso) {
+  const safeSlug = redactSecrets(String(slug || ""));
+  const safeMonth = redactSecrets(String(monthIso || ""));
+  const previewUrl = `/receipts/${encodeURIComponent(safeSlug)}/${encodeURIComponent(safeMonth)}`;
+  const modal = document.createElement("div");
+  modal.className = "modal receipts-modal";
+  modal.setAttribute("data-testid", "receipts-modal");
+  modal.innerHTML =
+    `<div class="modal-body">`
+    + `<h2>Publish ${esc(safeSlug)} · ${esc(safeMonth)}</h2>`
+    + `<p class="dim">Public viewers will see: PRs merged, total spend, $/PR, days CI was red.`
+    + ` No PR titles, no project names of other projects, no admin token.</p>`
+    + `<iframe class="receipts-preview" src="${esc(previewUrl)}" sandbox="allow-same-origin" title="Receipts preview"></iframe>`
+    + `<div class="actions">`
+    +   `<button class="btn primary" data-receipts-confirm data-slug="${esc(safeSlug)}" data-month="${esc(safeMonth)}">Publish to public URL</button>`
+    +   `<button class="btn" data-receipts-cancel>Cancel</button>`
+    + `</div>`
+    + `</div>`;
+  document.body.appendChild(modal);
 }
 
 async function home() {
