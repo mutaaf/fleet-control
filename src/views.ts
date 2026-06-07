@@ -3571,3 +3571,18 @@ export function fleetChangelog(
     generated_at: nowIso,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0041 — Fleet receipts re-exports.
+//
+// The compute + reader helpers live in src/receipts.ts (one cohesive
+// module with the schema, the publish persistence, the HTML renderer,
+// and the cache seam). We re-export the reader + compute pair here so
+// callers in the server / SPA paths can keep their "views.ts is the
+// read API" mental model — same posture as `fleetChangelog` and
+// `costPerMergedPr` above.
+// ────────────────────────────────────────────────────────────────────
+export {
+  computeReceipts, receiptsFor,
+  type ReceiptsPayload as Receipts,
+} from "./receipts.ts";

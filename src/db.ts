@@ -252,6 +252,23 @@ CREATE TABLE IF NOT EXISTS pair_token (
   created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS pair_token_expires ON pair_token(expires_at);
+
+-- Public monthly fleet-receipts (ticket 0041). One row per
+-- (project_slug, month_iso) tuple the operator has explicitly
+-- published; missing rows yield 404 on GET /receipts/<slug>/<month>.
+-- payload_json carries a FROZEN snapshot of the four stats taken at
+-- publish time so the public URL stays stable even if the underlying
+-- runs are later deleted by the stale-checkout janitor (0006).
+-- project_slug may be the literal "fleet" for cross-project rollups.
+-- Per LESSONS no backticks inside template-literal SQL strings, all
+-- identifiers stay plain words inside this SCHEMA template.
+CREATE TABLE IF NOT EXISTS receipts_published (
+  project_slug  TEXT NOT NULL,
+  month_iso     TEXT NOT NULL,
+  published_at  TEXT NOT NULL,
+  payload_json  TEXT NOT NULL,
+  PRIMARY KEY (project_slug, month_iso)
+);
 `;
 
 export type DB = DatabaseSync;
