@@ -610,6 +610,211 @@ async function fetchMondayCatchUp() {
   try { return await get("/api/fleet/monday-catchup"); } catch { return null; }
 }
 
+// Ticket 0043: new-since-last-visit diff. The SPA fetches this with
+// `?since=` set to the PRE-upsert `previous_last_seen` from
+// /api/fleet so the diff is against the previous visit, not the
+// just-upserted one. Errors fall through silently — when the route
+// is unreachable the banner disappears and the rest of the home
+// page still loads. Cache-Control: no-store on the server side, so
+// the SW (0029) does not intercept this fetch.
+async function fetchNewSinceVisit(previousLastSeen) {
+  if (!previousLastSeen) return null;
+  try {
+    const q = "?since=" + encodeURIComponent(previousLastSeen);
+    return await get("/api/fleet/new-since-visit" + q);
+  } catch { return null; }
+}
+
+// Ticket 0043: globalThis-slot queue for the IntersectionObserver
+// batched POST to /api/fleet/section-seen. We pin the slot to a
+// stable name so the headless test harness (mobile-portal /
+// new-since-visit DOM-level tests) can reset it between cases.
+// Convention: `__fleet_<feature>_<verb>__` matches the
+// LESSONS 2026-06-05 globalThis cache-invalidation pattern. The
+// queue is keyed by `<section>` so the POST batches one section
+// at a time.
+if (typeof globalThis !== "undefined") {
+  if (!globalThis.__fleet_seen_queue__) {
+    globalThis.__fleet_seen_queue__ = {
+      pending: Object.create(null), // section → Set<id>
+      reset() { this.pending = Object.create(null); },
+      enqueue(section, id) {
+        if (!this.pending[section]) this.pending[section] = new Set();
+        this.pending[section].add(String(id));
+      },
+      drain() {
+        const out = this.pending;
+        this.pending = Object.create(null);
+        return out;
+      },
+    };
+  }
+}
+
+/** Format `iso` as a short HH:mm wall-clock for the banner copy. */
+function shortClockHM(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return hh + ":" + mm;
+  } catch { return ""; }
+}
+
+/** Ticket 0043: render the "N new since you last looked at HH:mm"
+ *  banner at the absolute top of the home page when `total_new > 0`.
+ *  Returns "" when the operator has nothing new to look at (the
+ *  first-visit case is `total_new: 0` because the watermark was
+ *  absent on the previous visit). The banner uses
+ *  `data-testid="new-since-banner"` and the "show only new" toggle
+ *  carries `data-act="toggle-new-only"` so the home() page can
+ *  intercept the click. Each pip element carries
+ *  `data-testid="new-pip-<section>-<id>"`. Per LESSONS §
+ *  "defence-in-depth secret redaction at the renderer boundary",
+ *  every operator-visible string passes through redactSecrets
+ *  before HTML interpolation. The `quiet-hours-mode` class is
+ *  applied when `opts.quietHoursActive` is true (the banner is a
+ *  pull surface so it still renders, just muted). */
+function renderNewSinceBanner(data, opts) {
+  if (!data || typeof data.total_new !== "number" || data.total_new <= 0) return "";
+  const total = Number(data.total_new || 0);
+  const lastSeen = data.last_seen || null;
+  const clock = shortClockHM(lastSeen);
+  const safeClock = esc(redactSecrets(clock));
+  const isQuiet = !!(opts && opts.quietHoursActive);
+  const bannerClass = "new-since-banner" + (isQuiet ? " quiet-hours-mode" : "");
+  // The toggle is a plain <button> so screen readers announce it as
+  // an action. data-act is the SPA's global click delegate hook.
+  return `<div class="${bannerClass}" data-testid="new-since-banner">
+    <span class="new-since-label"><b>${total}</b> new since you last looked${safeClock ? ` at ${safeClock}` : ""}</span>
+    <button class="btn sm new-since-toggle" data-act="toggle-new-only" type="button">show only new</button>
+  </div>`;
+}
+
+/** Ticket 0043: pip element rendered inline next to an item title.
+ *  `section` is one of the five new-since sections; `id` is the
+ *  payload id the SPA also uses in the IntersectionObserver POST.
+ *  Returns "" when the id is not in the `newIds` Set for that
+ *  section (the existing card render path stays byte-identical
+ *  when nothing is new). */
+function renderNewPip(section, id, newIds) {
+  if (!newIds || !newIds[section] || !newIds[section].has(String(id))) return "";
+  // data-testid follows the `new-pip-<section>-<id>` template — the
+  // value is interpolated so the rendered DOM attribute reads
+  // `new-pip-pr_merged-42` and the headless tests can grep the
+  // attribute literal directly.
+  return `<span class="new-pip" data-testid="new-pip-${esc(section)}-${esc(String(id))}" data-new-pip-section="${esc(section)}" data-new-pip-id="${esc(String(id))}"></span>`;
+}
+
+/** Ticket 0043: IntersectionObserver setup. We watch every pipped
+ *  element on the home page; when one is >=50% visible for 2000ms,
+ *  we batch its id into `__fleet_seen_queue__` and POST every 5s
+ *  OR on visibilitychange. The 2000ms threshold uses a per-element
+ *  timer keyed by section+id so a re-render does not double-fire.
+ *  Returns a teardown function the caller can call when the home
+ *  view is unmounted. */
+function setupNewSincePipObserver() {
+  if (typeof window === "undefined" || typeof IntersectionObserver === "undefined") return () => {};
+  const dwellMs = 2000;
+  const flushMs = 5000;
+  const timers = new Map(); // key → setTimeout id
+  const queue = globalThis.__fleet_seen_queue__;
+  if (!queue) return () => {};
+
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const el = entry.target;
+      const section = el.getAttribute("data-new-pip-section");
+      const id = el.getAttribute("data-new-pip-id");
+      if (!section || !id) continue;
+      const key = section + ":" + id;
+      if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
+        if (!timers.has(key)) {
+          const t = setTimeout(() => {
+            queue.enqueue(section, id);
+            timers.delete(key);
+            // Fade the pip out optimistically; the server POST
+            // confirms via the flush below.
+            try { el.classList.add("new-pip-seen"); } catch { /* */ }
+          }, dwellMs);
+          timers.set(key, t);
+        }
+      } else {
+        const t = timers.get(key);
+        if (t) { clearTimeout(t); timers.delete(key); }
+      }
+    }
+  }, { threshold: [0.5] });
+
+  // Walk every pip element currently in the DOM and observe it.
+  try {
+    const pips = document.querySelectorAll("[data-new-pip-section]");
+    pips.forEach((el) => observer.observe(el));
+  } catch { /* no DOM */ }
+
+  async function flushOnce() {
+    const drained = queue.drain();
+    const sections = Object.keys(drained);
+    for (const section of sections) {
+      const ids = Array.from(drained[section]);
+      if (ids.length === 0) continue;
+      try {
+        await fetch("/api/fleet/section-seen", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ section, item_ids: ids }),
+        });
+      } catch { /* keep the local fade; retry on next flush */ }
+    }
+  }
+
+  const flushTimer = setInterval(() => { flushOnce().catch(() => {}); }, flushMs);
+  const onVisibilityChange = () => {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      // navigator.sendBeacon when available — guarantees delivery
+      // even when the tab is being closed. We pack one beacon per
+      // section so the server route's body parser stays unchanged.
+      const drained = queue.drain();
+      for (const section of Object.keys(drained)) {
+        const ids = Array.from(drained[section]);
+        if (ids.length === 0) continue;
+        const payload = JSON.stringify({ section, item_ids: ids });
+        let sent = false;
+        try {
+          if (navigator && typeof navigator.sendBeacon === "function") {
+            const blob = new Blob([payload], { type: "application/json" });
+            sent = navigator.sendBeacon("/api/fleet/section-seen", blob);
+          }
+        } catch { /* fall through to fetch */ }
+        if (!sent) {
+          try {
+            fetch("/api/fleet/section-seen", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: payload,
+              keepalive: true,
+            }).catch(() => {});
+          } catch { /* swallow */ }
+        }
+      }
+    }
+  };
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onVisibilityChange);
+  }
+  return function teardown() {
+    clearInterval(flushTimer);
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
+    try { observer.disconnect(); } catch { /* */ }
+    for (const t of timers.values()) clearTimeout(t);
+    timers.clear();
+  };
+}
+
 // Ticket 0040: "Riskiest open PR" badge. One-line surface above the
 // project grid (and below any visible 0033/0037/0038 card) that names
 // THE single open agent PR the operator should tend next. Lazy-fetched
@@ -1600,12 +1805,24 @@ async function home() {
   const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData] = await Promise.all([
     get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(),
   ]);
+  // Ticket 0043: fetch the new-since-visit diff using the additive
+  // `previous_last_seen` field from /api/fleet (the PRE-upsert
+  // watermark). When that field is null the operator has never
+  // visited before — the banner stays hidden and we skip the fetch.
+  const previousLastSeen = data && data.previous_last_seen ? data.previous_last_seen : null;
+  const newSinceData = await fetchNewSinceVisit(previousLastSeen);
+  // Whether to apply the quiet-hours-mode class to the banner. The
+  // inbox payload already carries `quietHoursActive`; reuse it so
+  // the banner styling tracks the same quiet-hours decision the
+  // inbox uses.
+  const quietHoursActive = !!(inboxData && inboxData.quietHoursActive);
   const alerts = data.alerts || [];
   const inboxCount = (inboxData && inboxData.items && inboxData.items.length) || 0;
   summary.innerHTML = `${inboxCount ? `<a href="#inbox" class="inbox-badge" data-inbox-badge>Inbox ${inboxCount}</a> · ` : ""}${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort · <a href="#/leaderboard" class="navlink">Compare ›</a>`;
   // Cache pace info so the "Set fleet pace" modal can show the current mix.
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
   app.innerHTML =
+    renderNewSinceBanner(newSinceData, { quietHoursActive }) +
     digestBanner(digestData) +
     renderMondayCatchUp(mondayCatchUpData) +
     renderFridayWrap(fridayWrapData) +
@@ -1647,6 +1864,19 @@ async function home() {
   foot.textContent = "updated " + new Date(data.generatedAt).toLocaleTimeString() + (data.daemonOn ? " · always-on" : "") + (fcLine ? " · " + fcLine : "") + (pf ? " · " + pf : "");
   if (pricingMeta.stale) foot.title = "Pricing may be stale (synced >24h ago). Run: fleetctl pricing sync";
   else foot.removeAttribute("title");
+  // Ticket 0043: wire the IntersectionObserver after the home page
+  // has rendered so the pip elements are in the DOM and observable.
+  // The teardown returned by setupNewSincePipObserver is stashed
+  // on globalThis so the next route() call can tear down the
+  // previous observer before re-rendering.
+  try {
+    if (typeof globalThis !== "undefined") {
+      if (typeof globalThis.__fleet_seen_pip_teardown__ === "function") {
+        try { globalThis.__fleet_seen_pip_teardown__(); } catch { /* */ }
+      }
+      globalThis.__fleet_seen_pip_teardown__ = setupNewSincePipObserver();
+    }
+  } catch { /* SPA boot tolerates missing IntersectionObserver / no DOM */ }
 }
 function alertRow(a) {
   return `<div class="banner ${a.severity === "critical" ? "bad" : ""}" style="margin:0 0 8px">

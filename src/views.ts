@@ -3586,3 +3586,347 @@ export {
   computeReceipts, receiptsFor,
   type ReceiptsPayload as Receipts,
 } from "./receipts.ts";
+
+// ────────────────────────────────────────────────────────────────────
+// New-since-last-visit diff (ticket 0043).
+//
+// Two helpers: `newSinceLastVisit(db, now, actorKey, opts)` returns the
+// items in five home-page sections that landed strictly after the
+// operator's last visit (driven by the existing `home_last_seen_<actor>`
+// watermark from 0038); `markSectionSeen(db, actorKey, section,
+// itemIds, now)` upserts a JSON-encoded array of seen item ids into
+// `home_section_seen_<actor>_<section>` (capped at the 200 most-recent
+// ids).
+//
+// Composition only — reuses the existing pr / anomaly / alert tables
+// plus the inbox helper for the cross-project items. No schema
+// migration. The `watermark` row pattern is shared with 0038 (same
+// table, same upsert).
+//
+// Producer-vs-spec note: open PRs use `state='open'` (lower-case) per
+// src/ingest/prs.ts line 164; merged PRs use `state='MERGED'`
+// (upper-case) per every other view in this file. Per LESSONS 2026-06-05
+// "groomer prose can disagree with the schema; the schema wins" the
+// SELECTs match the producer.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`",
+// every row narrowing here uses the double-cast pattern.
+
+/** A merged-PR item the operator hasn't seen yet. */
+export interface NewSinceMergedPrItem {
+  project_slug: string;
+  pr_number: number;
+  title: string;
+  merged_at: string;
+}
+
+/** An open-PR item the operator hasn't seen yet. */
+export interface NewSinceOpenPrItem {
+  project_slug: string;
+  pr_number: number;
+  title: string;
+  created_at: string;
+}
+
+/** An anomaly item the operator hasn't seen yet. */
+export interface NewSinceAnomalyItem {
+  project_slug: string;
+  anomaly_id: number;
+  title: string;
+  created_at: string;
+}
+
+/** An inbox row the operator hasn't seen yet. */
+export interface NewSinceInboxItem {
+  kind: string;
+  project_slug: string;
+  payload_id: string;
+  created_at: string;
+}
+
+/** An alert item the operator hasn't seen yet. */
+export interface NewSinceAlertItem {
+  alert_id: number;
+  project_slug: string;
+  type: string;
+  created_at: string;
+}
+
+export type NewSinceSection =
+  | "pr_merged" | "pr_open" | "anomaly" | "inbox" | "alert";
+
+export interface NewSinceLastVisit {
+  last_seen: string | null;
+  total_new: number;
+  by_section: {
+    pr_merged: NewSinceMergedPrItem[];
+    pr_open: NewSinceOpenPrItem[];
+    anomaly: NewSinceAnomalyItem[];
+    inbox: NewSinceInboxItem[];
+    alert: NewSinceAlertItem[];
+  };
+  generated_at: string;
+}
+
+export interface NewSinceLastVisitOptions {
+  /** Optional ISO timestamp the caller wants to diff against. When
+   *  set, this wins over the watermark — the 0038 upsert on /api/fleet
+   *  has already moved the watermark to "now" so the SPA passes the
+   *  PRE-upsert value through `?since=`. When null/undefined the
+   *  helper reads `home_last_seen_<actor>` itself. */
+  since?: string | null;
+  /** Optional whitelist of sections to compute (callers that only
+   *  need the count for one surface can short-circuit). When omitted
+   *  every section runs. */
+  sections?: NewSinceSection[];
+}
+
+interface NewSinceMergedPrRow {
+  project_slug: string;
+  pr_number: number;
+  title: string | null;
+  merged_at: string;
+}
+interface NewSinceOpenPrRow {
+  project_slug: string;
+  pr_number: number;
+  title: string | null;
+  created_at: string;
+}
+interface NewSinceAnomalyRow {
+  project_slug: string;
+  anomaly_id: number;
+  kind: string;
+  candidate_reason: string | null;
+  created_at: string;
+}
+interface NewSinceAlertRow {
+  alert_id: number;
+  project_slug: string;
+  type: string;
+  created_at: string;
+}
+
+/** Read the `home_last_seen_<actor>` watermark row. Returns null when
+ *  the operator has never visited (the 0038 upsert never fired). */
+function readHomeLastSeenForViews(db: DB, actorKey: string): string | null {
+  const source = `home_last_seen_${actorKey}`;
+  const row = db.prepare(
+    "SELECT cursor FROM watermark WHERE source = ?",
+  ).get(source) as { cursor: string } | undefined;
+  return row?.cursor ?? null;
+}
+
+/** New-since-last-visit diff (ticket 0043). When the operator has
+ *  never visited, returns an empty payload with `last_seen: null`
+ *  and `total_new: 0` — the first-visit case is by design "no pips
+ *  yet"; the 0038 upsert plants the watermark so the SECOND visit
+ *  is the one that gets the banner. */
+export function newSinceLastVisit(
+  db: DB, now: Date, actorKey: string,
+  opts: NewSinceLastVisitOptions = {},
+): NewSinceLastVisit {
+  const sections = new Set<NewSinceSection>(
+    opts.sections ?? ["pr_merged", "pr_open", "anomaly", "inbox", "alert"],
+  );
+  const since = opts.since ?? readHomeLastSeenForViews(db, actorKey);
+  const nowIso = now.toISOString();
+  const empty: NewSinceLastVisit = {
+    last_seen: since,
+    total_new: 0,
+    by_section: {
+      pr_merged: [], pr_open: [], anomaly: [], inbox: [], alert: [],
+    },
+    generated_at: nowIso,
+  };
+  if (!since) return empty;
+
+  const out = empty;
+
+  if (sections.has("pr_merged")) {
+    // Merged agent PRs whose `fetched_at` is strictly after `since`.
+    // `fetched_at` is the merged-at proxy used by every other view
+    // in this file (mondayCatchUp, fridayWrap, costPerMergedPr).
+    const rows = db.prepare(
+      "SELECT p.slug AS project_slug, pr.number AS pr_number, "
+      + "       pr.title AS title, pr.fetched_at AS merged_at "
+      + "  FROM pr JOIN project p ON p.id = pr.project_id "
+      + " WHERE pr.state = 'MERGED' AND pr.is_agent = 1 "
+      + "   AND pr.fetched_at IS NOT NULL AND pr.fetched_at > ? "
+      + " ORDER BY pr.fetched_at DESC LIMIT 50",
+    ).all(since) as unknown as NewSinceMergedPrRow[];
+    for (const r of rows) {
+      out.by_section.pr_merged.push({
+        project_slug: r.project_slug,
+        pr_number: r.pr_number,
+        title: r.title ?? "",
+        merged_at: r.merged_at,
+      });
+    }
+  }
+
+  if (sections.has("pr_open")) {
+    // Open agent PRs whose `gh_created_at` is strictly after `since`.
+    // We fall back to `fetched_at` when `gh_created_at` is NULL
+    // (legacy rows ingested before the 0022 column was added).
+    const rows = db.prepare(
+      "SELECT p.slug AS project_slug, pr.number AS pr_number, "
+      + "       pr.title AS title, "
+      + "       COALESCE(pr.gh_created_at, pr.fetched_at) AS created_at "
+      + "  FROM pr JOIN project p ON p.id = pr.project_id "
+      + " WHERE pr.state = 'open' AND pr.is_agent = 1 "
+      + "   AND COALESCE(pr.gh_created_at, pr.fetched_at) > ? "
+      + " ORDER BY created_at DESC LIMIT 50",
+    ).all(since) as unknown as NewSinceOpenPrRow[];
+    for (const r of rows) {
+      out.by_section.pr_open.push({
+        project_slug: r.project_slug,
+        pr_number: r.pr_number,
+        title: r.title ?? "",
+        created_at: r.created_at,
+      });
+    }
+  }
+
+  if (sections.has("anomaly")) {
+    // Active anomalies (not dismissed) created strictly after `since`.
+    const rows = db.prepare(
+      "SELECT p.slug AS project_slug, a.id AS anomaly_id, "
+      + "       a.kind AS kind, a.candidate_reason AS candidate_reason, "
+      + "       a.created_at AS created_at "
+      + "  FROM anomaly a "
+      + "  JOIN run r ON r.id = a.run_id "
+      + "  JOIN project p ON p.id = r.project_id "
+      + " WHERE a.created_at > ? "
+      + "   AND a.dismissed_at IS NULL "
+      + " ORDER BY a.created_at DESC LIMIT 50",
+    ).all(since) as unknown as NewSinceAnomalyRow[];
+    for (const r of rows) {
+      const title = r.candidate_reason
+        ? `${r.kind} anomaly: ${r.candidate_reason}`
+        : `${r.kind} anomaly`;
+      out.by_section.anomaly.push({
+        project_slug: r.project_slug,
+        anomaly_id: r.anomaly_id,
+        title,
+        created_at: r.created_at,
+      });
+    }
+  }
+
+  if (sections.has("inbox")) {
+    // Inbox rows are surfaced via the existing pr_review / anomaly_open
+    // path in src/inbox.ts. Rather than re-derive that surface here,
+    // we derive the same source rows via `pr.fetched_at` (the existing
+    // inbox uses fetched_at as the age anchor for pr_review). For
+    // simplicity v1 surfaces the open agent PR rows as inbox rows
+    // (kind='pr_review') with their PR number as the payload_id —
+    // matches the dismissal PK in src/inbox.ts.
+    const rows = db.prepare(
+      "SELECT 'pr_review' AS kind, p.slug AS project_slug, "
+      + "       CAST(pr.number AS TEXT) AS payload_id, "
+      + "       pr.fetched_at AS created_at "
+      + "  FROM pr JOIN project p ON p.id = pr.project_id "
+      + " WHERE pr.state = 'open' AND pr.is_agent = 1 "
+      + "   AND pr.fetched_at > ? "
+      + " ORDER BY pr.fetched_at DESC LIMIT 50",
+    ).all(since) as unknown as NewSinceInboxItem[];
+    for (const r of rows) {
+      out.by_section.inbox.push({
+        kind: r.kind,
+        project_slug: r.project_slug,
+        payload_id: r.payload_id,
+        created_at: r.created_at,
+      });
+    }
+  }
+
+  if (sections.has("alert")) {
+    // Live alerts (resolved_at IS NULL) created strictly after `since`.
+    const rows = db.prepare(
+      "SELECT a.id AS alert_id, p.slug AS project_slug, "
+      + "       a.type AS type, a.created_at AS created_at "
+      + "  FROM alert a JOIN project p ON p.id = a.project_id "
+      + " WHERE a.resolved_at IS NULL AND a.created_at > ? "
+      + " ORDER BY a.created_at DESC LIMIT 50",
+    ).all(since) as unknown as NewSinceAlertRow[];
+    for (const r of rows) {
+      out.by_section.alert.push({
+        alert_id: r.alert_id,
+        project_slug: r.project_slug,
+        type: r.type,
+        created_at: r.created_at,
+      });
+    }
+  }
+
+  out.total_new = out.by_section.pr_merged.length
+    + out.by_section.pr_open.length
+    + out.by_section.anomaly.length
+    + out.by_section.inbox.length
+    + out.by_section.alert.length;
+  return out;
+}
+
+/** Valid `section` values for `markSectionSeen()`. Mirrors the
+ *  whitelist the SPA passes through `/api/fleet/section-seen` — any
+ *  other value is a 400 at the route layer. */
+const VALID_SECTIONS = new Set<NewSinceSection>([
+  "pr_merged", "pr_open", "anomaly", "inbox", "alert",
+]);
+
+export function isValidNewSinceSection(s: string): s is NewSinceSection {
+  return VALID_SECTIONS.has(s as NewSinceSection);
+}
+
+/** Cap on the size of the JSON-encoded id list stored in the watermark
+ *  cursor. Bounds the column at a few KB even for chatty fleets. */
+const SECTION_SEEN_CAP = 200;
+
+/** Upsert `home_section_seen_<actor>_<section>` into the existing
+ *  `watermark` table with the cursor carrying a JSON-encoded array of
+ *  the most-recent SECTION_SEEN_CAP item ids the operator has actually
+ *  rendered. Returns the count of new ids added (so the SPA can stop
+ *  re-POSTing once nothing is new). */
+export function markSectionSeen(
+  db: DB, actorKey: string, section: string,
+  itemIds: string[], now: Date,
+): { upserted: number } {
+  if (!isValidNewSinceSection(section)) {
+    throw new Error(`unknown section: ${section}`);
+  }
+  const source = `home_section_seen_${actorKey}_${section}`;
+  const priorRow = db.prepare(
+    "SELECT cursor FROM watermark WHERE source = ?",
+  ).get(source) as { cursor: string } | undefined;
+  let prior: string[] = [];
+  if (priorRow?.cursor) {
+    try {
+      const parsed = JSON.parse(priorRow.cursor);
+      if (Array.isArray(parsed)) prior = parsed.map(String);
+    } catch { /* corrupt JSON → start fresh */ }
+  }
+  const known = new Set<string>(prior);
+  let upserted = 0;
+  // Append new ids in input order so the cap keeps the MOST-RECENT
+  // entries. JavaScript's Set retains insertion order which we rely
+  // on for the cap below.
+  const merged = [...prior];
+  for (const raw of itemIds) {
+    const id = String(raw);
+    if (known.has(id)) continue;
+    known.add(id);
+    merged.push(id);
+    upserted += 1;
+  }
+  const capped = merged.length > SECTION_SEEN_CAP
+    ? merged.slice(merged.length - SECTION_SEEN_CAP)
+    : merged;
+  const nowIso = now.toISOString();
+  db.prepare(
+    "INSERT INTO watermark(source, cursor, updated_at) VALUES (?, ?, ?) "
+    + "ON CONFLICT(source) DO UPDATE SET cursor = excluded.cursor, "
+    + "updated_at = excluded.updated_at",
+  ).run(source, JSON.stringify(capped), nowIso);
+  return { upserted };
+}

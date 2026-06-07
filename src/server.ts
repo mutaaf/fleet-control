@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -561,6 +561,19 @@ export function _getChangelogCacheBuildsForTests(): number {
   return changelogBuildCounter;
 }
 
+// Ticket 0043: per-section seen-watermark POST counter. Exposed via
+// the `_get…ForTests` convention so tests can assert "exactly one
+// write per POST" without an injected DB stub. Production code does
+// not read this value. Per LESSONS § "expose a build counter for
+// cache-hit tests, not a fetcher swap".
+let sectionSeenWriteCounter = 0;
+export function _getSectionSeenWriteCountForTests(): number {
+  return sectionSeenWriteCounter;
+}
+export function _resetSectionSeenWriteCountForTests(): void {
+  sectionSeenWriteCounter = 0;
+}
+
 /** Production cache-invalidation hook — called from the
  *  `runIngestPass` post-COMMIT tail. We clear the whole map (one
  *  PR-table change can move any cached row); the build counter is
@@ -924,23 +937,87 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           // window can start at the LATER of (Friday 17:00, last-seen).
           // The watermark table is reused — no new schema. The JSON
           // shape of /api/fleet is unchanged (the AC is explicit).
+          //
+          // Ticket 0043: read the PRE-upsert watermark FIRST so the
+          // additive `previous_last_seen` field reflects the visit
+          // BEFORE this one (the SPA passes it back into
+          // `/api/fleet/new-since-visit?since=` so the diff is against
+          // the previous visit, not the just-upserted one). This is
+          // the additive top-level field the new-since-visit SPA
+          // logic depends on; per AGENTS.md additive-on-existing-route
+          // is permitted (renaming or removing is not).
+          const actorKeyForFleet = actorKeyFor(req, rauth.principal);
+          let previousLastSeen: string | null = null;
           try {
+            previousLastSeen = readHomeLastSeen(db, actorKeyForFleet);
             upsertHomeLastSeen(
-              db, actorKeyFor(req, rauth.principal),
+              db, actorKeyForFleet,
               new Date().toISOString(),
             );
           } catch { /* watermark row is best-effort; never block /api/fleet */ }
-          const v = fleetView(db, cfg);
+          const v = fleetView(db, cfg) as Record<string, unknown>;
+          v.previous_last_seen = previousLastSeen;
           // Ticket 0022: ?sort=health re-orders the project grid
           // ascending by health.score (worst first) so the operator's
           // eye lands on the project that needs them. The default
           // ordering (slug ASC, set by fleetView) is unchanged when
           // the query param is absent.
           if (url.searchParams.get("sort") === "health") {
-            v.projects = [...v.projects].sort((a: any, b: any) =>
+            const projects = v.projects as any[];
+            v.projects = [...projects].sort((a: any, b: any) =>
               (a.health?.score ?? 0) - (b.health?.score ?? 0));
           }
           return json(res, v);
+        }
+        // Ticket 0043: new-since-last-visit diff. Composes pr / anomaly
+        // / alert / inbox reads against the existing watermark seam
+        // 0038 introduced. Cache-Control: no-store because the value
+        // is per-visit and changes the moment ANY new row lands. The
+        // optional `?since=` query param wins over the watermark so
+        // the SPA can pass the PRE-upsert value from /api/fleet's
+        // additive `previous_last_seen` field — otherwise the
+        // operator's home-page visit would race the upsert.
+        if (path === "/api/fleet/new-since-visit") {
+          const actorKey = actorKeyFor(req, rauth.principal);
+          const since = url.searchParams.get("since");
+          const opts: NewSinceLastVisitOptions = {};
+          if (since) opts.since = since;
+          const v = newSinceLastVisit(db, new Date(), actorKey, opts);
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "no-store",
+          });
+          return res.end(body);
+        }
+        // Ticket 0043: per-section seen watermark POST. The SPA's
+        // IntersectionObserver hook batches viewport-visible item ids
+        // and POSTs them here every 5s OR on visibilitychange. An
+        // unknown `section` is a 400; an unknown `actorKey` is
+        // impossible (loopback always resolves). The write counter
+        // is exposed via `_getSectionSeenWriteCountForTests()` per
+        // LESSONS § "expose a build counter for cache-hit tests,
+        // not a fetcher swap".
+        if (path === "/api/fleet/section-seen" && req.method === "POST") {
+          const actorKey = actorKeyFor(req, rauth.principal);
+          return readBody(req).then((body) => {
+            const section = String(body.section ?? "");
+            const itemIds = Array.isArray(body.item_ids) ? body.item_ids.map(String) : [];
+            if (!isValidNewSinceSection(section)) {
+              return json(res, { ok: false, message: `unknown section: ${section}` }, 400);
+            }
+            if (!Array.isArray(body.item_ids)) {
+              return json(res, { ok: false, message: "item_ids must be an array" }, 400);
+            }
+            try {
+              const r = markSectionSeen(db, actorKey, section, itemIds, new Date());
+              sectionSeenWriteCounter += 1;
+              return json(res, { upserted: r.upserted }, 200);
+            } catch (e: any) {
+              return json(res, { ok: false, message: String(e?.message ?? e) }, 400);
+            }
+          });
         }
         // Ticket 0022: per-project health detail. Reads `read` scope
         // (loopback bypasses), same posture as every other GET
