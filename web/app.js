@@ -824,6 +824,15 @@ async function fetchRiskiestPr() {
   try { return await get("/api/fleet/riskiest-pr"); } catch { return null; }
 }
 
+// Ticket 0044: spend-efficiency ranking + laggard verdict. Lazy-fetched
+// from /api/fleet/spend-efficiency; errors fall through silently so the
+// rest of the home page still loads when the endpoint is unreachable.
+// The 15-min server-side cache (matching Cache-Control: max-age=900)
+// keeps the round-trip cheap on poll re-renders.
+async function fetchSpendEfficiency() {
+  try { return await get("/api/fleet/spend-efficiency"); } catch { return null; }
+}
+
 /** Skeleton block shown while /api/fleet/glance is in flight. Carries
  *  `aria-busy="true"` so screen readers announce the loading state;
  *  the pulsing animation flattens under
@@ -1071,6 +1080,99 @@ function renderRiskiestPr(data) {
     </span>
     <span class="riskiest-pr-link">tend it now →</span>
   </a>`;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0044: spend-efficiency ranking card.
+//
+// Inline card on the home page (BELOW the 0040 riskiest-PR badge,
+// ABOVE the project grid). Renders the trailing-14d spend-efficiency
+// ranking + the laggard verdict. The card hides itself entirely when
+// fewer than 3 projects have merged a PR in the window (no meaningful
+// median).
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string passes through
+// redactSecrets before HTML insertion. Project names + signal details
+// flow through unbounded user-shaped strings (slug, "Why" detail
+// from the helper); the redaction pass is the silent backstop.
+//
+// Quiet-hours integration (AC9): when data.quiet_hours_active is
+// true, the "Look here" call-to-action is omitted. The laggard
+// verdict + leaderboard remain visible — the operator opened the
+// portal voluntarily; only the action prompt is suppressed (per the
+// 0030 pull-vs-push contract).
+function renderSpendEfficiencyCard(data) {
+  if (!data) return "";
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+  // Sub-3-project threshold (AC1 / AC10): hide entirely.
+  if (projects.length < 3) return "";
+  const windowDays = Number(data.window_days || 14);
+  const median = data.fleet_median_per_pr;
+  const totalSpend = Number(data.fleet_total_spend_usd || 0);
+  const quietHours = !!data.quiet_hours_active;
+  // Defence-in-depth redaction at the boundary.
+  const safeWindow = esc(redactSecrets(`last ${windowDays} days`));
+  const medianStr = median == null ? "—" : esc(usd(Number(median)));
+  const spendStr = esc(usd(totalSpend));
+
+  // Laggard block — present only when the server picked one.
+  let laggardBlock = "";
+  if (data.laggard) {
+    const lag = data.laggard;
+    const safeName = esc(redactSecrets(String(lag.project_name || lag.project_slug || "")));
+    const cpp = esc(usd(Number(lag.cost_per_pr_usd || 0)));
+    const ratio = Number(lag.ratio_to_median || 0);
+    const ratioStr = ratio > 0 ? `${ratio.toFixed(1)}x median` : "above median";
+    const why = Array.isArray(lag.why) ? lag.why : [];
+    const whyLine = why.length === 0
+      ? ""
+      : `<div class="spend-efficiency-why dim">Why: ${why.map((w) => esc(redactSecrets(String(w.detail || "")))).join(" · ")}</div>`;
+    const safeLink = esc(redactSecrets(String(lag.link || "")));
+    // Quiet hours suppress the action prompt but NOT the verdict.
+    const lookHere = quietHours
+      ? ""
+      : `<a class="spend-efficiency-look-here" data-testid="look-here-link" href="${safeLink}">Look here →</a>`;
+    laggardBlock = `<div class="spend-efficiency-laggard" data-testid="spend-efficiency-laggard">
+      <div class="spend-efficiency-laggard-head">
+        <span class="spend-efficiency-laggard-label">Laggard:</span>
+        <b>${safeName}</b>
+        <span class="spend-efficiency-laggard-stat mono">${cpp}/PR (${esc(ratioStr)})</span>
+      </div>
+      ${whyLine}
+      ${lookHere}
+    </div>`;
+  }
+
+  // Leaderboard: every project ranked ASC by cost-per-PR. Null $/PR
+  // rows (zero merges in window) sort to the bottom.
+  const laggardSlug = data.laggard ? String(data.laggard.project_slug) : null;
+  const rows = projects.map((p) => {
+    const slug = esc(redactSecrets(String(p.project_slug || "")));
+    const merged = Number(p.merged_prs || 0);
+    const cpp = p.cost_per_pr_usd == null
+      ? `<span class="dim">—</span>`
+      : esc(usd(Number(p.cost_per_pr_usd)));
+    const marker = (laggardSlug && String(p.project_slug) === laggardSlug)
+      ? ` <span class="spend-efficiency-marker">← laggard</span>`
+      : "";
+    return `<tr class="spend-efficiency-row" data-slug="${slug}">
+      <td class="spend-efficiency-leader-slug"><a href="#/p/${slug}"><b>${slug}</b></a>${marker}</td>
+      <td class="spend-efficiency-leader-cpp mono">${cpp}</td>
+      <td class="spend-efficiency-leader-prs mono">+${merged} PR${merged === 1 ? "" : "s"}</td>
+    </tr>`;
+  }).join("");
+
+  return `<div class="spend-efficiency-card" data-testid="spend-efficiency-card">
+    <div class="spend-efficiency-head">
+      <span class="spend-efficiency-title"><b>Spend efficiency</b> <span class="dim">(${safeWindow})</span></span>
+      <span class="spend-efficiency-summary dim">fleet median: ${medianStr}/PR · ${spendStr} spent</span>
+    </div>
+    ${laggardBlock}
+    <table class="spend-efficiency-leaderboard">
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1802,8 +1904,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(),
   ]);
   // Ticket 0043: fetch the new-since-visit diff using the additive
   // `previous_last_seen` field from /api/fleet (the PRE-upsert
@@ -1829,6 +1931,7 @@ async function home() {
     renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +
     renderRiskiestPr(riskiestPrData) +
+    renderSpendEfficiencyCard(spendEfficiencyData) +
     renderStreak(streakData) +
     renderInbox(inboxData) +
     (alerts.length ? `<div class="eyebrow">Needs attention</div>` + alerts.map(alertRow).join("") : "") +
@@ -2223,6 +2326,35 @@ async function project(slug, params) {
       }
     }
   } catch { /* never let the highlight crash the project page */ }
+  // Ticket 0044: project page focus highlight. The spend-efficiency
+  // laggard card deep-links here via `?focus=<signal>` (heals,
+  // self_cancel, drift, infra_flake). Map each signal to its target
+  // DOM region and briefly flash the matching <div class="eyebrow">
+  // section header + container with the `focus-flash` class (CSS-
+  // only fade; reuses the 0040 pr-card-flash animation pattern).
+  try {
+    const focusParam = params && params.get && params.get("focus");
+    if (focusParam) {
+      const FOCUS_SECTION_LABELS = {
+        heals: "Recent activity",
+        self_cancel: "Recent activity",
+        drift: "Anomalies",
+        infra_flake: "The jobs",
+      };
+      const label = FOCUS_SECTION_LABELS[String(focusParam)];
+      if (label) {
+        // Find the matching <div class="eyebrow"> by exact text match.
+        const eyebrows = Array.from(app.querySelectorAll(".eyebrow"));
+        const target = eyebrows.find((el) => (el.textContent || "").trim() === label);
+        if (target && !target._focusFlashed) {
+          target._focusFlashed = true;
+          target.classList.add("focus-flash");
+          try { target.scrollIntoView({ block: "center", behavior: "smooth" }); } catch { /* */ }
+          setTimeout(() => { target.classList.remove("focus-flash"); }, 2200);
+        }
+      }
+    }
+  } catch { /* highlight is best-effort; never crash the page */ }
 }
 
 // ---- Tool-mix sparkline (ticket 0031) ------------------------------------

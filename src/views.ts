@@ -4062,3 +4062,416 @@ export function lessonCreditRollup(
     generated_at: nowIso,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Spend-efficiency ranking + laggard diagnosis (ticket 0044).
+//
+// Composes already-shipped tables (pr, cost_rollup_day, run, anomaly,
+// control_audit) into one fleet-wide ranking + a structural verdict
+// for the worst-performer. No schema migration; no new ingest path.
+//
+// Producer reconciliation (per LESSONS 2026-06-05 "groomer prose can
+// disagree with the schema; the schema wins"):
+//   - merged PRs: `pr.state = 'MERGED' AND pr.is_agent = 1` (uppercase
+//     'MERGED' — matches `costPerMergedPr` and the production ingester
+//     at src/ingest/prs.ts line 164).
+//   - open agent PRs (for infra-flake): `pr.state = 'open'` lowercase
+//     (matches `riskiestOpenPr` and the production ingester).
+//   - run outcomes: lowercase 'healed' and 'self-cancel' (per
+//     src/ingest/transcripts.ts).
+//   - self-drift anomalies: `anomaly.kind = 'self_drift'` (snake-case,
+//     per src/drift.ts).
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing uses the double-cast.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// SQL strings are plain concatenation; identifiers stay unquoted.
+// Per LESSONS § "julianday() drifts ~10us per timestamp": no helper
+// here needs sub-millisecond timestamp precision (we bucket by full
+// days), but per-window arithmetic is JS-side via `Date.getTime()`
+// to stay clear of the trap.
+// Per AGENTS.md § "Never compose a shell string from input" — and its
+// SQL analogue: every parameter is bound via `?` placeholders.
+
+export interface SpendEfficiencyProjectRow {
+  project_slug: string;
+  project_name: string;
+  merged_prs: number;
+  spend_usd: number;
+  cost_per_pr_usd: number | null;
+  ratio_to_median: number | null;
+}
+
+export type SpendEfficiencyLaggardSignal =
+  | "heals"
+  | "self_cancel"
+  | "drift"
+  | "infra_flake";
+
+export interface SpendEfficiencyLaggardWhy {
+  signal: SpendEfficiencyLaggardSignal;
+  value: number;
+  fleet_median: number;
+  detail: string;
+}
+
+export interface SpendEfficiencyLaggard {
+  project_slug: string;
+  project_name: string;
+  cost_per_pr_usd: number;
+  ratio_to_median: number;
+  why: SpendEfficiencyLaggardWhy[];
+  /** `#/p/<slug>?focus=<signal>` deep-link. Signal is the cascade's
+   *  top entry when one exists; otherwise just `#/p/<slug>`. */
+  link: string;
+}
+
+export interface SpendEfficiencyRanking {
+  fleet_median_per_pr: number | null;
+  fleet_total_spend_usd: number;
+  fleet_total_prs: number;
+  projects: SpendEfficiencyProjectRow[];
+  laggard: SpendEfficiencyLaggard | null;
+  window_days: number;
+  generated_at: string;
+}
+
+export interface SpendEfficiencyOptions {
+  /** Window size in days; clamped to [7, 90] by the route handler.
+   *  Defaults to 14 here (matches the ticket's example surface). */
+  windowDays?: number;
+}
+
+interface SpendEffProjectRow_internal {
+  id: number;
+  slug: string;
+  name: string | null;
+}
+interface SpendEffMergedRow_internal {
+  project_id: number;
+  merged_prs: number | null;
+}
+interface SpendEffSpendRow_internal {
+  project_id: number;
+  spent_usd: number | null;
+}
+interface SpendEffOutcomeRow_internal {
+  project_id: number;
+  c: number | null;
+}
+interface SpendEffDriftRow_internal {
+  project_id: number;
+  c: number | null;
+}
+interface SpendEffOpenPrRow_internal {
+  project_id: number;
+  number: number;
+}
+
+/** JS-side median (sorted-array, no SQL window functions needed). Empty
+ *  input yields `null` — keeps the helper's downstream nullability
+ *  contract clean. */
+function _jsMedian(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** Compose the laggard's "why" cascade from per-project metric counts.
+ *  Only signals where the laggard value STRICTLY exceeds the fleet
+ *  median surface; results are ordered by absolute deviation DESC,
+ *  capped at 3. Per LESSONS § "anomaly tests need sigma > 0 in the
+ *  fixture": the caller seeds variation so the cascade has signal. */
+function _composeLaggardWhy(
+  laggard: { heals: number; self_cancels: number; drifts: number; flakes: number },
+  fleet: { heals: number; self_cancels: number; drifts: number; flakes: number },
+): SpendEfficiencyLaggardWhy[] {
+  const entries: SpendEfficiencyLaggardWhy[] = [];
+  if (laggard.heals > fleet.heals) {
+    entries.push({
+      signal: "heals",
+      value: laggard.heals,
+      fleet_median: fleet.heals,
+      detail: `${laggard.heals} healed run${laggard.heals === 1 ? "" : "s"} (median ${fleet.heals})`,
+    });
+  }
+  if (laggard.self_cancels > fleet.self_cancels) {
+    entries.push({
+      signal: "self_cancel",
+      value: laggard.self_cancels,
+      fleet_median: fleet.self_cancels,
+      detail: `${laggard.self_cancels} self-cancel${laggard.self_cancels === 1 ? "" : "s"}`,
+    });
+  }
+  if (laggard.drifts > fleet.drifts) {
+    entries.push({
+      signal: "drift",
+      value: laggard.drifts,
+      fleet_median: fleet.drifts,
+      detail: `${laggard.drifts} drift open`,
+    });
+  }
+  if (laggard.flakes > fleet.flakes) {
+    entries.push({
+      signal: "infra_flake",
+      value: laggard.flakes,
+      fleet_median: fleet.flakes,
+      detail: `${laggard.flakes} infra-flake PR${laggard.flakes === 1 ? "" : "s"}`,
+    });
+  }
+  // Order by absolute deviation DESC; stable secondary sort by signal
+  // index so a tied deviation surfaces the heal signal first (matches
+  // the ticket's "heal causes" emphasis).
+  entries.sort((a, b) => {
+    const da = a.value - a.fleet_median;
+    const db = b.value - b.fleet_median;
+    if (db !== da) return db - da;
+    return 0;
+  });
+  return entries.slice(0, 3);
+}
+
+/** Compute the fleet-wide spend-efficiency ranking + laggard verdict.
+ *  Pure-SQL composition over already-shipped tables. The fleet median
+ *  is computed JS-side (small N — typically <50 projects).
+ *
+ *  Window arithmetic mirrors `costPerMergedPr`: end is `now`'s UTC
+ *  midnight, start is `windowDays` before, bucketed by `date(fetched_at)`
+ *  / `day`. Per LESSONS § "julianday() drifts ~10us per timestamp":
+ *  the bucket math is integer dates so we never hit the float-day trap.
+ *
+ *  Returns the full `SpendEfficiencyRanking` shape. The route layer
+ *  caches by `(window_days, latest_run_id, latest_merged_pr_id)`. */
+export function spendEfficiencyRanking(
+  db: DB, now: Date, opts: SpendEfficiencyOptions = {},
+): SpendEfficiencyRanking {
+  const windowDays = Math.max(7, Math.min(90, Math.floor(opts.windowDays ?? 14)));
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  // Use `now` itself for the upper end (NOT date(now)) so seed rows
+  // dated today still count toward the window — matches the SPA's
+  // wall-clock framing where "today" is part of the trailing 14d.
+  // We push end forward one day for the `< end` half-open bound.
+  const endExclusive = new Date(end);
+  endExclusive.setUTCDate(endExclusive.getUTCDate() + 1);
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - windowDays);
+  const endExclusiveStr = endExclusive.toISOString().slice(0, 10);
+  const startStr = start.toISOString().slice(0, 10);
+  const startIso = start.toISOString();
+  const endIso = endExclusive.toISOString();
+
+  // ── Anchor: every project (small N). ────────────────────────────
+  const projects = db.prepare(
+    "SELECT id, slug, name FROM project ORDER BY slug",
+  ).all() as unknown as SpendEffProjectRow_internal[];
+
+  if (projects.length === 0) {
+    return {
+      fleet_median_per_pr: null,
+      fleet_total_spend_usd: 0,
+      fleet_total_prs: 0,
+      projects: [],
+      laggard: null,
+      window_days: windowDays,
+      generated_at: now.toISOString(),
+    };
+  }
+
+  // ── Per-project spend over window (cost_rollup_day). ────────────
+  const spendRows = db.prepare(
+    "SELECT project_id, SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day < ? "
+    + " GROUP BY project_id",
+  ).all(startStr, endExclusiveStr) as unknown as SpendEffSpendRow_internal[];
+  const spendByPid = new Map<number, number>();
+  for (const r of spendRows) spendByPid.set(r.project_id, Number(r.spent_usd ?? 0));
+
+  // ── Per-project merged-PR count over window. ────────────────────
+  // Producer note: 'MERGED' uppercase + is_agent=1 (matches
+  // costPerMergedPr's casing per LESSONS 2026-06-05).
+  const mergedRows = db.prepare(
+    "SELECT project_id, COUNT(*) AS merged_prs "
+    + "  FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) < ? "
+    + " GROUP BY project_id",
+  ).all(startStr, endExclusiveStr) as unknown as SpendEffMergedRow_internal[];
+  const mergedByPid = new Map<number, number>();
+  for (const r of mergedRows) mergedByPid.set(r.project_id, Number(r.merged_prs ?? 0));
+
+  // ── Per-project counts for the "why" cascade. ───────────────────
+  // healed runs over window (lowercase per src/ingest/transcripts.ts).
+  const healRows = db.prepare(
+    "SELECT project_id, COUNT(*) AS c "
+    + "  FROM run "
+    + " WHERE outcome = 'healed' "
+    + "   AND started_at IS NOT NULL "
+    + "   AND started_at >= ? AND started_at < ? "
+    + " GROUP BY project_id",
+  ).all(startIso, endIso) as unknown as SpendEffOutcomeRow_internal[];
+  const healByPid = new Map<number, number>();
+  for (const r of healRows) healByPid.set(r.project_id, Number(r.c ?? 0));
+
+  // self-cancel runs over window (lowercase-with-dash per producer).
+  const cancelRows = db.prepare(
+    "SELECT project_id, COUNT(*) AS c "
+    + "  FROM run "
+    + " WHERE outcome = 'self-cancel' "
+    + "   AND started_at IS NOT NULL "
+    + "   AND started_at >= ? AND started_at < ? "
+    + " GROUP BY project_id",
+  ).all(startIso, endIso) as unknown as SpendEffOutcomeRow_internal[];
+  const cancelByPid = new Map<number, number>();
+  for (const r of cancelRows) cancelByPid.set(r.project_id, Number(r.c ?? 0));
+
+  // open self_drift anomalies (kind matches src/drift.ts producer).
+  // JOIN through run to derive project_id; no inbox_dismissal gate
+  // here (the verdict surface is a pull, not a push — dismissals
+  // affect only the inbox).
+  const driftRows = db.prepare(
+    "SELECT r.project_id AS project_id, COUNT(*) AS c "
+    + "  FROM anomaly a "
+    + "  JOIN run r ON r.id = a.run_id "
+    + " WHERE a.kind = 'self_drift' "
+    + "   AND a.created_at IS NOT NULL "
+    + "   AND a.created_at >= ? "
+    + " GROUP BY r.project_id",
+  ).all(startIso) as unknown as SpendEffDriftRow_internal[];
+  const driftByPid = new Map<number, number>();
+  for (const r of driftRows) driftByPid.set(r.project_id, Number(r.c ?? 0));
+
+  // Open agent PRs per project — we'll classify each one via the
+  // existing `classifyPrFailure` helper to count infra_flake matches.
+  const openPrRows = db.prepare(
+    "SELECT project_id, number FROM pr "
+    + " WHERE state = 'open' AND is_agent = 1",
+  ).all() as unknown as SpendEffOpenPrRow_internal[];
+  const flakeByPid = new Map<number, number>();
+  for (const r of openPrRows) {
+    const cls = classifyPrFailure(db, r.project_id, r.number);
+    if (cls.kind === "infra_flake") {
+      flakeByPid.set(r.project_id, (flakeByPid.get(r.project_id) ?? 0) + 1);
+    }
+  }
+
+  // ── Assemble per-project rows + fleet totals. ───────────────────
+  const projectRows: SpendEfficiencyProjectRow[] = [];
+  let fleetSpend = 0;
+  let fleetMerged = 0;
+  for (const p of projects) {
+    const spend = spendByPid.get(p.id) ?? 0;
+    const merged = mergedByPid.get(p.id) ?? 0;
+    const cpp = merged > 0 ? spend / merged : null;
+    projectRows.push({
+      project_slug: p.slug,
+      project_name: p.name ?? p.slug,
+      merged_prs: merged,
+      spend_usd: spend,
+      cost_per_pr_usd: cpp,
+      ratio_to_median: null, // filled in after we know the median
+    });
+    fleetSpend += spend;
+    fleetMerged += merged;
+  }
+
+  // Fleet median per-PR: built from per-project cost_per_pr values
+  // restricted to projects with >= 1 merged PR (per AC1).
+  const medianBase = projectRows
+    .filter((r) => r.cost_per_pr_usd != null && r.merged_prs >= 1)
+    .map((r) => r.cost_per_pr_usd as number);
+  const median = _jsMedian(medianBase);
+
+  // Fill in ratio_to_median once the median is known.
+  for (const r of projectRows) {
+    if (r.cost_per_pr_usd != null && median != null && median > 0) {
+      r.ratio_to_median = r.cost_per_pr_usd / median;
+    }
+  }
+
+  // Sort projects by ascending cost_per_pr_usd (cheap first → laggard
+  // sinks to the bottom). Nulls (merged_prs == 0) drop to the end.
+  projectRows.sort((a, b) => {
+    const an = a.cost_per_pr_usd == null;
+    const bn = b.cost_per_pr_usd == null;
+    if (an && bn) return a.project_slug.localeCompare(b.project_slug);
+    if (an) return 1;
+    if (bn) return -1;
+    if (a.cost_per_pr_usd !== b.cost_per_pr_usd) {
+      return (a.cost_per_pr_usd as number) - (b.cost_per_pr_usd as number);
+    }
+    return a.project_slug.localeCompare(b.project_slug);
+  });
+
+  // ── Laggard selection (AC2). ────────────────────────────────────
+  // Threshold: fewer than 3 projects with >= 1 merge → no median is
+  // meaningful → laggard:null even if the data structurally exists.
+  const projectsWithMerges = projectRows.filter((r) => r.merged_prs >= 1);
+  let laggard: SpendEfficiencyLaggard | null = null;
+  if (projectsWithMerges.length >= 3 && median != null && median > 0) {
+    // Candidates: ratio_to_median > 1.5; pick highest ratio; tie-break
+    // by higher ABSOLUTE cost_per_pr_usd.
+    const candidates = projectsWithMerges.filter(
+      (r) => r.ratio_to_median != null && (r.ratio_to_median as number) > 1.5,
+    );
+    candidates.sort((a, b) => {
+      const ar = a.ratio_to_median as number;
+      const br = b.ratio_to_median as number;
+      if (br !== ar) return br - ar;
+      const ac = a.cost_per_pr_usd as number;
+      const bc = b.cost_per_pr_usd as number;
+      return bc - ac;
+    });
+    if (candidates.length > 0) {
+      const top = candidates[0];
+      // Resolve project_id from the slug — we'll need it for the
+      // signal-count lookup against the per-PID maps.
+      const lp = projects.find((p) => p.slug === top.project_slug);
+      const lpid = lp?.id ?? -1;
+      const laggardCounts = {
+        heals: healByPid.get(lpid) ?? 0,
+        self_cancels: cancelByPid.get(lpid) ?? 0,
+        drifts: driftByPid.get(lpid) ?? 0,
+        flakes: flakeByPid.get(lpid) ?? 0,
+      };
+      // Fleet medians for each signal (the JS median over all projects'
+      // counts; missing values count as 0 — a project that never
+      // healed has heals=0). Per AC3: "Fleet median computed the same
+      // way" for heals; self_cancel/drift/infra_flake use the same
+      // per-project count median.
+      const projectIds = projects.map((p) => p.id);
+      const fleetCounts = {
+        heals: _jsMedian(projectIds.map((id) => healByPid.get(id) ?? 0)) ?? 0,
+        self_cancels: _jsMedian(projectIds.map((id) => cancelByPid.get(id) ?? 0)) ?? 0,
+        drifts: _jsMedian(projectIds.map((id) => driftByPid.get(id) ?? 0)) ?? 0,
+        flakes: _jsMedian(projectIds.map((id) => flakeByPid.get(id) ?? 0)) ?? 0,
+      };
+      const why = _composeLaggardWhy(laggardCounts, fleetCounts);
+      const focusSignal = why.length > 0 ? why[0].signal : null;
+      const link = focusSignal
+        ? `#/p/${encodeURIComponent(top.project_slug)}?focus=${focusSignal}`
+        : `#/p/${encodeURIComponent(top.project_slug)}`;
+      laggard = {
+        project_slug: top.project_slug,
+        project_name: top.project_name,
+        cost_per_pr_usd: top.cost_per_pr_usd as number,
+        ratio_to_median: top.ratio_to_median as number,
+        why,
+        link,
+      };
+    }
+  }
+
+  return {
+    fleet_median_per_pr: median,
+    fleet_total_spend_usd: fleetSpend,
+    fleet_total_prs: fleetMerged,
+    projects: projectRows,
+    laggard,
+    window_days: windowDays,
+    generated_at: now.toISOString(),
+  };
+}
