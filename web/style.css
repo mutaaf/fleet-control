@@ -947,6 +947,93 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   100% { box-shadow: 0 0 0 0 rgba(217, 138, 43, 0);    border-color: var(--line); }
 }
 
+/* Ticket 0044: project page focus-section flash. When the project page
+ * is deep-linked with `?focus=<signal>` from the spend-efficiency
+ * laggard verdict, the matching .eyebrow section header briefly glows
+ * so the operator's eye lands on the right region. Reuses the 0040
+ * pr-card-flash animation timing + --warn highlight ring (per the
+ * engineering note: "reuse the existing pr-card-flash CSS variable"). */
+.focus-flash {
+  animation: focus-flash 2s ease-out 1;
+  border-radius: var(--r);
+}
+@keyframes focus-flash {
+  0%   { box-shadow: 0 0 0 3px rgba(217, 138, 43, .55); background: rgba(217, 138, 43, .12); }
+  100% { box-shadow: 0 0 0 0 rgba(217, 138, 43, 0);    background: transparent; }
+}
+
+/* Ticket 0044: spend-efficiency ranking card. Stacked single-column at
+ * 375px (phones); inline laggard + leaderboard at >=600px. The card
+ * is a pull surface — info-dense; no hover affordances. Reuses the
+ * generic card surface for consistency with 0033/0035/0040. */
+.spend-efficiency-card {
+  margin: 14px 0;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.spend-efficiency-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.spend-efficiency-title { font-size: 14px; }
+.spend-efficiency-summary { font-size: 12.5px; font-family: var(--mono); }
+.spend-efficiency-laggard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: rgba(217, 138, 43, .08);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r);
+}
+.spend-efficiency-laggard-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+.spend-efficiency-laggard-label {
+  color: var(--warn);
+  font-weight: 600;
+  font-size: 12.5px;
+}
+.spend-efficiency-laggard-stat { font-size: 12.5px; }
+.spend-efficiency-why { font-size: 12px; }
+.spend-efficiency-look-here {
+  font-size: 12.5px;
+  align-self: flex-start;
+}
+.spend-efficiency-leaderboard {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.spend-efficiency-leaderboard td {
+  padding: 4px 6px;
+  border-top: 1px solid var(--line);
+}
+.spend-efficiency-leaderboard tr:first-child td { border-top: none; }
+.spend-efficiency-marker {
+  color: var(--warn);
+  font-size: 11.5px;
+  margin-left: 6px;
+}
+@media (min-width: 600px) {
+  .spend-efficiency-card { padding: 16px 18px; }
+  .spend-efficiency-head {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .spend-efficiency-leaderboard td { padding: 5px 10px; }
+}
+
 /* Ticket 0034: self-baseline drift detail view. Three rows stacked
  * single-column on phones; each row carries the metric label, the
  * baseline mean/sigma + current value as a numeric line, and an

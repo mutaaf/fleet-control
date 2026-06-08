@@ -1,12 +1,24 @@
 ---
 id: 0044
 title: Spend-efficiency ranking - rank projects by $/merged-PR and diagnose the laggard
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-07
 owner: gtm-innovation
 ---
+
+## Implementation log
+
+- 2026-06-07: branched `feat/0044-spend-efficiency-ranking-laggard`. Producer
+  audit confirms `pr.state = 'MERGED'` + `is_agent = 1` (per `costPerMergedPr`
+  line 1875 and `src/ingest/prs.ts:164`), `run.outcome` is lowercase
+  (`'healed'`, `'self-cancel'`, surfaced by `src/ingest/transcripts.ts`),
+  `anomaly.kind = 'self_drift'` (snake_case, per `src/drift.ts`), and the
+  `infra_flake` signal reuses the existing `classifyPrFailure` helper which
+  scans the latest `control_audit` heal-row for that PR. The new helper
+  + route + SPA card compose entirely over already-shipped tables — no
+  schema migration, no new ingest path.
 
 ## User story
 

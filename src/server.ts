@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -526,6 +526,88 @@ function getRiskiestPrCached(db: DB, cfg: FleetConfig, now: Date): RiskiestOpenP
   const quiet = quietHoursActiveAnywhere(cfg, now);
   const value = riskiestOpenPr(db, now, { quietHoursActive: quiet });
   riskiestPrCache = { tuple, value, expires_at: Date.now() + RISKIEST_PR_TTL_MS };
+  return value;
+}
+
+// Ticket 0044: "Spend-efficiency ranking" memo cache.
+//
+// 15-min TTL (matches Cache-Control: max-age=900 — the median moves
+// slowly; the laggard rarely flips within a 15-min window). The cache
+// is invalidated by a three-value tuple computed BEFORE the main query:
+//
+//   - windowDays              = the resolved ?window= value
+//   - latestRunId             = SELECT MAX(id) FROM run
+//   - latestMergedFetch       = SELECT MAX(fetched_at), COUNT(*) FROM
+//                               pr WHERE state='MERGED' AND is_agent=1
+//
+// The `pr` table has no surrogate id (PK is (project_id, number)) so
+// we proxy "latest merged PR landed" via MAX(fetched_at) + COUNT(*) —
+// either signal moving (a fresh sync OR an additional row) busts the
+// cache. Any tuple component moving (a fresh run, a fresh merge, or
+// the operator changing the window) busts the cache the moment the
+// next request arrives — no poll-the-full-result required. Per LESSONS §
+// "in-process dedup sets need an explicit reset hook for tests" we
+// expose `_resetSpendEfficiencyCacheForTests()`. Per LESSONS § "expose
+// a build counter for cache-hit tests, not a fetcher swap" we also
+// expose a read-only `_getSpendEfficiencyCacheBuildsForTests()` that
+// ticks on every cache MISS so route tests assert hit/miss semantics
+// without stubbing SQL. Production code never reads either.
+interface SpendEfficiencyCacheEntry {
+  tuple: string;
+  value: SpendEfficiencyRanking & { quiet_hours_active: boolean };
+  expires_at: number;
+}
+const SPEND_EFFICIENCY_TTL_MS = 900_000;
+const spendEfficiencyCache = new Map<string, SpendEfficiencyCacheEntry>();
+let spendEfficiencyBuildCounter = 0;
+
+export function _resetSpendEfficiencyCacheForTests(): void {
+  spendEfficiencyCache.clear();
+  spendEfficiencyBuildCounter = 0;
+}
+
+export function _getSpendEfficiencyCacheBuildsForTests(): number {
+  return spendEfficiencyBuildCounter;
+}
+
+interface SpendEffMaxRunRow { x: number | null; }
+interface SpendEffMergedPrSummaryRow { mx: string | null; c: number | null; }
+
+function spendEfficiencyInvalidationTuple(db: DB, windowDays: number): string {
+  const runRow = db.prepare(
+    "SELECT MAX(id) AS x FROM run",
+  ).get() as unknown as SpendEffMaxRunRow | undefined;
+  // The pr table has no surrogate id (PK is (project_id, number)) so
+  // we proxy "fresh merge landed" via the (MAX(fetched_at), COUNT(*))
+  // pair — either moving busts the cache.
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c "
+    + "  FROM pr WHERE state = 'MERGED' AND is_agent = 1",
+  ).get() as unknown as SpendEffMergedPrSummaryRow | undefined;
+  const r = Number(runRow?.x ?? 0);
+  const mx = prRow?.mx ?? "";
+  const c = Number(prRow?.c ?? 0);
+  return `${windowDays}|${r}|${mx}|${c}`;
+}
+
+function getSpendEfficiencyCached(
+  db: DB, cfg: FleetConfig, now: Date, windowDays: number,
+): SpendEfficiencyRanking & { quiet_hours_active: boolean } {
+  const tuple = spendEfficiencyInvalidationTuple(db, windowDays);
+  const hit = spendEfficiencyCache.get(String(windowDays));
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) {
+    return hit.value;
+  }
+  spendEfficiencyBuildCounter += 1;
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const inner = spendEfficiencyRanking(db, now, { windowDays });
+  // Surface quiet_hours_active in the payload so the SPA can hide the
+  // "look here" call-to-action overnight per AC9 (the 0030 pull-vs-
+  // push contract: information visible, action suppressed).
+  const value = { ...inner, quiet_hours_active: quiet };
+  spendEfficiencyCache.set(String(windowDays), {
+    tuple, value, expires_at: Date.now() + SPEND_EFFICIENCY_TTL_MS,
+  });
   return value;
 }
 
@@ -1207,6 +1289,34 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=30",
+          });
+          return res.end(body);
+        }
+        // Ticket 0044: spend-efficiency ranking + laggard diagnosis.
+        // Composes pr + cost_rollup_day + run + anomaly + control_audit
+        // — no schema migration. 15-min memo cache keyed by
+        // (windowDays, latestRunId, latestMergedPrId) so a fresh run or
+        // merged PR busts the entry on the next call. Quiet hours (0030)
+        // suppress only the "Look here" call-to-action — the verdict
+        // surface (laggard verdict + leaderboard) stays visible because
+        // the card is a pull surface, not a push (per the 0030 contract).
+        // Net-new route — no existing JSON shape to preserve.
+        if (path === "/api/fleet/spend-efficiency") {
+          const raw = url.searchParams.get("window");
+          let windowDays = 14;
+          if (raw != null) {
+            const n = Number(raw);
+            if (!Number.isFinite(n) || Math.floor(n) !== n || n < 7 || n > 90) {
+              return json(res, { error: "window must be an integer in [7, 90]" }, 400);
+            }
+            windowDays = n;
+          }
+          const v = getSpendEfficiencyCached(db, cfg, new Date(), windowDays);
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=900",
           });
           return res.end(body);
         }
