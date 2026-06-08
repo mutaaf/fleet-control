@@ -1,7 +1,7 @@
 ---
 id: 0044
 title: Spend-efficiency ranking - rank projects by $/merged-PR and diagnose the laggard
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-07
@@ -19,6 +19,13 @@ owner: gtm-innovation
   scans the latest `control_audit` heal-row for that PR. The new helper
   + route + SPA card compose entirely over already-shipped tables — no
   schema migration, no new ingest path.
+- 2026-06-07: shipped via PR #104. The `pr` table has no surrogate id (its
+  PK is `(project_id, number)`), so the cache-invalidation tuple proxies
+  "latest merged PR landed" via `MAX(pr.fetched_at) + COUNT(*)` instead of
+  the spec's literal `latest_merged_pr_id` — either signal moving busts
+  the cache identically. Documented inline at the cache state declaration
+  in `src/server.ts` so the next reader doesn't reach for a non-existent
+  column.
 
 ## User story
 

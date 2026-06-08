@@ -505,3 +505,30 @@ schema is the contract. `cost_rollup_day.phase`, `run.outcome`,
 GitHub-rollup tokens FAILURE/SUCCESS/PENDING the spec used), and
 `anomaly.kind` are all places this trap could bite next; the producer
 file is the chokepoint to grep.
+
+## 2026-06-07 — the `pr` table has no surrogate `id`; proxy "latest landed" via (MAX(fetched_at), COUNT(*))
+
+Symptom: while wiring ticket 0044's spend-efficiency cache I copied
+the 0040 riskiest-PR invalidation-tuple pattern (`SELECT MAX(id)
+FROM pr WHERE state='MERGED'`) and got an instant runtime 500 against
+the booted test server: `no such column: id`. Cause: the `pr` table
+in `src/db.ts` declares `PRIMARY KEY(project_id, number)` and NO
+`id INTEGER PRIMARY KEY` autoincrement column — unlike `run`,
+`anomaly`, `control_audit`, and most other tables in this DB. The
+spec's "latest_merged_pr_id" is a column that doesn't exist. The
+fix is to proxy "fresh merge landed" with a TWO-VALUE pair:
+`MAX(fetched_at)` (catches the case where the same row's sync
+timestamp advances) AND `COUNT(*)` (catches a new row inserted that
+happens to share the same fetched_at). Either moving busts the
+cache identically to a phantom id. General rule for this repo: any
+new cache that wants to invalidate on "fresh `pr` row landed" MUST
+use the `(MAX(fetched_at), COUNT(*))` pair, never `MAX(id)`. The
+groomer's spec text routinely names a `latest_<table>_id` tuple
+component without confirming the column exists; round-trip every
+such reference through the schema in `src/db.ts` before writing
+the SELECT. Adjacent tables with the same composite-PK shape and
+no surrogate id today: `cost_rollup_day` (PK `(project_id, phase,
+day)`), `project_alias` (PK `alias_slug`), `pricing` (PK `model`),
+`watermark` (PK `source`), `inbox_dismissal` (PK `(kind,
+project_slug, payload_id)`), `home_last_seen` — same trap applies
+to any future cache keyed off "the latest row in any of these."
