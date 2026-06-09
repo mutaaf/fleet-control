@@ -1,7 +1,7 @@
 ---
 id: 0046
 title: fleetctl onboard wizard - one command from zero-state to first ingested project in under three minutes
-status: groomed
+status: in-progress
 priority: P1
 area: infra
 created: 2026-06-09
@@ -473,4 +473,69 @@ storage.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+### 2026-06-09 — in-progress (implementation-dev)
+
+Composition-only wizard. New module `src/onboard.ts` exporting
+`runOnboard(deps: OnboardDeps)` plus a `productionDeps()` wirer. New
+`onboard` case added to `bin/fleetctl.ts`. Tests in
+`tests/onboard.test.ts` — one `test(...)` per AC checkbox plus the AC11
+CLI subprocess test that uses `FLEET_DB_PATH` + a planted tmp
+`fleet-control.config.json` in cwd.
+
+Producer-vs-spec reconciliation (per LESSONS 2026-06-05 "groomer prose can
+disagree with the schema; the schema wins"):
+
+- **Budget cap (0021)**: the spec calls for a "daily_budget_usd"-style
+  column on `project`, but the actual producer (`src/control.ts`
+  `set-budget` action + `src/budget_guard.ts` `parseCap`) reads
+  `MAX_DAILY_USD` from the project's `agents.config.sh` manifest, parsed
+  into `project.cadence_json.max_daily_usd`. There is NO column on
+  `project` named `daily_budget_usd`. The wizard wires through
+  `doAction(db, "local", "set-budget", { slug, max_daily_usd })` per
+  project — the SAME helper the portal's per-project budget control
+  invokes. No parallel storage.
+- **Quiet hours (0030)**: the spec is right; the key under
+  `fleet-control.config.json` is `quietHours: { start, end, tz }` (see
+  `src/config.ts` + `src/quiet_hours.ts` consumers). The wizard does a
+  read-merge-write so other config keys (`adminToken`, `projectRoots`,
+  `ntfyTopic`, etc.) are preserved.
+- **Token mint (0003)**: the wizard reads the existing token from
+  `fleet-control.config.json`'s `adminToken` field if present (matches
+  the welcome banner's resolver in `bin/fleetctl.ts` `serve` case). If
+  absent, it mints a fresh admin-scoped token via `auth.mintToken(db,
+  "onboard", "admin")` and writes it back to `fleet-control.config.json`
+  so the next `serve` boot picks it up.
+- **LAN + QR (0032)**: reuses `discoverLanUrl(host, port)` and
+  `renderQrAscii(text)` directly. No parallel encoder.
+- **Doctor liveness probe (0016)**: the wizard's `isServeRunning` check
+  uses the same loopback HTTP probe `checkAdminSocket` uses — a `GET
+  http://127.0.0.1:7070/api/health` via `node:http`. We don't import
+  `checkAdminSocket` because it returns a `DoctorCheck` shape; the
+  underlying primitive is a one-shot fetch and we just inline that
+  shape into the deps surface.
+- **Welcome checklist (0024)**: the spec asks for "checklist X/Y done"
+  read via the same helper the 0024 banner uses. The 0024 banner
+  enumerates 5 prescribed steps (open portal / loopback auth / add
+  project / fleetctl doctor / live tail); it does NOT track per-step
+  state. The wizard computes a derived count: step 3 ("add project") is
+  "done" when at least one project is registered after the wizard's
+  Step 1/2; the other 4 are always "available". So a fresh wizard run
+  with at least one project registered prints "5/5"; a wizard with zero
+  projects registered prints "4/5". This keeps the X/Y number
+  meaningful without inventing a parallel `welcome_checklist` table.
+
+Per LESSONS 2026-05-29 "when a CLI subcommand adds boot output, take
+ownership of the listen banner": the onboard subcommand owns its full
+stdout. The `startServeInBackground` helper does NOT inherit stdout from
+the wizard — it daemonises via the same `installDaemon()` path (launchd
+plist) so the wizard's stdout is the wizard's, end-of-story.
+
+Per LESSONS § "shell-out modules need an injectable runner for tests":
+every side effect routes through `OnboardDeps`. Production wires
+`productionDeps()`; tests pass a stub object with scripted stdin reads
+and recording stubs.
+
+Per LESSONS § "in-process dedup sets need an explicit reset hook for
+tests": `_resetOnboardForTests()` is exported; it clears the
+module-level "have we run onboard in this process" flag the idempotency
+AC needs.
