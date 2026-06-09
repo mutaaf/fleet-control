@@ -20,6 +20,7 @@ import {
 } from "../src/receipts.ts";
 import { doAction } from "../src/control.ts";
 import { defaultDeps, runDoctor, renderHuman, renderJson, exitCodeFor } from "../src/doctor.ts";
+import { runOnboard, productionDeps as onboardProductionDeps, parseOnboardArgs, ONBOARD_HELP } from "../src/onboard.ts";
 import { loadDemoFixture, DEMO_BANNER, DEMO_DEFAULT_PORT } from "../src/demo/fixture.ts";
 import { firstRun, sentinelPathFor, type WelcomeOpts, type WelcomeDeps } from "../src/welcome.ts";
 import { discoverLanUrl } from "../src/lan.ts";
@@ -676,6 +677,33 @@ switch (cmd) {
     process.on("SIGTERM", teardown);
     break;
   }
+  case "onboard": {
+    // `fleetctl onboard [--non-interactive] [--skip <list>] [--help]` —
+    // interactive wizard (ticket 0046). Composes existing helpers
+    // (0010 register-url, 0021 budget, 0030 quiet hours, 0032 LAN+QR,
+    // 0003 token mint, 0016 doctor liveness probe, 0024 welcome
+    // checklist). Per LESSONS 2026-05-29 "when a CLI subcommand adds
+    // boot output, take ownership of the listen banner" — the onboard
+    // branch owns its full stdout; no other module prints during the
+    // wizard.
+    const parsed = parseOnboardArgs(argv.slice(1));
+    if (parsed.help) {
+      process.stdout.write(ONBOARD_HELP);
+      break;
+    }
+    try {
+      const deps = onboardProductionDeps(db, {
+        nonInteractive: parsed.nonInteractive,
+        skip: parsed.skip,
+      });
+      await runOnboard(deps);
+      process.exitCode = 0;
+    } catch (e: any) {
+      process.stderr.write(`onboard: crashed — ${String(e?.message ?? e)}\n`);
+      process.exitCode = 2;
+    }
+    break;
+  }
   case "doctor": {
     // `fleetctl doctor [--json]` — one-shot install + ingest diagnostic
     // (ticket 0016). Wraps runDoctor() in a try/catch so a doctor crash
@@ -696,6 +724,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|doctor [--json]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|doctor [--json]|onboard [--non-interactive] [--skip <list>] [--help]]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run" && cmd !== "demo") db.close();
