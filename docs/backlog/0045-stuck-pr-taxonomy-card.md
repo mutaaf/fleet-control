@@ -1,7 +1,7 @@
 ---
 id: 0045
 title: Stuck-PR taxonomy card - label every open agent PR so the operator knows whether to intervene or wait
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-09
@@ -480,4 +480,25 @@ this ticket must do the same audit BEFORE writing the SELECT).
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-09 (in-progress): producer-vs-spec reconciliation grepped
+  `src/ingest/prs.ts`:
+  - `pr.state`: `'open'` lowercase (line 164) + `'MERGED'` uppercase
+    (the prs ingester deletes on every pass and only inserts state
+    `'open'`; the merged casing is established by sibling helpers
+    `costPerMergedPr` / `spendEfficiencyRanking` / `fridayWrap`).
+  - `pr.ci_state`: one of `'red' | 'pending' | 'green' | 'none'`
+    (lowercase from `ciState()` in `src/ingest/prs.ts`, NOT GitHub
+    rollup tokens).
+  - check-rollup count: the producer DOES NOT persist a numeric
+    rollup count column on `pr`. The signal "zero check-runs" is
+    encoded via `ci_state = 'none'` (per `ciState()`'s `!Array
+    .isArray(rollup) || !rollup.length` branch). The taxonomy
+    helper therefore reads `ci_state = 'none'` as the ci_absent
+    bucket condition.
+  - `pr.merge_state` stores `mergeStateStatus` verbatim from `gh`
+    (e.g. `'CLEAN'`, `'BEHIND'`, `'DIRTY'`) - uppercase.
+  - `pr.autoMergeRequest` is NOT persisted to the schema; the
+    "auto-merge armed" evidence cue therefore degrades to
+    `"CLEAN + green"` (the AC2 #6 fallback string) until a future
+    ticket persists the field.
+- 2026-06-09: helper, route, cache, SPA renderer added per ACs.

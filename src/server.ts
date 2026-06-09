@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -608,6 +608,94 @@ function getSpendEfficiencyCached(
   spendEfficiencyCache.set(String(windowDays), {
     tuple, value, expires_at: Date.now() + SPEND_EFFICIENCY_TTL_MS,
   });
+  return value;
+}
+
+// Ticket 0045: "Stuck-PR taxonomy" memo cache.
+//
+// 30s TTL (matches Cache-Control: max-age=30 — any of the seven
+// inputs can shift the verdict on the next tick). The cache is
+// invalidated by a THREE-VALUE tuple:
+//
+//   - openPrMaxFetchedAt = SELECT MAX(fetched_at) FROM pr
+//                           WHERE state='open' AND is_agent=1
+//   - openPrCount        = SELECT COUNT(*)        FROM pr
+//                           WHERE state='open' AND is_agent=1
+//   - latestHealTs       = SELECT MAX(ts)         FROM control_audit
+//                           WHERE action='heal'
+//
+// The `pr` table has no surrogate id (PK is (project_id, number)) so
+// we proxy "fresh open-PR row landed" via the (MAX(fetched_at),
+// COUNT(*)) pair (per LESSONS 2026-06-07 "the `pr` table has no
+// surrogate id; proxy 'latest landed' via (MAX(fetched_at), COUNT(*))")
+// — either side moving busts the cache. The third tuple value
+// captures every new heal-audit row, so a fresh heal (which can
+// shift a PR from ci_red to needs_human) also busts the cache.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetStuckPrTaxonomyCacheForTests()`. Per
+// LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap" we also expose
+// `_getStuckPrTaxonomyCacheBuildsForTests()`; it ticks on every
+// cache MISS so route tests assert hit/miss semantics without
+// stubbing SQL. Production code never reads either.
+interface StuckPrTaxonomyCacheEntry {
+  tuple: string;
+  value: StuckPrTaxonomy & { quiet_hours_active: boolean };
+  expires_at: number;
+}
+const STUCK_PR_TAXONOMY_TTL_MS = 30_000;
+let stuckPrTaxonomyCache: StuckPrTaxonomyCacheEntry | null = null;
+let stuckPrTaxonomyBuildCounter = 0;
+
+export function _resetStuckPrTaxonomyCacheForTests(): void {
+  stuckPrTaxonomyCache = null;
+  stuckPrTaxonomyBuildCounter = 0;
+}
+
+export function _getStuckPrTaxonomyCacheBuildsForTests(): number {
+  return stuckPrTaxonomyBuildCounter;
+}
+
+interface StuckPrOpenSummaryRow { mx: string | null; c: number | null; }
+interface StuckPrLatestHealRow { t: string | null; }
+
+function stuckPrTaxonomyInvalidationTuple(db: DB): string {
+  const openRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c "
+    + "  FROM pr WHERE state = 'open' AND is_agent = 1",
+  ).get() as unknown as StuckPrOpenSummaryRow | undefined;
+  const healRow = db.prepare(
+    "SELECT MAX(ts) AS t FROM control_audit WHERE action = 'heal'",
+  ).get() as unknown as StuckPrLatestHealRow | undefined;
+  const mx = openRow?.mx ?? "";
+  const c = Number(openRow?.c ?? 0);
+  const t = healRow?.t ?? "";
+  return `${mx}|${c}|${t}`;
+}
+
+function getStuckPrTaxonomyCached(
+  db: DB, cfg: FleetConfig, now: Date,
+): StuckPrTaxonomy & { quiet_hours_active: boolean } {
+  const tuple = stuckPrTaxonomyInvalidationTuple(db);
+  if (
+    stuckPrTaxonomyCache
+    && stuckPrTaxonomyCache.tuple === tuple
+    && stuckPrTaxonomyCache.expires_at > Date.now()
+  ) {
+    return stuckPrTaxonomyCache.value;
+  }
+  stuckPrTaxonomyBuildCounter += 1;
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const inner = stuckPrTaxonomy(db, now);
+  // Surface quiet_hours_active in the payload so the SPA can hide the
+  // infra_flake / merging / healthy_waiting rows overnight per AC6
+  // (the 0030 pull-vs-push contract: information visible, noise
+  // demoted — the action-urgent rows still render).
+  const value = { ...inner, quiet_hours_active: quiet };
+  stuckPrTaxonomyCache = {
+    tuple, value, expires_at: Date.now() + STUCK_PR_TAXONOMY_TTL_MS,
+  };
   return value;
 }
 
@@ -1317,6 +1405,24 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=900",
+          });
+          return res.end(body);
+        }
+        // Ticket 0045: stuck-PR taxonomy card. Labels every open agent
+        // PR with one of seven taxonomy buckets so the operator knows
+        // whether to intervene or wait. Pure composition over pr +
+        // project + control_audit; no schema migration. 30s memo
+        // cache keyed by (MAX(pr.fetched_at), COUNT(*), MAX(audit.ts))
+        // — any of the three moving busts the cache on the next call.
+        // Quiet-hours suppression (AC6) is signalled via
+        // `quiet_hours_active`; the SPA hides non-urgent rows.
+        if (path === "/api/fleet/stuck-pr-taxonomy") {
+          const v = getStuckPrTaxonomyCached(db, cfg, new Date());
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=30",
           });
           return res.end(body);
         }

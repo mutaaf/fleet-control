@@ -1034,6 +1034,106 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .spend-efficiency-leaderboard td { padding: 5px 10px; }
 }
 
+/* Ticket 0045: stuck-PR taxonomy card. One row per open agent PR
+ * ordered by urgency rank; the bucket-label chip is colour-coded so
+ * the operator's eye snaps to needs_human / ci_red rows first. Phone
+ * layout (default <600px): rows stack vertically (bucket -> slug ->
+ * evidence -> action), merging + healthy_waiting rows are hidden
+ * behind a "+N healthy or merging" toggle button. Desktop (>=600px):
+ * each row renders inline. Reuses --bad / --warn / --good / --dim
+ * palette tokens — no new variables. */
+.stuck-pr-taxonomy-card {
+  margin: 14px 0;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.stuck-pr-head { display: flex; justify-content: space-between; align-items: baseline; }
+.stuck-pr-title-head { font-size: 14px; }
+.stuck-pr-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel2, transparent);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.stuck-pr-row-needs_human { border-left-color: var(--bad); }
+.stuck-pr-row-ci_red,
+.stuck-pr-row-ci_absent,
+.stuck-pr-row-account_suspended { border-left-color: var(--warn); }
+.stuck-pr-row-infra_flake { border-left-color: var(--accent); }
+.stuck-pr-row-merging { border-left-color: var(--good); }
+.stuck-pr-row-healthy_waiting { border-left-color: var(--dim); }
+.stuck-pr-bucket {
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.stuck-pr-bucket-needs_human { color: var(--bad); }
+.stuck-pr-bucket-ci_red,
+.stuck-pr-bucket-ci_absent,
+.stuck-pr-bucket-account_suspended { color: var(--warn); }
+.stuck-pr-bucket-infra_flake { color: var(--accent); }
+.stuck-pr-bucket-merging { color: var(--good); }
+.stuck-pr-bucket-healthy_waiting { color: var(--dim); }
+.stuck-pr-slug b { color: var(--ink); font-weight: 600; }
+.stuck-pr-title { margin-left: 4px; font-size: 12px; }
+.stuck-pr-evidence { font-size: 12px; }
+.stuck-pr-action {
+  color: var(--accent);
+  font-size: 12.5px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.stuck-pr-action:hover { text-decoration: underline; }
+.stuck-pr-mobile-toggle {
+  display: none;
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: var(--r);
+  cursor: pointer;
+  align-self: flex-start;
+}
+/* Phone: hide the merging + healthy_waiting rows behind the toggle;
+ * tapping the toggle adds .stuck-pr-expanded to the card and reveals
+ * them inline. Action-urgent rows (needs_human / ci_* / infra_flake /
+ * account_suspended) stay visible at all viewport widths. */
+@media (max-width: 599px) {
+  .stuck-pr-taxonomy-card .stuck-pr-row[data-bucket="merging"],
+  .stuck-pr-taxonomy-card .stuck-pr-row[data-bucket="healthy_waiting"] {
+    display: none;
+  }
+  .stuck-pr-taxonomy-card.stuck-pr-expanded .stuck-pr-row[data-bucket="merging"],
+  .stuck-pr-taxonomy-card.stuck-pr-expanded .stuck-pr-row[data-bucket="healthy_waiting"] {
+    display: flex;
+  }
+  .stuck-pr-mobile-toggle { display: inline-block; }
+}
+@media (min-width: 600px) {
+  .stuck-pr-taxonomy-card { padding: 16px 18px; }
+  .stuck-pr-row {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .stuck-pr-bucket { min-width: 130px; }
+  .stuck-pr-evidence { flex: 1 1 auto; }
+}
+
 /* Ticket 0034: self-baseline drift detail view. Three rows stacked
  * single-column on phones; each row carries the metric label, the
  * baseline mean/sigma + current value as a numeric line, and an

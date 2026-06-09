@@ -4475,3 +4475,316 @@ export function spendEfficiencyRanking(
     generated_at: now.toISOString(),
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Stuck-PR taxonomy card (ticket 0045).
+//
+// Label every open agent PR with EXACTLY ONE of seven taxonomy buckets
+// so the operator knows whether to intervene or wait. Pure composition
+// over already-shipped data (`pr`, `project`, `control_audit`,
+// `classifyPrFailure`). No schema migration.
+//
+// Producer reconciliation (per LESSONS 2026-06-05 "groomer prose can
+// disagree with the schema; the schema wins"):
+//   - open agent PRs: `pr.state = 'open' AND pr.is_agent = 1` (the
+//     production ingester writes lowercase `'open'` — see
+//     src/ingest/prs.ts line 164; same casing `riskiestOpenPr` uses).
+//   - `pr.ci_state`: one of `'red' | 'pending' | 'green' | 'none'`
+//     (lowercase, from `ciState()` in src/ingest/prs.ts). NOT GitHub
+//     rollup tokens.
+//   - `pr.merge_state`: stores `mergeStateStatus` verbatim from gh
+//     (uppercase tokens like `'CLEAN'`, `'BEHIND'`, `'DIRTY'`).
+//   - check-rollup count: the producer does NOT persist a numeric
+//     rollup count. The "zero check-runs" signal is encoded as
+//     `ci_state = 'none'` (per `ciState()`'s "no rollup → 'none'"
+//     branch). The taxonomy uses that as the ci_absent condition.
+//   - `autoMergeRequest`: not persisted today — the merging-bucket
+//     evidence degrades to "CLEAN + green" (no "+ auto-merge armed"
+//     suffix) until a future ticket adds the column.
+//
+// Bucket cascade (top-down; first match wins so the operator sees the
+// strongest signal):
+//   1. needs_human       — heal_attempts >= 2 (AGENTS.md ceiling)
+//   2. account_suspended — latest heal-audit stdout_tail matches
+//                          /account is suspended/i
+//   3. infra_flake       — classifyPrFailure.kind === 'infra_flake'
+//   4. ci_red            — ci_state === 'red'
+//   5. ci_absent         — ci_state === 'none' AND fetched_at >= 5
+//                          minutes ago (avoid flagging a fresh PR)
+//   6. merging           — merge_state === 'CLEAN' AND ci_state ===
+//                          'green'
+//   7. healthy_waiting   — default; heal_attempts === 0 AND age < 6h
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing uses the double-cast.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// SQL strings stay plain concatenation; identifiers are unquoted
+// single words.
+// Per AGENTS.md § "Never compose a shell string from input" — and its
+// SQL analogue: every WHERE filter is a parameterised `?` placeholder.
+
+export type StuckPrBucket =
+  | "needs_human"
+  | "ci_red"
+  | "ci_absent"
+  | "infra_flake"
+  | "account_suspended"
+  | "merging"
+  | "healthy_waiting";
+
+export interface StuckPrTaxonomyRow {
+  project_slug: string;
+  project_name: string;
+  pr_number: number;
+  pr_title: string;
+  pr_url: string;
+  bucket: StuckPrBucket;
+  evidence: string;
+  next_action: string;
+  heal_attempts: number;
+  age_hours: number;
+  urgency_rank: number;
+}
+
+export interface StuckPrTaxonomy {
+  open_count: number;
+  by_bucket: Record<StuckPrBucket, number>;
+  rows: StuckPrTaxonomyRow[];
+  generated_at: string;
+}
+
+const BUCKET_URGENCY: Record<StuckPrBucket, number> = {
+  needs_human: 0,
+  ci_red: 1,
+  ci_absent: 2,
+  infra_flake: 3,
+  account_suspended: 4,
+  merging: 5,
+  healthy_waiting: 6,
+};
+
+const BUCKET_NEXT_ACTION: Record<StuckPrBucket, string> = {
+  needs_human: "open & fix",
+  ci_red: "review the check log",
+  ci_absent: "close + reopen to re-fire webhook",
+  infra_flake: "wait (loop retries)",
+  account_suspended: "external - wait or escalate to human",
+  merging: "leave it",
+  healthy_waiting: "leave it (or review)",
+};
+
+/** Zeroed bucket histogram (every key present so the SPA never needs
+ *  a "is the key defined" check). */
+function zeroBuckets(): Record<StuckPrBucket, number> {
+  return {
+    needs_human: 0, ci_red: 0, ci_absent: 0, infra_flake: 0,
+    account_suspended: 0, merging: 0, healthy_waiting: 0,
+  };
+}
+
+interface StuckPrRowInternal {
+  project_slug: string;
+  project_name: string | null;
+  project_id: number;
+  pr_number: number;
+  pr_title: string | null;
+  pr_url: string | null;
+  ci_state: string | null;
+  merge_state: string | null;
+  first_fail_check: string | null;
+  heal_attempts: number | null;
+  fetched_at: string | null;
+}
+
+interface StuckPrAuditTailRow { stdout_tail: string | null; }
+
+/** Format an age string ("12m ago", "3h ago", "2d ago"). Integer
+ *  bucket — the operator reads this at a glance, not as a stopwatch. */
+function formatAge(ageHours: number, ageMinutes: number): string {
+  if (ageHours >= 24) return `${Math.floor(ageHours / 24)}d ago`;
+  if (ageHours >= 1) return `${ageHours}h ago`;
+  return `${Math.max(0, ageMinutes)}m ago`;
+}
+
+/** Compute the stuck-PR taxonomy for every open agent PR.
+ *
+ *  Per the AC cascade: evaluate top-down, first match wins. `now` is
+ *  the wall-clock anchor for age math (tests pin it; production
+ *  passes `new Date()`).
+ *
+ *  Single JOIN over `pr + project`. Per-row helper calls are bounded
+ *  by N (typically <50): one `classifyPrFailure` (already memoises
+ *  the heal-audit lookup internally per call) + one latest-heal-audit
+ *  fetch for the account_suspended scan. The perf AC (50 PRs under
+ *  35ms) is comfortably below the per-call cost. */
+export function stuckPrTaxonomy(db: DB, now: Date = new Date()): StuckPrTaxonomy {
+  const generatedAt = now.toISOString();
+
+  const rows = db.prepare(
+    "SELECT "
+    + "  p.slug AS project_slug, p.name AS project_name, p.id AS project_id, "
+    + "  pr.number AS pr_number, pr.title AS pr_title, pr.url AS pr_url, "
+    + "  pr.ci_state AS ci_state, pr.merge_state AS merge_state, "
+    + "  pr.first_fail_check AS first_fail_check, "
+    + "  pr.heal_attempts AS heal_attempts, pr.fetched_at AS fetched_at "
+    + "FROM pr JOIN project p ON p.id = pr.project_id "
+    + "WHERE pr.state = 'open' AND pr.is_agent = 1",
+  ).all() as unknown as StuckPrRowInternal[];
+
+  const byBucket = zeroBuckets();
+  if (rows.length === 0) {
+    return {
+      open_count: 0,
+      by_bucket: byBucket,
+      rows: [],
+      generated_at: generatedAt,
+    };
+  }
+
+  // Account-suspended scan needs the latest heal-audit per PR. We
+  // collect them in a single query rather than N lookups so the perf
+  // AC stays comfortable.
+  const latestHealByPr = new Map<number, string>();
+  const auditRows = db.prepare(
+    "SELECT target, stdout_tail FROM control_audit "
+    + " WHERE action = 'heal' "
+    + " AND id IN (SELECT MAX(id) FROM control_audit "
+    + "            WHERE action = 'heal' GROUP BY target)",
+  ).all() as unknown as Array<{ target: string | null; stdout_tail: string | null }>;
+  for (const r of auditRows) {
+    const t = String(r.target ?? "");
+    const m = t.match(/^pr-(\d+)$/);
+    if (m && r.stdout_tail) {
+      latestHealByPr.set(Number(m[1]), String(r.stdout_tail));
+    }
+  }
+
+  const ACCOUNT_SUSPENDED_RE = /account is suspended/i;
+
+  const out: StuckPrTaxonomyRow[] = [];
+  for (const r of rows) {
+    // Age: integer ms diff → hours + minutes. Negative (clock-skew →
+    // future fetched_at) clamps to 0.
+    let ageHours = 0;
+    let ageMinutes = 0;
+    let ageMs = 0;
+    if (r.fetched_at) {
+      ageMs = now.getTime() - new Date(r.fetched_at).getTime();
+      if (ageMs > 0) {
+        ageHours = Math.floor(ageMs / 3600_000);
+        ageMinutes = Math.floor(ageMs / 60_000);
+      }
+    }
+    const ageStr = formatAge(ageHours, ageMinutes);
+    const heal = Math.max(0, Number(r.heal_attempts ?? 0) || 0);
+    const ci = String(r.ci_state ?? "");
+    const mergeState = String(r.merge_state ?? "");
+    const tail = latestHealByPr.get(r.pr_number) ?? null;
+    const healCount = countHealAuditsForPr(db, r.pr_number);
+
+    // Cascade. First match wins. The classifyPrFailure call is shared
+    // across cases 2/3 so we do it once.
+    const cls = classifyPrFailure(db, r.project_id, r.pr_number);
+
+    let bucket: StuckPrBucket;
+    let evidence: string;
+
+    // 1. needs_human: heal cap exceeded (>= 2). The cap is a ceiling;
+    //    a third heal still keeps the PR here (edge case AC8) with
+    //    "(over cap)" suffix.
+    if (heal >= 2) {
+      bucket = "needs_human";
+      const overCap = heal > 2 ? " (over cap)" : " (cap)";
+      const kindLabel = cls.kind === "infra_flake" && cls.detail
+        ? `infra_flake (${cls.detail})`
+        : cls.kind;
+      evidence = `${heal} heals${overCap}, latest: ${kindLabel}`;
+    }
+    // 2. account_suspended: latest heal stdout matches the regex.
+    else if (tail && ACCOUNT_SUSPENDED_RE.test(tail)) {
+      bucket = "account_suspended";
+      evidence = `GitHub account suspended, retried ${healCount}x`;
+    }
+    // 3. infra_flake: classifier says so. Reuse the 0040 helper
+    //    unchanged (Out of scope: no new patterns).
+    else if (cls.kind === "infra_flake") {
+      bucket = "infra_flake";
+      const detail = cls.detail ?? "infra-flake match";
+      const healPlural = heal === 1 ? "heal" : "heals";
+      evidence = `${detail}, ${heal} ${healPlural}`;
+    }
+    // 4. ci_red: producer's lowercase 'red' token.
+    else if (ci === "red") {
+      bucket = "ci_red";
+      const checkName = r.first_fail_check ? String(r.first_fail_check) : "red check";
+      evidence = checkName;
+    }
+    // 5. ci_absent: ci_state === 'none' AND fetched_at >= 5 minutes
+    //    ago. The producer's `ciState()` writes 'none' when the
+    //    rollup is empty (the ingester's "no checks queued" signal).
+    //    The 5-min floor avoids flagging a PR opened 30s ago (per
+    //    LESSONS 2026-05-26 "GH Actions doesn't fire on a fresh PR").
+    else if (ci === "none" && ageMs >= 5 * 60_000) {
+      bucket = "ci_absent";
+      evidence = `pushed ${ageStr}, no checks queued`;
+    }
+    // 6. merging: merge_state === 'CLEAN' (uppercase per gh) AND
+    //    ci_state === 'green'. The autoMergeRequest field is NOT
+    //    persisted today; evidence degrades to "CLEAN + green".
+    else if (mergeState === "CLEAN" && ci === "green") {
+      bucket = "merging";
+      evidence = "CLEAN + green";
+    }
+    // 7. healthy_waiting (default): no heals AND age < 6h. When none
+    //    of the above fires and the row doesn't fit the healthy
+    //    template (heals=0 + age<6h), fall through with "no signal".
+    else if (heal === 0 && ageHours < 6) {
+      bucket = "healthy_waiting";
+      evidence = `${ageStr} old, awaiting review`;
+    } else {
+      bucket = "healthy_waiting";
+      evidence = "no signal";
+    }
+
+    byBucket[bucket] += 1;
+    out.push({
+      project_slug: r.project_slug,
+      project_name: r.project_name ?? r.project_slug,
+      pr_number: r.pr_number,
+      pr_title: r.pr_title ?? "",
+      pr_url: r.pr_url ?? "",
+      bucket,
+      evidence,
+      next_action: BUCKET_NEXT_ACTION[bucket],
+      heal_attempts: heal,
+      age_hours: ageHours,
+      urgency_rank: BUCKET_URGENCY[bucket],
+    });
+  }
+
+  // Sort: urgency_rank ASC, then age_hours DESC within bucket; stable
+  // final tiebreak by pr_number ASC for deterministic re-renders.
+  out.sort((a, b) => {
+    if (a.urgency_rank !== b.urgency_rank) return a.urgency_rank - b.urgency_rank;
+    if (b.age_hours !== a.age_hours) return b.age_hours - a.age_hours;
+    return a.pr_number - b.pr_number;
+  });
+
+  return {
+    open_count: rows.length,
+    by_bucket: byBucket,
+    rows: out,
+    generated_at: generatedAt,
+  };
+}
+
+/** Count heal-audit rows for a given PR (every retry, not just the
+ *  latest). Used by the account_suspended evidence string so the
+ *  operator sees "retried 3x" instead of a flat "1x". */
+function countHealAuditsForPr(db: DB, prNumber: number): number {
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c FROM control_audit "
+    + " WHERE action = 'heal' AND target = ?",
+  ).get(`pr-${prNumber}`) as unknown as { c: number | null } | undefined;
+  return Number(row?.c ?? 0);
+}
