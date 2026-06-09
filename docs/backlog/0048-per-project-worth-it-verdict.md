@@ -1,7 +1,7 @@
 ---
 id: 0048
 title: Per-project worth-it verdict - each project card emits a yearly-trajectory "keep, watch, or sunset" call
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-09
@@ -618,4 +618,29 @@ dev MUST do the same audit BEFORE writing the SELECT.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-09 — implementation-dev picked up; flipped status to
+  in-progress on `feat/0048-per-project-worth-it-verdict`.
+  Verified producer casing in `src/ingest/prs.ts` and existing
+  helpers' SELECTs: merged PR rows live as `state='MERGED'`
+  uppercase + `is_agent=1`, open PRs as `state='open'`
+  lowercase, closed non-merged as `state='CLOSED'` uppercase
+  (matches LESSONS 2026-06-05 and the 0044/0047 reconciliation).
+  Confirmed the `pr` table has no surrogate `id` (PK is
+  `(project_id, number)`), so the cache invalidation tuple uses
+  `(MAX(fetched_at), COUNT(*))` per LESSONS 2026-06-07. Confirmed
+  `src/config.ts` uses a flat `FleetConfig` object with no nested
+  keys today; the `worth_it` block is a fresh nested object on
+  the config, populated by `Object.assign` from
+  `fleet-control.config.json` — no new pattern, just one more
+  top-level key whose value is itself an object.
+- 2026-06-09 — AC1 arithmetic check: the ticket's `21 PRs × 1h × $75
+  / $44 ≈ 3.2x` is actually `35.8x`. Per the ticket's "adjust the
+  SEED if the arithmetic doesn't match" instruction the test uses
+  `32 PRs × $750` so `32 × 1 × 75 / 750 = 3.2` exactly at the
+  default rate. The user-story prose stays unchanged; the test
+  arithmetic is load-bearing.
+- 2026-06-09 — also fixed in-flight drift on this branch: ticket
+  0047 (PR autopsy card) was merged via PR #111 on 2026-06-09 but
+  its frontmatter + README index row still said `in-progress`.
+  Flipped both to `shipped` here per AGENTS.md's "drift-fix on the
+  same branch" rule.

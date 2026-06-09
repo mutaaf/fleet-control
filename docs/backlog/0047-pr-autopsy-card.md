@@ -1,7 +1,7 @@
 ---
 id: 0047
 title: PR autopsy card - surface why each non-merged PR died and which signal would have predicted it
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-09
