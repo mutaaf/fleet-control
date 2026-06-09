@@ -856,6 +856,17 @@ async function fetchStuckPrTaxonomy() {
   try { return await get("/api/fleet/stuck-pr-taxonomy"); } catch { return null; }
 }
 
+// Ticket 0047: PR autopsy card. Lazy-fetched from
+// /api/fleet/pr-autopsies; errors fall through silently so the rest of
+// the home page still loads when the endpoint is unreachable. The
+// 10-min server-side cache (matching Cache-Control: max-age=600) keeps
+// the round-trip cheap on poll re-renders — autopsies are historical
+// and only change when a PR closes (the ingest pass busts the cache
+// via the globalThis hook the moment that happens).
+async function fetchPrAutopsies() {
+  try { return await get("/api/fleet/pr-autopsies"); } catch { return null; }
+}
+
 /** Skeleton block shown while /api/fleet/glance is in flight. Carries
  *  `aria-busy="true"` so screen readers announce the loading state;
  *  the pulsing animation flattens under
@@ -1314,6 +1325,144 @@ function renderSpendEfficiencyCard(data) {
     <table class="spend-efficiency-leaderboard">
       <tbody>${rows}</tbody>
     </table>
+  </div>`;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0047: PR autopsy card.
+//
+// Inline card on the home page (BELOW the 0040 riskiest-PR badge,
+// BELOW the 0045 stuck-PR taxonomy card, ABOVE the 0044 spend-
+// efficiency card). One row per non-merged PR close in the last 7
+// days. Each row carries:
+//   - cause-of-death label (color-coded — red for cap_reached,
+//     orange for infra_blocked_giveup, neutral for everything else)
+//   - slug + #number + age-since-close
+//   - riskiness_breakdown line ("red_test x 2 heals, 23h old")
+//   - heal count + latest_fail line
+//   - "Lesson credited: <headline> (<N> prior saves)" or
+//     "Lesson credited: NONE - failure mode is novel"
+//   - verdict line
+//   - (when draft_lesson is set AND quiet hours are NOT active)
+//     "[draft entry →]" tap-target → /lessons?draft=<base64>
+//
+// Render rules:
+//   - total_closes === 0          → return "" (no DOM, no testid)
+//   - quiet_hours_active === true → hide every draft-entry link
+//     (the rest of the card renders normally per the 0030 pull-vs-
+//     push contract — verdicts visible, action prompts suppressed)
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string (pr_title,
+// latest_fail_detail, verdict, draft_lesson, riskiness_breakdown)
+// passes through redactSecrets before HTML insertion. Stdout-derived
+// substrings (latest_fail_detail in particular) make this a real
+// risk — the redaction pass is the silent backstop.
+// ────────────────────────────────────────────────────────────────────
+
+const PR_AUTOPSY_CAUSE_LABEL = {
+  cap_reached: "cap_reached",
+  infra_blocked_giveup: "infra_blocked_giveup",
+  human_rejected: "human_rejected",
+  force_closed_stale: "force_closed_stale",
+  unknown: "unknown",
+};
+
+/** Format closed-age like "18h ago", "3d ago", "2h ago". Integer
+ *  bucket — the operator reads at a glance. */
+function _autopsyAgeLabel(hours) {
+  const h = Math.max(0, Number(hours) || 0);
+  if (h >= 24) return Math.floor(h / 24) + "d ago";
+  if (h >= 1) return h + "h ago";
+  return "just now";
+}
+
+/** base64-encode a UTF-8 string the safest way the SPA can. btoa
+ *  doesn't handle non-ASCII directly, so we route through
+ *  TextEncoder + String.fromCharCode. Used to pack the draft-lesson
+ *  skeleton into a URL query param (AC9). */
+function _autopsyBase64Encode(s) {
+  try {
+    const bytes = new TextEncoder().encode(String(s));
+    let bin = "";
+    for (const b of bytes) bin += String.fromCharCode(b);
+    // SPA-side btoa always exists in modern browsers and node v25.
+    return btoa(bin);
+  } catch {
+    // Fallback: lossy — escape the string and try plain btoa. The
+    // lessons page tolerates either shape (it base64-decodes
+    // defensively and falls back to the raw text on decode failure).
+    try { return btoa(unescape(encodeURIComponent(String(s)))); }
+    catch { return ""; }
+  }
+}
+
+function renderPrAutopsyCard(data) {
+  if (!data) return "";
+  const totalCloses = Number(data.total_closes || 0);
+  if (totalCloses === 0) return "";
+  const allRows = Array.isArray(data.rows) ? data.rows : [];
+  if (allRows.length === 0) return "";
+  const windowDays = Number(data.window_days || 7);
+  const quietHoursActive = !!data.quiet_hours_active;
+  // Title: "PR autopsies (last 7 days, 2 closes)". The numbers route
+  // through redactSecrets defensively even though they're integers.
+  const titleText = `PR autopsies (last ${windowDays} days, ${totalCloses} close${totalCloses === 1 ? "" : "s"})`;
+  const safeTitle = esc(redactSecrets(titleText));
+
+  const rowHtml = allRows.map((r) => {
+    const cause = String(r.cause || "unknown");
+    const safeCause = esc(cause);
+    const causeLabel = esc(redactSecrets(PR_AUTOPSY_CAUSE_LABEL[cause] || cause));
+    const slug = String(r.project_slug || "");
+    const safeSlug = esc(redactSecrets(slug));
+    const num = Number(r.pr_number || 0);
+    const safeTitleStr = esc(redactSecrets(String(r.pr_title || "")));
+    const ageStr = esc(_autopsyAgeLabel(Number(r.closed_age_hours || 0)));
+    const safeBreakdown = esc(redactSecrets(String(r.riskiness_breakdown || "")));
+    const heals = Number(r.heal_attempts || 0);
+    const failKind = esc(redactSecrets(String(r.latest_fail_kind || "")));
+    const failDetailRaw = String(r.latest_fail_detail || "");
+    const failDetail = failDetailRaw
+      ? `: ${esc(redactSecrets(failDetailRaw))}`
+      : "";
+    const healsLine = `Heals: ${heals}, latest: ${failKind}${failDetail}`;
+    // Lesson credit line — populated row vs NONE row.
+    let creditLine;
+    if (r.lesson_credit) {
+      const headline = esc(redactSecrets(String(r.lesson_credit.headline || "")));
+      const priorSaves = Number(r.lesson_credit.prior_saves || 0);
+      creditLine = `Lesson credited: ${headline} (${priorSaves} prior save${priorSaves === 1 ? "" : "s"})`;
+    } else {
+      creditLine = "Lesson credited: NONE - failure mode is novel";
+    }
+    const safeCreditLine = esc(redactSecrets(creditLine));
+    const safeVerdict = esc(redactSecrets(String(r.verdict || "")));
+    // Draft-entry tap target: only when the server set a draft skeleton
+    // AND quiet hours are NOT active.
+    let draftLink = "";
+    if (r.draft_lesson && !quietHoursActive) {
+      const encoded = _autopsyBase64Encode(String(r.draft_lesson));
+      const href = `#/lessons?draft=${encodeURIComponent(encoded)}`;
+      draftLink = `<a class="pr-autopsy-draft" data-testid="draft-entry-link" href="${esc(href)}">[draft entry →]</a>`;
+    }
+    const rowTestid = `pr-autopsy-row-${safeSlug}-${num}`;
+    return `<div class="pr-autopsy-row pr-autopsy-row-${safeCause}" data-cause="${safeCause}" data-testid="${rowTestid}">
+      <span class="pr-autopsy-cause pr-autopsy-cause-${safeCause}">${causeLabel}</span>
+      <span class="pr-autopsy-slug"><b>${safeSlug}</b> #${num} <span class="dim">closed ${ageStr}</span>${safeTitleStr ? ` <span class="pr-autopsy-title dim">${safeTitleStr}</span>` : ""}</span>
+      <span class="pr-autopsy-breakdown dim">Riskiness at close: ${Number(r.riskiness_at_close || 0)} (${safeBreakdown})</span>
+      <span class="pr-autopsy-heals dim">${esc(redactSecrets(healsLine))}</span>
+      <span class="pr-autopsy-credit dim">${safeCreditLine}</span>
+      <span class="pr-autopsy-verdict">→ ${safeVerdict}</span>
+      ${draftLink}
+    </div>`;
+  }).join("");
+
+  return `<div class="pr-autopsy-card" data-testid="pr-autopsy-card">
+    <div class="pr-autopsy-head">
+      <span class="pr-autopsy-title-head"><b>${safeTitle}</b></span>
+    </div>
+    ${rowHtml}
   </div>`;
 }
 
@@ -2046,8 +2195,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(),
   ]);
   // Ticket 0043: fetch the new-since-visit diff using the additive
   // `previous_last_seen` field from /api/fleet (the PRE-upsert
@@ -2074,6 +2223,7 @@ async function home() {
     renderYesterdayGlance(glanceData) +
     renderRiskiestPr(riskiestPrData) +
     renderStuckPrTaxonomyCard(stuckPrTaxonomyData) +
+    renderPrAutopsyCard(prAutopsiesData) +
     renderSpendEfficiencyCard(spendEfficiencyData) +
     renderStreak(streakData) +
     renderInbox(inboxData) +
@@ -3677,6 +3827,23 @@ function decorateLessonRowsWithCredits(container, rollup) {
   }
 }
 
+/** base64-decode a UTF-8 string emitted by the 0047 autopsy card's
+ *  draft tap-target. Pairs with `_autopsyBase64Encode` above; tolerant
+ *  of malformed input — a decode failure returns null and the lessons
+ *  page renders without the suggested-entry textarea. */
+function _lessonsDecodeDraft(b64) {
+  if (!b64) return null;
+  try {
+    const bin = atob(String(b64));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    try { return decodeURIComponent(escape(atob(String(b64)))); }
+    catch { return null; }
+  }
+}
+
 async function lessons(params) {
   summary.innerHTML = `<a href="#/" class="dim">‹ all projects</a>`;
   let data = null;
@@ -3686,6 +3853,29 @@ async function lessons(params) {
   } catch (e) {
     app.innerHTML = `<div class="loading">couldn't load fleet lessons.<br><span class="dim">${esc(e.message)}</span></div>`;
     return;
+  }
+  // Ticket 0047: pre-populated LESSONS-entry draft from the autopsy
+  // card's "[draft entry →]" tap-target. The base64-decoded skeleton
+  // pre-fills a read-only-ish <textarea> at the top of the page; the
+  // operator copies, refines, and pastes into docs/LESSONS.md
+  // themselves (the autopsy NEVER writes to the file — see the
+  // ticket's Out of scope). Per LESSONS § "defence-in-depth secret
+  // redaction at the renderer boundary": the decoded text passes
+  // through redactSecrets before rendering so a token-shape
+  // substring (e.g. a heal log slipping into the draft body) is
+  // scrubbed at the boundary.
+  let draftHtml = "";
+  const rawDraft = (params && params.get && params.get("draft")) || "";
+  if (rawDraft) {
+    const decoded = _lessonsDecodeDraft(rawDraft);
+    if (decoded) {
+      const safeDraft = esc(redactSecrets(decoded));
+      draftHtml = `<div class="lesson-draft-block" data-testid="lesson-draft-block">
+        <div class="lesson-draft-eyebrow">Suggested entry</div>
+        <textarea class="lesson-draft-textarea" data-testid="lesson-draft-textarea" readonly rows="6">${safeDraft}</textarea>
+        <div class="dim lesson-draft-help">Review and paste into <code>docs/LESSONS.md</code> yourself — the autopsy never writes the file.</div>
+      </div>`;
+    }
   }
   // Lesson credit ledger (ticket 0042) — best-effort fetch. A failure
   // here MUST NOT block the lessons page rendering; absence of the
@@ -3723,6 +3913,7 @@ async function lessons(params) {
       </div>
       ${creditSummaryHtml}
     </div>
+    ${draftHtml}
     ${renderLessonsPage(data)}
   </div>`;
   foot.textContent = "";

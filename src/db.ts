@@ -350,6 +350,19 @@ export function openDb(path: string): DB {
     // LESSONS § no backticks inside template-literal SQL strings, the
     // identifier stays plain (no quoting needed for a single word).
     "ALTER TABLE pr ADD COLUMN heal_attempts INTEGER DEFAULT 0",
+    // ticket 0047: PR autopsy card. The pr table needs to carry a
+    // closed_at timestamp so non-merged closes can be windowed
+    // (`closed_at >= now - 7 days`) and ordered for the autopsy
+    // surface. Default NULL on legacy rows so existing readers
+    // (riskiestOpenPr, stuckPrTaxonomy, spendEfficiencyRanking,
+    // costPerMergedPr, fleetChangelog, fleetStreak) are unaffected —
+    // every one of them restricts by a single state value
+    // (`state = 'open'` or `state = 'MERGED'`) and never touches
+    // closed_at. The 0049 sibling ticket extends src/ingest/prs.ts to
+    // populate the column on every `--state closed` fetch. Per
+    // LESSONS § no backticks inside template-literal SQL strings,
+    // identifier stays plain.
+    "ALTER TABLE pr ADD COLUMN closed_at TEXT",
     // ticket 0027: the anomaly table grows one new column for
     // correlation tagging. The existing `kind` column (NOT NULL since
     // 0008) is reused for the new 'fleet_correlated' value — adding

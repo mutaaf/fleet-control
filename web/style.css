@@ -1134,6 +1134,116 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .stuck-pr-evidence { flex: 1 1 auto; }
 }
 
+/* Ticket 0047: PR autopsy card.
+ *
+ * Mobile-first layout: each row stacks vertically (cause label on top,
+ * evidence + verdict below). Color-coded left border per the AC spec:
+ *   - cap_reached         → --bad   (red — heal cap hit on real failures)
+ *   - infra_blocked_giveup → --warn  (amber — infra blocked recovery)
+ *   - everything else     → --dim   (neutral — human / stale / unknown)
+ *
+ * Desktop (>=600px): cause label aligns inline with the slug; the
+ * remaining evidence + verdict + draft link stack underneath. Reuses
+ * the existing --bad / --warn / --good / --dim / --accent palette
+ * tokens — NO new CSS variables. */
+.pr-autopsy-card {
+  margin: 14px 0;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.pr-autopsy-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.pr-autopsy-title-head { font-size: 14px; }
+.pr-autopsy-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel2, transparent);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.pr-autopsy-row-cap_reached { border-left-color: var(--bad); }
+.pr-autopsy-row-infra_blocked_giveup { border-left-color: var(--warn); }
+.pr-autopsy-row-human_rejected,
+.pr-autopsy-row-force_closed_stale,
+.pr-autopsy-row-unknown { border-left-color: var(--dim); }
+.pr-autopsy-cause {
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.pr-autopsy-cause-cap_reached { color: var(--bad); }
+.pr-autopsy-cause-infra_blocked_giveup { color: var(--warn); }
+.pr-autopsy-cause-human_rejected,
+.pr-autopsy-cause-force_closed_stale,
+.pr-autopsy-cause-unknown { color: var(--dim); }
+.pr-autopsy-slug b { color: var(--ink); font-weight: 600; }
+.pr-autopsy-title { margin-left: 4px; font-size: 12px; }
+.pr-autopsy-breakdown,
+.pr-autopsy-heals,
+.pr-autopsy-credit { font-size: 12px; }
+.pr-autopsy-verdict { color: var(--ink); font-size: 12.5px; }
+.pr-autopsy-draft {
+  color: var(--accent);
+  font-size: 12.5px;
+  text-decoration: none;
+  align-self: flex-start;
+  margin-top: 2px;
+}
+.pr-autopsy-draft:hover { text-decoration: underline; }
+@media (min-width: 600px) {
+  .pr-autopsy-card { padding: 16px 18px; }
+  .pr-autopsy-row { gap: 4px; }
+  .pr-autopsy-cause { min-width: 170px; }
+}
+
+/* Ticket 0047: lessons page "Suggested entry" textarea — pre-filled
+ * by the autopsy card's [draft entry →] tap-target. Lives at the top
+ * of /lessons when the ?draft= query param is present; absent
+ * otherwise. Reuses the existing --panel2 / --line / --mono tokens —
+ * no new variables. */
+.lesson-draft-block {
+  margin: 14px 0;
+  padding: 12px 14px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lesson-draft-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.lesson-draft-textarea {
+  width: 100%;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  resize: vertical;
+}
+.lesson-draft-help { font-family: var(--mono); font-size: 11.5px; }
+
 /* Ticket 0034: self-baseline drift detail view. Three rows stacked
  * single-column on phones; each row carries the metric label, the
  * baseline mean/sigma + current value as a numeric line, and an
