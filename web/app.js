@@ -486,6 +486,20 @@ document.addEventListener("click", (e) => {
   closeModal();
 });
 
+// Ticket 0045: mobile expand/collapse for the stuck-PR taxonomy card.
+// Tapping the "+N healthy or merging" button toggles
+// .stuck-pr-expanded on the card so the hidden rows reveal inline.
+// The toggle has data-stop="1" so the existing click-bubble logic in
+// the card chrome doesn't re-route us.
+document.addEventListener("click", (e) => {
+  const btn = e.target && e.target.closest && e.target.closest(".stuck-pr-mobile-toggle");
+  if (!btn) return;
+  const card = btn.closest(".stuck-pr-taxonomy-card");
+  if (!card) return;
+  const expanded = card.classList.toggle("stuck-pr-expanded");
+  btn.setAttribute("aria-expanded", expanded ? "true" : "false");
+});
+
 let timer = null;
 let liveES = null; // live tool-call EventSource (ticket 0002)
 const stop = () => {
@@ -833,6 +847,15 @@ async function fetchSpendEfficiency() {
   try { return await get("/api/fleet/spend-efficiency"); } catch { return null; }
 }
 
+// Ticket 0045: stuck-PR taxonomy card. Lazy-fetched from
+// /api/fleet/stuck-pr-taxonomy; errors fall through silently so the
+// rest of the home page still loads when the endpoint is unreachable.
+// The 30s server-side cache (matching Cache-Control: max-age=30) keeps
+// the round-trip cheap on poll re-renders.
+async function fetchStuckPrTaxonomy() {
+  try { return await get("/api/fleet/stuck-pr-taxonomy"); } catch { return null; }
+}
+
 /** Skeleton block shown while /api/fleet/glance is in flight. Carries
  *  `aria-busy="true"` so screen readers announce the loading state;
  *  the pulsing animation flattens under
@@ -1080,6 +1103,125 @@ function renderRiskiestPr(data) {
     </span>
     <span class="riskiest-pr-link">tend it now →</span>
   </a>`;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0045: stuck-PR taxonomy card.
+//
+// Inline card on the home page (BELOW the 0040 riskiest-PR badge,
+// ABOVE the 0044 spend-efficiency card and ABOVE the project grid).
+// Lists every open agent PR ordered by urgency rank, each row
+// classified into ONE of seven buckets: needs_human, ci_red,
+// ci_absent, infra_flake, account_suspended, merging, healthy_waiting.
+//
+// Three render modes:
+//   - open_count === 0      → return ""  (no DOM element, no testid)
+//   - mobile (375px)        → hide merging + healthy_waiting rows;
+//                             render trailing "+N healthy or merging"
+//                             toggle that expands inline on tap.
+//                             Handled in CSS (the rows are all in the
+//                             DOM with a data-bucket attribute the
+//                             style rules key off).
+//   - quiet hours active    → hide infra_flake + merging + healthy_
+//                             waiting rows (the action-urgent rows
+//                             stay visible). Handled here in JS so
+//                             the served HTML reflects the verdict;
+//                             the CSS would otherwise need a server-
+//                             side flag to key off.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string (evidence, next_action,
+// pr_title, project_slug) passes through redactSecrets before HTML
+// insertion. The evidence line carries stdout-derived substrings
+// (e.g. infra_flake's matched substring or the failing-check name);
+// the redaction pass is the silent backstop.
+// ────────────────────────────────────────────────────────────────────
+
+/** Project count helper for the card title. */
+function _stuckPrTaxonomyProjectCount(rows) {
+  const set = new Set();
+  for (const r of rows) set.add(String(r.project_slug || ""));
+  return set.size;
+}
+
+const STUCK_PR_BUCKET_LABEL = {
+  needs_human: "needs_human",
+  ci_red: "ci_red",
+  ci_absent: "ci_absent",
+  infra_flake: "infra_flake",
+  account_suspended: "account_suspended",
+  merging: "merging",
+  healthy_waiting: "healthy_waiting",
+};
+
+const STUCK_PR_QUIET_HIDDEN_BUCKETS = new Set([
+  "infra_flake", "merging", "healthy_waiting",
+]);
+
+const STUCK_PR_MOBILE_HIDDEN_BUCKETS = new Set([
+  "merging", "healthy_waiting",
+]);
+
+function renderStuckPrTaxonomyCard(data) {
+  if (!data) return "";
+  const openCount = Number(data.open_count || 0);
+  if (openCount === 0) return "";
+  const allRows = Array.isArray(data.rows) ? data.rows : [];
+  if (allRows.length === 0) return "";
+  const projectCount = _stuckPrTaxonomyProjectCount(allRows);
+  const quietHours = !!data.quiet_hours_active;
+  // Quiet-hours filter happens here in JS so the served DOM matches
+  // the verdict. Mobile-hide is CSS-only (the rows are rendered with
+  // a data-bucket attribute the stylesheet keys off).
+  const rowsToRender = quietHours
+    ? allRows.filter((r) => !STUCK_PR_QUIET_HIDDEN_BUCKETS.has(String(r.bucket)))
+    : allRows;
+  // Count how many rows the mobile view will collapse behind the
+  // toggle so the trailing "+N healthy or merging" line is accurate.
+  // We count from the rows that ARE in the DOM (quiet hours already
+  // filtered) — a quiet-hours render won't surface a toggle because
+  // those buckets are absent entirely.
+  const mobileHiddenCount = rowsToRender.reduce(
+    (n, r) => n + (STUCK_PR_MOBILE_HIDDEN_BUCKETS.has(String(r.bucket)) ? 1 : 0),
+    0,
+  );
+  const rowHtml = rowsToRender.map((r, idx) => {
+    const bucket = String(r.bucket || "healthy_waiting");
+    const safeBucket = esc(bucket);
+    const slug = String(r.project_slug || "");
+    const safeSlug = esc(redactSecrets(slug));
+    const num = Number(r.pr_number || 0);
+    const safeEvidence = esc(redactSecrets(String(r.evidence || "")));
+    const safeAction = esc(redactSecrets(String(r.next_action || "")));
+    const safeTitle = esc(redactSecrets(String(r.pr_title || "")));
+    // Tap target deep-links to the project page with ?pr=<n> so the
+    // existing 0040 scroll-and-highlight pattern lands on the
+    // matching PR card.
+    const link = "#/p/" + encodeURIComponent(slug) + "?pr=" + num;
+    const testid = `stuck-pr-row-${safeBucket}-${safeSlug}-${num}`;
+    void idx;
+    return `<div class="stuck-pr-row stuck-pr-row-${safeBucket}" data-bucket="${safeBucket}" data-testid="${testid}">
+      <span class="stuck-pr-bucket stuck-pr-bucket-${safeBucket}">${esc(STUCK_PR_BUCKET_LABEL[bucket] || bucket)}</span>
+      <span class="stuck-pr-slug"><b>${safeSlug}</b> #${num}${safeTitle ? ` <span class="stuck-pr-title dim">${safeTitle}</span>` : ""}</span>
+      <span class="stuck-pr-evidence dim">${safeEvidence}</span>
+      <a class="stuck-pr-action" href="${esc(link)}">→ ${safeAction}</a>
+    </div>`;
+  }).join("");
+  // Trailing mobile toggle: rendered only when at least one row is
+  // mobile-hidden. On phones, the CSS hides .stuck-pr-row[data-bucket]
+  // for the merging+healthy_waiting buckets; tapping the toggle adds
+  // .stuck-pr-expanded to the container to reveal them.
+  const mobileToggle = mobileHiddenCount > 0
+    ? `<button type="button" class="stuck-pr-mobile-toggle" data-testid="stuck-pr-mobile-toggle" data-stop="1" aria-expanded="false">+${mobileHiddenCount} healthy or merging</button>`
+    : "";
+  const title = `Open PR triage (${openCount} across ${projectCount} project${projectCount === 1 ? "" : "s"})`;
+  return `<div class="stuck-pr-taxonomy-card" data-testid="stuck-pr-taxonomy-card">
+    <div class="stuck-pr-head">
+      <span class="stuck-pr-title-head"><b>${esc(redactSecrets(title))}</b></span>
+    </div>
+    ${rowHtml}
+    ${mobileToggle}
+  </div>`;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1904,8 +2046,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(),
   ]);
   // Ticket 0043: fetch the new-since-visit diff using the additive
   // `previous_last_seen` field from /api/fleet (the PRE-upsert
@@ -1931,6 +2073,7 @@ async function home() {
     renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +
     renderRiskiestPr(riskiestPrData) +
+    renderStuckPrTaxonomyCard(stuckPrTaxonomyData) +
     renderSpendEfficiencyCard(spendEfficiencyData) +
     renderStreak(streakData) +
     renderInbox(inboxData) +
