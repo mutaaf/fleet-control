@@ -1,7 +1,7 @@
 ---
 id: 0046
 title: fleetctl onboard wizard - one command from zero-state to first ingested project in under three minutes
-status: in-progress
+status: shipped
 priority: P1
 area: infra
 created: 2026-06-09
