@@ -1,7 +1,7 @@
 ---
 id: 0047
 title: PR autopsy card - surface why each non-merged PR died and which signal would have predicted it
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-09
@@ -660,3 +660,79 @@ casing> AND <merged-flag-is-false>` rather than guessing.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-09 — schema reconciliation (implementation-dev)
+
+Per LESSONS 2026-06-05 "groomer prose can disagree with the
+schema; the schema wins" and 2026-06-07 "the `pr` table has no
+surrogate `id`": grepped `src/ingest/prs.ts`,
+`src/views.ts`, and the SCHEMA template in `src/db.ts` for the
+exact casing of `pr.state` and the existence of
+`closed_at`/`merged`/`created_at`.
+
+Findings, before any code change:
+- `pr.state` open PRs land lowercase `'open'` (production
+  ingester at `src/ingest/prs.ts:164` hardcodes the literal —
+  it ignores gh's `state` field). The 0040 LESSON established
+  this casing.
+- `pr.state` merged PRs land uppercase `'MERGED'` (every
+  reader — `costPerMergedPr`, `fleetStreak`, `fleetChangelog`,
+  `spendEfficiencyRanking`, `riskiestOpenPr`'s
+  unhealthy-window — agrees; test seeders agree). The
+  production ingester does NOT write 'MERGED' today (only
+  open PRs are fetched); merged-PR rows land via the limited
+  set of ingestion seams that pre-date the open-only fetcher
+  and via demo/snapshot/test seeding.
+- `pr.closed_at` does NOT exist as a column. Neither does
+  `pr.created_at` (the closest is `pr.gh_created_at` added by
+  ticket 0022) nor `pr.merged_at`. The ticket's prose names
+  these columns; the schema wins.
+- The `pr` PK is `(project_id, number)` — no surrogate `id`
+  (confirmed in `src/db.ts`).
+
+Reconciliation decisions (the schema is the contract):
+1. ADD column `pr.closed_at TEXT` via additive ALTER (same
+   shape as the 0022 / 0023 ALTERs already in `openDb`).
+   Default NULL on legacy rows. Production ingester is NOT
+   extended in this PR — the ingest of `--state closed` PRs
+   is its own scope (spawned-from 0047, see new sibling
+   ticket 0049). Test seeds populate the column directly so
+   the helper is exercised end-to-end against fixture data.
+2. "Closed casing" is uppercase `'CLOSED'` to mirror the
+   established `'MERGED'` casing used by every existing
+   merged-PR reader, and to match gh's verbatim state token
+   ("OPEN"|"CLOSED"|"MERGED") that future ingester extension
+   will emit. Lowercase `'open'` stays the open-PR casing
+   per the 0040 LESSON.
+3. "Not merged" is naturally encoded as `state = 'CLOSED'`
+   (the values are disjoint — a row is exactly ONE of
+   `'open'` / `'CLOSED'` / `'MERGED'`).
+4. The "human_rejected" cause cascade rule depends on a
+   closed-by/actor signal the schema does NOT carry today
+   (the ingester does not fetch a closer identity). Per the
+   ticket's AC2 part 3 permissive clause ("if no human-
+   action signal is recoverable, this rule does NOT fire"),
+   v1 falls those deaths through to `unknown` and the
+   verdict prompts a fresh LESSONS entry. A future ticket
+   widens the ingester to capture `closedBy.login` and
+   surfaces the rule.
+5. Cache invalidation tuple is
+   `(window_days, MAX(closed_at) WHERE state='CLOSED',
+   COUNT(*) WHERE state='CLOSED' AND closed_at >= cutoff)`
+   per LESSONS 2026-06-07. NEVER `MAX(pr.id)` (column does
+   not exist).
+6. Lesson credit attribution joins against the existing 0042
+   `lesson_credit` table on `heal_audit_id`. The ledger row's
+   `(lesson_slug, lesson_date, lesson_title)` triple is the
+   most-recent credit by `created_at DESC` for any heal-audit
+   row matching `action='heal' AND target='pr-<n>'`.
+   `prior_saves` is `COUNT(*) FROM lesson_credit WHERE
+   lesson_slug = ? AND created_at >= now - 30 days` (per
+   AC4).
+
+Sibling tickets spawned in this PR:
+- 0049 (proposed): extend `src/ingest/prs.ts` to also fetch
+  `--state closed` PRs, populate `state`, `closed_at`, and
+  (when available) the closer identity. Today's
+  `prAutopsies()` helper is data-ready for that ingest
+  extension; v1 ships behind seeded fixture data only.
