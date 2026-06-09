@@ -22,7 +22,7 @@ proposes new ones, `review` grades them.
 | 0048 | Per-project worth-it verdict - each project card emits a yearly-trajectory "keep, watch, or sunset" call | P2 | groomed | observability |
 | 0047 | PR autopsy card - surface why each non-merged PR died and which signal would have predicted it | P2 | groomed | observability |
 | 0046 | fleetctl onboard wizard - one command from zero-state to first ingested project in under three minutes | P1 | groomed | infra |
-| 0045 | Stuck-PR taxonomy card - label every open agent PR so the operator knows whether to intervene or wait | P1 | in-progress | observability |
+| 0045 | Stuck-PR taxonomy card - label every open agent PR so the operator knows whether to intervene or wait | P1 | shipped | observability |
 | 0044 | Spend-efficiency ranking - rank projects by $/merged-PR and diagnose the laggard | P2 | shipped | observability |
 | 0043 | New-since-last-visit diff - mark every home-page item the operator has not yet seen | P1 | shipped | portal |
 | 0042 | Lesson credit ledger - attribute heal saves to the cross-fleet lesson that caught them | P2 | shipped | observability |
