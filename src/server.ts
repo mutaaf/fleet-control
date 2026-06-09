@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -698,6 +698,127 @@ function getStuckPrTaxonomyCached(
   };
   return value;
 }
+
+// Ticket 0047: "PR autopsy card" memo cache.
+//
+// 10-min TTL (matches Cache-Control: max-age=600 — autopsies are
+// historical and only change when a PR closes). The cache is
+// invalidated by a THREE-VALUE tuple:
+//
+//   - windowDays         = the route's ?window= parameter (per-window
+//                          cache row so the operator can flip between
+//                          7d / 30d without polluting either entry)
+//   - latestClosedAt     = SELECT MAX(closed_at) FROM pr
+//                          WHERE state='CLOSED'
+//   - closedCountInWin   = SELECT COUNT(*)       FROM pr
+//                          WHERE state='CLOSED' AND
+//                                closed_at >= now - windowDays days
+//
+// The `pr` table has no surrogate id (PK is (project_id, number)) so
+// we proxy "fresh closed-PR row landed" via the (MAX(closed_at),
+// COUNT(*)) pair per LESSONS 2026-06-07 "the `pr` table has no
+// surrogate `id`; proxy 'latest landed' via (MAX(fetched_at),
+// COUNT(*))" — the same pattern the spend-efficiency cache uses for
+// merges. Either side moving busts the cache the moment the next
+// request arrives.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetPrAutopsiesCacheForTests()`. Per
+// LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap" we also expose
+// `_getPrAutopsiesCacheBuildsForTests()`; it ticks on every cache
+// MISS so route tests assert hit/miss semantics without stubbing
+// SQL. Production code never reads either.
+//
+// Per LESSONS 2026-06-05 "break ingest↔server cache-invalidation
+// cycles via a globalThis slot, not a circular import": the ingest
+// pass (`runIngestPass` in src/ingest/index.ts) calls a hook
+// registered on `globalThis.__fleet_pr_autopsies_invalidate__` so a
+// freshly-closed PR clears the cache without waiting out the TTL.
+// The slot is registered below at module load time and read lazily
+// by the ingest module — same shape as the 0039 changelog hook.
+interface PrAutopsiesCacheEntry {
+  tuple: string;
+  value: PrAutopsies & { quiet_hours_active: boolean };
+  expires_at: number;
+}
+const PR_AUTOPSIES_TTL_MS = 600_000;
+const prAutopsiesCache = new Map<string, PrAutopsiesCacheEntry>();
+let prAutopsiesBuildCounter = 0;
+
+export function _resetPrAutopsiesCacheForTests(): void {
+  prAutopsiesCache.clear();
+  prAutopsiesBuildCounter = 0;
+}
+
+export function _getPrAutopsiesCacheBuildsForTests(): number {
+  return prAutopsiesBuildCounter;
+}
+
+interface PrAutopsiesClosedSummaryRow {
+  mx: string | null;
+  c: number | null;
+}
+
+function prAutopsiesInvalidationTuple(db: DB, windowDays: number, now: Date): string {
+  // MAX(closed_at) over ALL closed rows: catches the case where the
+  // same row's closed_at advances (a re-close after re-open scenario).
+  const latestRow = db.prepare(
+    "SELECT MAX(closed_at) AS mx FROM pr "
+    + " WHERE state = 'CLOSED' AND closed_at IS NOT NULL",
+  ).get() as unknown as PrAutopsiesClosedSummaryRow | undefined;
+  // COUNT(*) over closed rows IN WINDOW: catches a new row that
+  // happens to share the same MAX(closed_at).
+  const cutoffIso = new Date(now.getTime() - windowDays * 86400_000).toISOString();
+  const countRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE state = 'CLOSED' AND closed_at IS NOT NULL "
+    + "   AND closed_at >= ?",
+  ).get(cutoffIso) as unknown as PrAutopsiesClosedSummaryRow | undefined;
+  const mx = latestRow?.mx ?? "";
+  const c = Number(countRow?.c ?? 0);
+  return `${windowDays}|${mx}|${c}`;
+}
+
+function getPrAutopsiesCached(
+  db: DB, cfg: FleetConfig, now: Date, windowDays: number,
+): PrAutopsies & { quiet_hours_active: boolean } {
+  const tuple = prAutopsiesInvalidationTuple(db, windowDays, now);
+  const key = String(windowDays);
+  const hit = prAutopsiesCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) {
+    return hit.value;
+  }
+  prAutopsiesBuildCounter += 1;
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const inner = prAutopsies(db, now, { windowDays });
+  // Surface quiet_hours_active in the payload so the SPA can hide
+  // the [draft entry →] tap-target overnight per AC11 (the 0030
+  // pull-vs-push contract: information visible, action prompt
+  // suppressed). The verdict + draft-skeleton are still computed
+  // server-side so a re-render at 6am has the data ready.
+  const value = { ...inner, quiet_hours_active: quiet };
+  prAutopsiesCache.set(key, {
+    tuple, value, expires_at: Date.now() + PR_AUTOPSIES_TTL_MS,
+  });
+  return value;
+}
+
+/** Clear the autopsies memo so the next request rebuilds. Called by
+ *  the ingest pass via the globalThis slot below — the changelog
+ *  cache invalidator's pattern (registered at module load), so the
+ *  ingest module never imports server.ts. */
+export function _invalidatePrAutopsiesCacheAfterIngest(): void {
+  prAutopsiesCache.clear();
+}
+
+// Register the autopsy invalidation hook on the global object so
+// `runIngestPass` (in src/ingest/index.ts) can call it without
+// importing this module (which would create a cycle — server.ts
+// imports runIngestPass at the top). Per LESSONS 2026-06-05 the
+// slot is suffix-prefix'd with underscores to avoid collisions.
+(globalThis as { __fleet_pr_autopsies_invalidate__?: () => void })
+  .__fleet_pr_autopsies_invalidate__ = _invalidatePrAutopsiesCacheAfterIngest;
 
 // Ticket 0038: "Monday morning catch-up" memo cache.
 //
@@ -1423,6 +1544,36 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=30",
+          });
+          return res.end(body);
+        }
+        // Ticket 0047: PR autopsy card. One row per non-merged PR
+        // close in the last N days (default 7, clamped to [1, 30]).
+        // Pure composition over pr + project + control_audit + 0042's
+        // lesson_credit — no schema migration beyond the additive
+        // `pr.closed_at TEXT` ALTER. 10-min memo cache keyed by
+        // (windowDays, MAX(closed_at) WHERE state='CLOSED',
+        //  COUNT(*) WHERE state='CLOSED' AND closed_at >= now-window) —
+        // either tuple value moving busts the cache, and the ingest
+        // pass calls the globalThis invalidation hook so a freshly-
+        // closed PR surfaces on the next render without waiting out
+        // the TTL. Net-new route; no existing JSON shape to preserve.
+        if (path === "/api/fleet/pr-autopsies") {
+          const raw = url.searchParams.get("window");
+          let windowDays = 7;
+          if (raw != null) {
+            const n = Number(raw);
+            if (!Number.isFinite(n) || Math.floor(n) !== n || n < 1 || n > 30) {
+              return json(res, { error: "window must be an integer in [1, 30]" }, 400);
+            }
+            windowDays = n;
+          }
+          const v = getPrAutopsiesCached(db, cfg, new Date(), windowDays);
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=600",
           });
           return res.end(body);
         }

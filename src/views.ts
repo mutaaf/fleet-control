@@ -4788,3 +4788,392 @@ function countHealAuditsForPr(db: DB, prNumber: number): number {
   ).get(`pr-${prNumber}`) as unknown as { c: number | null } | undefined;
   return Number(row?.c ?? 0);
 }
+
+// ────────────────────────────────────────────────────────────────────
+// PR autopsy card (ticket 0047).
+//
+// One row per non-merged PR close in the last N days. Each row carries
+// a structural cause-of-death, the riskiness score the 0040 helper
+// would have computed at close time, the credited lesson (via the 0042
+// `lesson_credit` ledger) if any, a deterministic verdict line, and a
+// pre-filled LESSONS-entry skeleton (for the unknown / no-lesson
+// branches).
+//
+// Producer reconciliation (per LESSONS 2026-06-05 "groomer prose can
+// disagree with the schema; the schema wins"; full audit in the
+// 0047 ticket's Implementation log):
+//   - closed PRs: `state = 'CLOSED'` uppercase (mirrors the
+//     established `'MERGED'` uppercase convention used by every
+//     existing merged-PR reader; matches gh's verbatim state token
+//     "CLOSED"). The 0049 sibling ticket extends the ingester to
+//     populate this; v1 of the autopsy is data-ready behind seeded
+//     fixtures.
+//   - `closed_at`: NEW additive column added via ALTER in
+//     src/db.ts:openDb. Default NULL on legacy rows.
+//   - `control_audit` heal rows: action='heal' (lowercase) +
+//     target='pr-<number>' — matches src/views.ts:classifyPrFailure.
+//   - `lesson_credit` join: per src/db.ts schema the join column is
+//     `heal_audit_id` (snake_case lowercase) — matches the 0042
+//     attributor.
+//
+// The cause cascade (top-down, first match wins) is the deterministic
+// classifier the AC2 spec demands:
+//   1. cap_reached         — heal_attempts >= 2 AND latest heal is
+//                            NOT an infra-flake (via classifyPrFailure)
+//   2. infra_blocked_giveup — heal_attempts >= 1 AND latest heal IS
+//                            an infra-flake
+//   3. human_rejected      — heal_attempts < 2 AND a closed-by-human
+//                            signal exists. PRODUCER-VS-SPEC: the
+//                            schema today carries no `closed_by` /
+//                            `actor_login` field; the ingester does
+//                            not fetch a closer identity. Per the
+//                            AC's permissive clause "if no human-
+//                            action signal is recoverable, this rule
+//                            does NOT fire", v1 SKIPS this branch
+//                            (the death falls through to `unknown`
+//                            and the verdict prompts a fresh
+//                            LESSONS entry). The 0049 sibling ticket
+//                            widens the ingester so this branch
+//                            lights up.
+//   4. force_closed_stale  — heal_attempts === 0 AND
+//                            (closed_at - gh_created_at) > 7 days
+//   5. unknown             — default
+//
+// Riskiness reconstruction (AC3) reuses the 0040 formula AS-IS:
+//   heal_attempts * 4 + FAIL_KIND_WEIGHT[fail_kind] +
+//     floor(age_hours_at_close / 6)
+// where fail_kind comes from `classifyPrFailure(db, projectId,
+// prNumber)` (the latest heal-audit row survives the PR close per the
+// 0040 LESSONS lookup pattern).
+//
+// Lesson credit attribution (AC4): for each autopsy row, the helper
+// queries `lesson_credit` for ANY row whose `heal_audit_id` points at
+// a heal-audit row for this PR (`action='heal' AND target='pr-<n>'`),
+// picks the most-recently credited one, and surfaces
+// {slug, headline, prior_saves} — where `prior_saves` is
+// `COUNT(*) FROM lesson_credit WHERE lesson_slug = ? AND
+// created_at >= now - 30 days`. When zero matches exist,
+// `lesson_credit` is null.
+//
+// Verdict + draft_lesson composition (AC5) is a pure deterministic
+// dispatch over (cause, lesson_credit present?) — no LLM, no
+// stringified prose composition beyond the fixed templates.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing uses the double-cast.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// SQL strings stay plain concatenation; identifiers unquoted single
+// words.
+// Per LESSONS § "julianday() drifts ~10us per timestamp": every
+// timestamp diff is JS-side via `Date.getTime()` (integer ms).
+// Per AGENTS.md § "Never compose a shell string from input" — and
+// its SQL analogue: every parameter is bound via `?` placeholders.
+
+export type PrAutopsyCause =
+  | "cap_reached"
+  | "human_rejected"
+  | "force_closed_stale"
+  | "infra_blocked_giveup"
+  | "unknown";
+
+export interface PrAutopsyLessonCredit {
+  slug: string;
+  headline: string;
+  prior_saves: number;
+}
+
+export interface PrAutopsyRow {
+  project_slug: string;
+  project_name: string;
+  pr_number: number;
+  pr_title: string;
+  pr_url: string;
+  closed_at: string;
+  closed_age_hours: number;
+  cause: PrAutopsyCause;
+  riskiness_at_close: number;
+  riskiness_breakdown: string;
+  heal_attempts: number;
+  latest_fail_kind: string;
+  latest_fail_detail: string | null;
+  lesson_credit: PrAutopsyLessonCredit | null;
+  verdict: string;
+  draft_lesson: string | null;
+}
+
+export interface PrAutopsies {
+  window_days: number;
+  total_closes: number;
+  rows: PrAutopsyRow[];
+  generated_at: string;
+}
+
+export interface PrAutopsiesOptions {
+  /** Window in days for the autopsy lookback. Defaults to 7. The
+   *  route handler clamps to [1, 30] before passing through. */
+  windowDays?: number;
+}
+
+interface PrAutopsyRowInternal {
+  project_slug: string;
+  project_name: string | null;
+  project_id: number;
+  pr_number: number;
+  pr_title: string | null;
+  pr_url: string | null;
+  closed_at: string;
+  gh_created_at: string | null;
+  heal_attempts: number | null;
+  ci_state: string | null;
+  first_fail_check: string | null;
+}
+
+interface LessonCreditJoinRow {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  created_at: string;
+}
+
+interface PriorSavesRow { c: number | null; }
+
+/** Look up the most-recent lesson_credit row whose heal_audit_id
+ *  matches any heal-audit for this PR. Returns null when no rows
+ *  exist. Encapsulated so the join is one SQL read per autopsy row
+ *  (small N, typically <50 per window). */
+function lessonCreditForAutopsyRow(
+  db: DB, prNumber: number,
+): { row: LessonCreditJoinRow; prior_saves: number } | null {
+  // Inner SELECT collects the heal_audit_id list for this PR; outer
+  // JOIN picks the most-recent credit row. Pure SQL — no per-heal
+  // round-trip.
+  const credit = db.prepare(
+    "SELECT lc.lesson_slug AS lesson_slug, "
+    + "       lc.lesson_date AS lesson_date, "
+    + "       lc.lesson_title AS lesson_title, "
+    + "       lc.created_at AS created_at "
+    + "  FROM lesson_credit lc "
+    + " WHERE lc.heal_audit_id IN ( "
+    + "        SELECT id FROM control_audit "
+    + "         WHERE action = 'heal' AND target = ? "
+    + "      ) "
+    + " ORDER BY lc.created_at DESC LIMIT 1",
+  ).get(`pr-${prNumber}`) as unknown as LessonCreditJoinRow | undefined;
+  if (!credit) return null;
+  return { row: credit, prior_saves: 0 }; // prior_saves filled below
+}
+
+/** Count lesson_credit rows for a given lesson_slug within the
+ *  trailing 30 days. The cutoff is computed JS-side and passed as a
+ *  bind parameter (per LESSONS § julianday drifts). */
+function priorSavesForLesson(
+  db: DB, lessonSlug: string, now: Date,
+): number {
+  const cutoffIso = new Date(now.getTime() - 30 * 86400_000).toISOString();
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c FROM lesson_credit "
+    + " WHERE lesson_slug = ? AND created_at >= ?",
+  ).get(lessonSlug, cutoffIso) as unknown as PriorSavesRow | undefined;
+  return Number(row?.c ?? 0);
+}
+
+/** Compose the verdict line for a given (cause, lesson_credit) pair.
+ *  Deterministic — no LLM, no string interpolation beyond the fixed
+ *  templates. The returned tuple carries the verdict and whether
+ *  the row should prompt a fresh LESSONS-entry draft. */
+function composeVerdict(
+  cause: PrAutopsyCause, hasCredit: boolean,
+): { verdict: string; promptsDraft: boolean } {
+  switch (cause) {
+    case "cap_reached":
+      return hasCredit
+        ? { verdict: "The lesson named the symptom. Heal cap is the issue.", promptsDraft: false }
+        : { verdict: "Heal cap reached AND no lesson covers this. Worth a LESSONS entry.", promptsDraft: true };
+    case "infra_blocked_giveup":
+      return hasCredit
+        ? { verdict: "Infra blocked recovery. The lesson named it - consider widening the retry budget.", promptsDraft: false }
+        : { verdict: "Infra blocked recovery and no lesson covers this flake. Add a LESSONS entry.", promptsDraft: true };
+    case "human_rejected":
+      return { verdict: "Human closed. Was the agent off-track or was the goal wrong?", promptsDraft: false };
+    case "force_closed_stale":
+      return { verdict: "PR sat unattended for >7 days. Likely the backlog moved on.", promptsDraft: false };
+    case "unknown":
+    default:
+      return { verdict: "Cause not detected from signals. Consider adding a LESSONS entry naming this failure mode.", promptsDraft: true };
+  }
+}
+
+/** Compose the draft-LESSONS skeleton (AC5). Fixed 3-line template;
+ *  the operator reviews + copies into docs/LESSONS.md themselves. */
+function composeDraftLesson(opts: {
+  now: Date;
+  slug: string;
+  prNumber: number;
+  cause: PrAutopsyCause;
+  failKind: string;
+  failDetail: string | null;
+  verdict: string;
+}): string {
+  const date = opts.now.toISOString().slice(0, 10);
+  const headline = `${opts.slug} #${opts.prNumber} died: ${opts.cause}`;
+  const detail = opts.failDetail ?? "none";
+  return (
+    `### ${date} - ${headline}\n\n`
+    + `PR ${opts.slug} #${opts.prNumber} was closed for cause=${opts.cause}. `
+    + `Latest heal fail-kind: ${opts.failKind}. Detail: ${detail}. `
+    + `Verdict: ${opts.verdict}\n\nFIX: <fill in>`
+  );
+}
+
+/** Compose the riskiness_breakdown line (AC3). One-line human summary:
+ *  "<fail_kind> x <heals> heals, <age>h old". */
+function composeRiskinessBreakdown(opts: {
+  failKind: string;
+  heals: number;
+  ageHours: number;
+}): string {
+  const healPlural = opts.heals === 1 ? "heal" : "heals";
+  return `${opts.failKind} x ${opts.heals} ${healPlural}, ${opts.ageHours}h old`;
+}
+
+/** Compute the PR autopsy card payload for the last N (default 7)
+ *  days. `now` is the wall-clock anchor for the window cutoff +
+ *  age math; tests pin it, production passes `new Date()`. */
+export function prAutopsies(
+  db: DB,
+  now: Date,
+  opts: PrAutopsiesOptions = {},
+): PrAutopsies {
+  // Window: [now - windowDays, now]. The cutoff is computed JS-side
+  // (per LESSONS § julianday drifts) and passed as a bind param.
+  const windowDays = Math.max(1, Math.floor(opts.windowDays ?? 7));
+  const cutoffIso = new Date(now.getTime() - windowDays * 86400_000).toISOString();
+  const generatedAt = now.toISOString();
+
+  // Main SELECT: closed-non-merged PRs with closed_at in window. The
+  // 0040 LESSON established lowercase 'open' for open PRs; this
+  // implementation establishes uppercase 'CLOSED' for closed-non-
+  // merged (mirrors the 'MERGED' uppercase convention every existing
+  // merged-PR reader uses, and matches gh's verbatim state token).
+  // Edge case (AC12 / spec edge case): a PR closed AND re-opened
+  // has its current state back at 'open' — it is naturally excluded
+  // by the state='CLOSED' filter.
+  const rows = db.prepare(
+    "SELECT "
+    + "  p.slug AS project_slug, p.name AS project_name, p.id AS project_id, "
+    + "  pr.number AS pr_number, pr.title AS pr_title, pr.url AS pr_url, "
+    + "  pr.closed_at AS closed_at, pr.gh_created_at AS gh_created_at, "
+    + "  pr.heal_attempts AS heal_attempts, pr.ci_state AS ci_state, "
+    + "  pr.first_fail_check AS first_fail_check "
+    + "FROM pr JOIN project p ON p.id = pr.project_id "
+    + "WHERE pr.state = 'CLOSED' "
+    + "  AND pr.closed_at IS NOT NULL "
+    + "  AND pr.closed_at >= ? "
+    + "ORDER BY pr.closed_at DESC",
+  ).all(cutoffIso) as unknown as PrAutopsyRowInternal[];
+
+  if (rows.length === 0) {
+    return {
+      window_days: windowDays,
+      total_closes: 0,
+      rows: [],
+      generated_at: generatedAt,
+    };
+  }
+
+  const out: PrAutopsyRow[] = [];
+  for (const r of rows) {
+    const closedAtMs = new Date(r.closed_at).getTime();
+    const createdAtMs = r.gh_created_at
+      ? new Date(r.gh_created_at).getTime()
+      : closedAtMs;
+    // Age at close = closed_at - created_at (integer ms diff → hours).
+    // Clamp to 0 on clock-skew (future created_at) to keep the score
+    // non-negative.
+    const ageMsAtClose = Math.max(0, closedAtMs - createdAtMs);
+    const ageHoursAtClose = Math.floor(ageMsAtClose / 3600_000);
+    const closedAgeMs = Math.max(0, now.getTime() - closedAtMs);
+    const closedAgeHours = Math.floor(closedAgeMs / 3600_000);
+    const heal = Math.max(0, Number(r.heal_attempts ?? 0) || 0);
+
+    // Reuse the existing classifyPrFailure helper unchanged (AC3
+    // "no new helper — REUSE 0040's classifyPrFailure AS-IS"). The
+    // latest heal-audit row still exists post-close (control_audit
+    // is append-only) so the classifier returns the same kind the
+    // 0040 riskiness path computed at close time.
+    const cls = classifyPrFailure(db, r.project_id, r.pr_number);
+    const failKind = cls.kind;
+    const failDetail = cls.detail;
+
+    // Cause cascade (AC2). Top-down; first match wins. The
+    // human_rejected branch is skipped per the AC's permissive
+    // clause because the schema carries no closed_by signal today
+    // (the 0049 sibling ticket widens the ingester to fix this).
+    let cause: PrAutopsyCause;
+    if (heal >= 2 && failKind !== "infra_flake") {
+      cause = "cap_reached";
+    } else if (heal >= 1 && failKind === "infra_flake") {
+      cause = "infra_blocked_giveup";
+    } else if (heal === 0 && ageMsAtClose > 7 * 86400_000) {
+      cause = "force_closed_stale";
+    } else {
+      cause = "unknown";
+    }
+
+    // Riskiness reconstruction (AC3): 0040's formula AS-IS against
+    // the PR's state at close time.
+    const score = heal * 4
+      + FAIL_KIND_WEIGHT[failKind]
+      + Math.floor(ageHoursAtClose / 6);
+    const breakdown = composeRiskinessBreakdown({
+      failKind, heals: heal, ageHours: ageHoursAtClose,
+    });
+
+    // Lesson credit attribution (AC4).
+    let lessonCredit: PrAutopsyLessonCredit | null = null;
+    const creditRow = lessonCreditForAutopsyRow(db, r.pr_number);
+    if (creditRow) {
+      const priorSaves = priorSavesForLesson(db, creditRow.row.lesson_slug, now);
+      lessonCredit = {
+        slug: creditRow.row.lesson_slug,
+        headline: creditRow.row.lesson_title,
+        prior_saves: priorSaves,
+      };
+    }
+
+    // Verdict + draft-lesson composition (AC5).
+    const { verdict, promptsDraft } = composeVerdict(cause, lessonCredit != null);
+    const draftLesson = promptsDraft
+      ? composeDraftLesson({
+        now, slug: r.project_slug, prNumber: r.pr_number,
+        cause, failKind, failDetail, verdict,
+      })
+      : null;
+
+    out.push({
+      project_slug: r.project_slug,
+      project_name: r.project_name ?? r.project_slug,
+      pr_number: r.pr_number,
+      pr_title: r.pr_title ?? "",
+      pr_url: r.pr_url ?? "",
+      closed_at: r.closed_at,
+      closed_age_hours: closedAgeHours,
+      cause,
+      riskiness_at_close: score,
+      riskiness_breakdown: breakdown,
+      heal_attempts: heal,
+      latest_fail_kind: failKind,
+      latest_fail_detail: failDetail,
+      lesson_credit: lessonCredit,
+      verdict,
+      draft_lesson: draftLesson,
+    });
+  }
+
+  return {
+    window_days: windowDays,
+    total_closes: out.length,
+    rows: out,
+    generated_at: generatedAt,
+  };
+}
