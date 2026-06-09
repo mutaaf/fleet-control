@@ -1,7 +1,7 @@
 ---
 id: 0045
 title: Stuck-PR taxonomy card - label every open agent PR so the operator knows whether to intervene or wait
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-09
