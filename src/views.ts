@@ -5505,3 +5505,420 @@ export function projectWorthItSticky(
     sticky_days: stickyDays,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Fleet year-in-review (ticket 0050).
+//
+// Composes already-shipped helpers + tables (pr, cost_rollup_day,
+// lesson_credit, project, plus projectWorthItVerdict) into ONE read
+// against a year-long window. The page is the smallest meaningful
+// unit of value that lets the operator close the laptop on New
+// Year's Eve with a single artifact.
+//
+// PRODUCER reconciliation (per LESSONS 2026-06-05 "groomer prose can
+// disagree with the schema; the schema wins" — confirmed against the
+// 0049-extended src/ingest/prs.ts):
+//   - merged PRs: `pr.state = 'MERGED'` uppercase + is_agent = 1
+//     (matches src/ingest/prs.ts line 235's verbatim gh state token).
+//   - closed-non-merged PRs: `pr.state = 'CLOSED'` uppercase
+//     (matches src/ingest/prs.ts line 235's safe default).
+//   - open PRs: `pr.state = 'open'` lowercase (matches src/ingest/prs.ts
+//     line 188's hardcoded `'open'` per the 0040 LESSON).
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing uses the double-cast.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// SQL strings are plain concatenation; identifiers stay unquoted.
+// Per LESSONS § "julianday() drifts ~10us per timestamp": week math
+// here is whole-day integer arithmetic in JS — no julianday involved.
+// Per LESSONS § "time-pinned tests must NOT derive seed timestamps
+// from `new Date()`": the `now` parameter is the single anchor for
+// every "today" calculation downstream (top_projects' projectWorthIt
+// reuse takes the same `now`).
+// Per LESSONS § "anomaly tests need σ > 0 in the fixture": the
+// dip-week median-spend gate is exercised against varied per-week
+// spend in the AC2 test; a flat-spend year resolves to dip = null.
+
+export interface FleetYearInReviewWeek {
+  week_iso: string;        // "2026-Wnn" (ISO week key)
+  merged: number;
+  closed_unmerged: number;
+  spend_usd: number;
+}
+
+export interface FleetYearInReviewDip {
+  week_iso: string;
+  merged: number;
+  closed_unmerged: number;
+  spend_usd: number;
+  headline: string;        // loss-framing OR neutral, per quietHoursActive
+}
+
+export interface FleetYearInReviewProject {
+  project_slug: string;
+  merged_prs: number;
+  spend_usd: number;
+  cost_per_pr_usd: number | null;
+  verdict: "net_positive" | "watch" | "sunset_candidate" | "insufficient_data";
+  prose: string;
+}
+
+export interface FleetYearInReviewLesson {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  heal_count: number;
+  first_credited_at: string;
+  last_credited_at: string;
+  saved_pr_count: number;
+}
+
+export interface FleetYearInReview {
+  year: number;
+  range_start: string;     // "YYYY-01-01"
+  range_end: string;       // "YYYY-12-31"
+  total_merged_prs: number;
+  total_spend_usd: number;
+  cost_per_pr_usd: number | null;
+  roi_multiplier: number | null;
+  project_count: number;
+  weekly_merges: FleetYearInReviewWeek[];
+  dip_week: FleetYearInReviewDip | null;
+  top_projects: FleetYearInReviewProject[];
+  top_lessons: FleetYearInReviewLesson[];
+  generated_at: string;
+}
+
+export interface FleetYearInReviewOptions {
+  /** Hourly-rate knob for ROI; matches the 0048 worth-it defaults. */
+  hourlyRateUsd?: number;
+  /** Hours-per-PR knob for ROI. */
+  hoursPerPr?: number;
+  /** Quiet-hours flag — when true, suppresses the loss-framing
+   *  language in `dip_week.headline` (the numbers stay visible). */
+  quietHoursActive?: boolean;
+}
+
+interface YearInReviewWeeklyRow_internal {
+  week_iso: string | null;
+  c: number | null;
+}
+interface YearInReviewWeeklySpendRow_internal {
+  week_iso: string | null;
+  spend_usd: number | null;
+}
+interface YearInReviewProjectAggRow_internal {
+  project_id: number;
+  slug: string;
+  merged_prs: number;
+  spend_usd: number;
+}
+interface YearInReviewLessonRow_internal {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  heal_count: number;
+  first_credited_at: string;
+  last_credited_at: string;
+  saved_pr_count: number;
+}
+
+/** Compute the fleet-wide year-in-review for the given calendar year.
+ *  Pure read — no schema migration, no shell-out, no network. */
+export function fleetYearInReview(
+  db: DB, year: number, now: Date = new Date(),
+  opts: FleetYearInReviewOptions = {},
+): FleetYearInReview {
+  const hourlyRateUsd = typeof opts.hourlyRateUsd === "number" ? opts.hourlyRateUsd : 75;
+  const hoursPerPr = typeof opts.hoursPerPr === "number" ? opts.hoursPerPr : 1;
+  const quiet = !!opts.quietHoursActive;
+
+  const yearStr = String(year);
+  const rangeStart = `${yearStr}-01-01`;
+  const rangeEnd = `${yearStr}-12-31`;
+  // Half-open exclusive upper bound for date() comparisons.
+  const rangeEndExclusive = `${yearStr}-12-31T23:59:59.999Z`;
+  const startIso = `${rangeStart}T00:00:00.000Z`;
+  const endIso = `${yearStr}-12-31T23:59:59.999Z`;
+
+  // ── Total merged PRs (agent) in the year ────────────────────────
+  const mergedTotalRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) <= ?",
+  ).get(rangeStart, rangeEnd) as unknown as { c: number | null } | undefined;
+  const totalMergedPrs = Number(mergedTotalRow?.c ?? 0) || 0;
+
+  // ── Total spend in the year (cost_rollup_day) ──────────────────
+  const spendTotalRow = db.prepare(
+    "SELECT SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day <= ?",
+  ).get(rangeStart, rangeEnd) as unknown as { spent_usd: number | null } | undefined;
+  const totalSpendUsd = Number(spendTotalRow?.spent_usd ?? 0) || 0;
+
+  const costPerPrUsd: number | null = totalMergedPrs > 0
+    ? totalSpendUsd / totalMergedPrs
+    : null;
+  // Human equivalent: every merged PR represents hoursPerPr * rate USD
+  // of equivalent human work. ROI = equivalent / spend.
+  const humanEquivalentUsd = totalMergedPrs * hoursPerPr * hourlyRateUsd;
+  const roiMultiplier: number | null = totalSpendUsd > 0
+    ? humanEquivalentUsd / totalSpendUsd
+    : null;
+
+  // ── Project count (any project with at least one merged PR in
+  //    the year) ───────────────────────────────────────────────────
+  const projectCountRow = db.prepare(
+    "SELECT COUNT(DISTINCT project_id) AS c FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) <= ?",
+  ).get(rangeStart, rangeEnd) as unknown as { c: number | null } | undefined;
+  const projectCount = Number(projectCountRow?.c ?? 0) || 0;
+
+  // ── Weekly aggregation: 52 ISO weeks of the year ───────────────
+  // We build the canonical week labels in JS (Jan 1 → Dec 31 ISO
+  // weeks for `year`) so the result always has 52 entries even when
+  // the SQL groups are sparse. SQL gives us per-week merged + closed
+  // + spend; JS joins on the canonical week label.
+  const weekLabels = _yearIsoWeekLabels(year);
+  const mergedByWeek = new Map<string, number>();
+  const closedByWeek = new Map<string, number>();
+  const spendByWeek = new Map<string, number>();
+
+  const mergedWeekRows = db.prepare(
+    "SELECT strftime('%Y-%W', fetched_at) AS w, COUNT(*) AS c FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) <= ? "
+    + " GROUP BY w",
+  ).all(rangeStart, rangeEnd) as unknown as Array<{ w: string | null; c: number | null }>;
+  for (const r of mergedWeekRows) {
+    if (r.w) mergedByWeek.set(_sqliteWeekToIsoWeekLabel(r.w, year), Number(r.c ?? 0));
+  }
+  const closedWeekRows = db.prepare(
+    "SELECT strftime('%Y-%W', COALESCE(closed_at, fetched_at)) AS w, COUNT(*) AS c FROM pr "
+    + " WHERE state = 'CLOSED' AND is_agent = 1 "
+    + "   AND COALESCE(closed_at, fetched_at) IS NOT NULL "
+    + "   AND date(COALESCE(closed_at, fetched_at)) >= ? "
+    + "   AND date(COALESCE(closed_at, fetched_at)) <= ? "
+    + " GROUP BY w",
+  ).all(rangeStart, rangeEnd) as unknown as Array<{ w: string | null; c: number | null }>;
+  for (const r of closedWeekRows) {
+    if (r.w) closedByWeek.set(_sqliteWeekToIsoWeekLabel(r.w, year), Number(r.c ?? 0));
+  }
+  const spendWeekRows = db.prepare(
+    "SELECT strftime('%Y-%W', day) AS w, SUM(COALESCE(cost_usd, 0)) AS s "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day <= ? "
+    + " GROUP BY w",
+  ).all(rangeStart, rangeEnd) as unknown as Array<{ w: string | null; s: number | null }>;
+  for (const r of spendWeekRows) {
+    if (r.w) spendByWeek.set(_sqliteWeekToIsoWeekLabel(r.w, year), Number(r.s ?? 0));
+  }
+
+  const weeklyMerges: FleetYearInReviewWeek[] = weekLabels.map((wk) => ({
+    week_iso: wk,
+    merged: mergedByWeek.get(wk) ?? 0,
+    closed_unmerged: closedByWeek.get(wk) ?? 0,
+    spend_usd: spendByWeek.get(wk) ?? 0,
+  }));
+
+  // ── Dip-week detection: the single ISO week with the highest
+  //    (closed_unmerged - merged) delta, GATED on spend above the
+  //    year median. Clean year → null. ──────────────────────────
+  const dipWeek = _detectDipWeek(weeklyMerges, quiet);
+
+  // ── Top projects: at most 3 by merged_prs desc ──────────────────
+  // Reuse projectWorthItVerdict for the verdict label (the helper's
+  // window is sized to one year via the windowDays option).
+  const projectAggRows = db.prepare(
+    "SELECT p.id AS project_id, p.slug AS slug, "
+    + "       COUNT(pr.number) AS merged_prs, "
+    + "       COALESCE(SUM(crd.s), 0) AS spend_usd "
+    + "  FROM project p "
+    + "  LEFT JOIN pr ON pr.project_id = p.id "
+    + "         AND pr.state = 'MERGED' AND pr.is_agent = 1 "
+    + "         AND pr.fetched_at IS NOT NULL "
+    + "         AND date(pr.fetched_at) >= ? AND date(pr.fetched_at) <= ? "
+    + "  LEFT JOIN (SELECT project_id, day, SUM(COALESCE(cost_usd, 0)) AS s "
+    + "               FROM cost_rollup_day "
+    + "              WHERE day >= ? AND day <= ? "
+    + "              GROUP BY project_id, day) crd "
+    + "         ON crd.project_id = p.id "
+    + " GROUP BY p.id, p.slug "
+    + " ORDER BY merged_prs DESC, p.slug ASC",
+  ).all(rangeStart, rangeEnd, rangeStart, rangeEnd) as unknown as YearInReviewProjectAggRow_internal[];
+
+  const topProjects: FleetYearInReviewProject[] = [];
+  for (const p of projectAggRows) {
+    if (Number(p.merged_prs ?? 0) === 0) continue;
+    if (topProjects.length >= 3) break;
+    const merged = Number(p.merged_prs ?? 0) || 0;
+    const spend = Number(p.spend_usd ?? 0) || 0;
+    const cpp = merged > 0 ? spend / merged : null;
+    // Verdict reuses the per-project helper with a 365-day window so
+    // the "yearly trajectory" framing matches the page's promise. The
+    // verdict is informational; the chip (sticky_days) suppression
+    // happens at the SPA layer, not here.
+    let verdict: FleetYearInReviewProject["verdict"] = "insufficient_data";
+    try {
+      const v = projectWorthItVerdict(db, p.project_id, now, {
+        windowDays: 365,
+        humanEquivalentHourlyUsd: hourlyRateUsd,
+        humanHoursPerPr: hoursPerPr,
+      });
+      verdict = v.verdict;
+    } catch { /* fall through to insufficient_data */ }
+    // Fixed-template prose. Deterministic; never an LLM call.
+    const cppStr = cpp != null ? `$${cpp.toFixed(2)}/PR` : "—/PR";
+    const prose = _projectProse(p.slug, merged, cppStr, verdict);
+    topProjects.push({
+      project_slug: p.slug,
+      merged_prs: merged,
+      spend_usd: spend,
+      cost_per_pr_usd: cpp,
+      verdict,
+      prose,
+    });
+  }
+
+  // ── Top lessons: at most 3 by heal_count desc, from lesson_credit
+  //    filtered to the year. ──────────────────────────────────────
+  const lessonRows = db.prepare(
+    "SELECT lesson_slug, lesson_date, lesson_title, "
+    + "       COUNT(DISTINCT heal_audit_id) AS heal_count, "
+    + "       MIN(created_at) AS first_credited_at, "
+    + "       MAX(created_at) AS last_credited_at "
+    + "  FROM lesson_credit "
+    + " WHERE created_at >= ? AND created_at <= ? "
+    + " GROUP BY lesson_slug, lesson_date, lesson_title "
+    + " ORDER BY heal_count DESC, last_credited_at DESC "
+    + " LIMIT 3",
+  ).all(startIso, endIso) as unknown as Array<{
+    lesson_slug: string; lesson_date: string; lesson_title: string;
+    heal_count: number; first_credited_at: string; last_credited_at: string;
+  }>;
+  const topLessons: FleetYearInReviewLesson[] = lessonRows.map((r) => ({
+    lesson_slug: String(r.lesson_slug),
+    lesson_date: String(r.lesson_date),
+    lesson_title: String(r.lesson_title),
+    heal_count: Number(r.heal_count ?? 0),
+    first_credited_at: String(r.first_credited_at ?? ""),
+    last_credited_at: String(r.last_credited_at ?? ""),
+    // Each lesson_credit row corresponds to ONE heal_audit_id, which
+    // attributes to ONE saved PR. heal_count is therefore the
+    // saved-PR count by construction. We surface both names so the
+    // SPA can pick the operator-friendly phrasing.
+    saved_pr_count: Number(r.heal_count ?? 0),
+  }));
+
+  return {
+    year,
+    range_start: rangeStart,
+    range_end: rangeEnd,
+    total_merged_prs: totalMergedPrs,
+    total_spend_usd: totalSpendUsd,
+    cost_per_pr_usd: costPerPrUsd,
+    roi_multiplier: roiMultiplier,
+    project_count: projectCount,
+    weekly_merges: weeklyMerges,
+    dip_week: dipWeek,
+    top_projects: topProjects,
+    top_lessons: topLessons,
+    generated_at: now.toISOString(),
+  };
+}
+
+/** Build the canonical ordered list of 52 ISO week labels for the
+ *  given year. SQLite's `strftime('%Y-%W', ...)` returns weeks 00..53
+ *  (Sunday-anchored). We normalise to "YYYY-Wnn" with nn ∈ 01..52
+ *  so the labels match what the test asserts. */
+function _yearIsoWeekLabels(year: number): string[] {
+  const labels: string[] = [];
+  for (let i = 1; i <= 52; i++) {
+    labels.push(`${year}-W${String(i).padStart(2, "0")}`);
+  }
+  return labels;
+}
+
+/** Translate a SQLite `strftime('%Y-%W', ts)` value (e.g. "2026-23")
+ *  into the canonical "YYYY-Wnn" label. SQLite's %W is 00-padded
+ *  weeks-since-first-Sunday; weeks 00 are mapped to W01 so they roll
+ *  into the year's opening week (the page is a calendar-year view —
+ *  no operator cares whether the first half-week is W00 or W01).
+ *  Weeks > 52 (rare year boundaries) are clamped to W52. */
+function _sqliteWeekToIsoWeekLabel(sqliteValue: string, year: number): string {
+  const m = sqliteValue.match(/^(\d{4})-(\d{1,2})$/);
+  if (!m) return `${year}-W01`;
+  let w = Number(m[2]);
+  if (!Number.isFinite(w) || w < 1) w = 1;
+  if (w > 52) w = 52;
+  return `${year}-W${String(w).padStart(2, "0")}`;
+}
+
+/** Find the single ISO week with the highest (closed_unmerged -
+ *  merged) delta, gated on "spend above the year median" so the
+ *  detector doesn't fire on a sleepy week. Returns null when no
+ *  week qualifies — "a clean year." The `quiet` flag toggles between
+ *  the loss-framing headline ("the dip — N PRs died") and the
+ *  neutral "lowest week" form. */
+function _detectDipWeek(
+  weeks: FleetYearInReviewWeek[],
+  quiet: boolean,
+): FleetYearInReviewDip | null {
+  if (weeks.length === 0) return null;
+  // Year-median spend across all 52 weeks.
+  const spendValues = weeks.map((w) => w.spend_usd).sort((a, b) => a - b);
+  const mid = Math.floor(spendValues.length / 2);
+  const medianSpend = spendValues.length % 2 === 0
+    ? (spendValues[mid - 1] + spendValues[mid]) / 2
+    : spendValues[mid];
+  // Candidate weeks: closed_unmerged > merged AND spend > median.
+  // Pick the highest delta among candidates; tie-break on highest
+  // spend then earliest week_iso so the result is deterministic.
+  let winner: FleetYearInReviewWeek | null = null;
+  let winnerDelta = -Infinity;
+  for (const w of weeks) {
+    const delta = w.closed_unmerged - w.merged;
+    if (delta <= 0) continue;
+    if (w.spend_usd <= medianSpend) continue;
+    if (delta > winnerDelta
+      || (delta === winnerDelta && winner && w.spend_usd > winner.spend_usd)
+      || (delta === winnerDelta && winner && w.spend_usd === winner.spend_usd
+          && w.week_iso < winner.week_iso)
+    ) {
+      winner = w;
+      winnerDelta = delta;
+    }
+  }
+  if (!winner) return null;
+  const headline = quiet
+    ? "the lowest week of the year"
+    : `the dip — ${winner.closed_unmerged} PRs died, ${winner.merged} merged, $${winner.spend_usd.toFixed(0)} spent`;
+  return {
+    week_iso: winner.week_iso,
+    merged: winner.merged,
+    closed_unmerged: winner.closed_unmerged,
+    spend_usd: winner.spend_usd,
+    headline,
+  };
+}
+
+/** Fixed-template per-project prose. Deterministic. No LLM, no
+ *  template-injection risk (the slug is bound from the project
+ *  table). */
+function _projectProse(
+  slug: string, mergedPrs: number, cppStr: string,
+  verdict: FleetYearInReviewProject["verdict"],
+): string {
+  const verdictLabel: Record<FleetYearInReviewProject["verdict"], string> = {
+    net_positive: "net-positive",
+    watch: "watch",
+    sunset_candidate: "sunset candidate",
+    insufficient_data: "insufficient data",
+  };
+  return `${slug} shipped ${mergedPrs} PRs at ${cppStr}. Verdict ${verdictLabel[verdict]}.`;
+}

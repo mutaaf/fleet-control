@@ -19,6 +19,13 @@ owner: gtm-innovation
   `'open'` for open PRs (line 188) and uppercase `'MERGED'` /
   `'CLOSED'` for closed PRs (line 235) — these tests + the
   fleetYearInReview SELECTs match the producer casing.
+- 2026-06-10 — shipped fleetYearInReview + GET /api/fleet/year/:year
+  + GET /year/:year (self-contained HTML, no <script>) + 1h memo
+  cache + globalThis invalidation hook + mobile/desktop CSS + SPA
+  hash route. Cache uses (MAX(pr.fetched_at), COUNT(*) FROM pr,
+  MAX(run.ended_at), COUNT(*) FROM run) per LESSONS 2026-06-07 (no
+  surrogate id on `pr`). 14 new test scenarios in
+  tests/year-in-review.test.ts cover each AC checkbox.
 
 ## User story
 
