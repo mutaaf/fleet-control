@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -1112,6 +1112,273 @@ function getChangelogCached(db: DB, opts: FleetChangelogOptions): FleetChangelog
   return value;
 }
 
+// Ticket 0050: fleet year-in-review memo cache.
+//
+// 1-hour TTL (the page moves slowly — it's a year-scale artifact).
+// Keyed by `year` + the cross-table tuple
+//   (year, MAX(pr.fetched_at), COUNT(*) FROM pr WHERE state IN
+//      ('MERGED','open','CLOSED'), MAX(run.ended_at), COUNT(*) FROM run)
+// per the AC. Per LESSONS 2026-06-07 "the `pr` table has no surrogate
+// `id`", the PR signal uses (MAX(fetched_at), COUNT(*)), NEVER
+// MAX(pr.id). Per LESSONS § "in-process dedup sets need an explicit
+// reset hook for tests" we expose `_resetYearInReviewCacheForTests()`.
+// Per LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap" we expose `_getYearInReviewCacheBuildsForTests()`
+// that ticks on every cache MISS.
+interface YearInReviewCacheEntry {
+  tuple: string;
+  value: FleetYearInReview;
+  expires_at: number;
+}
+const YEAR_IN_REVIEW_TTL_MS = 3600_000; // 1 hour
+const yearInReviewCache = new Map<number, YearInReviewCacheEntry>();
+let yearInReviewBuildCounter = 0;
+
+export function _resetYearInReviewCacheForTests(): void {
+  yearInReviewCache.clear();
+  yearInReviewBuildCounter = 0;
+}
+
+export function _getYearInReviewCacheBuildsForTests(): number {
+  return yearInReviewBuildCounter;
+}
+
+interface YearInReviewPrSummaryRow { mx: string | null; c: number | null; }
+interface YearInReviewRunSummaryRow { mx: string | null; c: number | null; }
+
+function yearInReviewInvalidationTuple(db: DB, year: number): string {
+  // PR signal: (MAX(fetched_at), COUNT(*)) across MERGED/open/CLOSED —
+  // either moving busts the cache.
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr "
+    + " WHERE state IN ('MERGED', 'open', 'CLOSED')",
+  ).get() as unknown as YearInReviewPrSummaryRow | undefined;
+  const runRow = db.prepare(
+    "SELECT MAX(ended_at) AS mx, COUNT(*) AS c FROM run",
+  ).get() as unknown as YearInReviewRunSummaryRow | undefined;
+  const prMx = prRow?.mx ?? "";
+  const prC = Number(prRow?.c ?? 0);
+  const runMx = runRow?.mx ?? "";
+  const runC = Number(runRow?.c ?? 0);
+  return `${year}|${prMx}|${prC}|${runMx}|${runC}`;
+}
+
+/** Production cache-invalidation hook — called from the
+ *  `runIngestPass` post-COMMIT tail via the `globalThis` slot
+ *  (per LESSONS 2026-06-05 "break ingest↔server cache-invalidation
+ *  cycles via a globalThis slot"). Clearing the map (not the build
+ *  counter) lets tests observe a counter increment on the next call
+ *  after an ingest. */
+export function _invalidateYearInReviewCacheAfterIngest(): void {
+  yearInReviewCache.clear();
+}
+
+// Register the year-in-review invalidation hook on the global object
+// so `runIngestPass` (in src/ingest/index.ts) can call it without
+// importing this module (which would create a cycle — server.ts
+// imports runIngestPass at the top). Same convention as the
+// changelog hook above; the double-underscore-prefix-and-suffix
+// reads as "do not collide".
+(globalThis as { __fleet_year_in_review_invalidate__?: () => void })
+  .__fleet_year_in_review_invalidate__ = _invalidateYearInReviewCacheAfterIngest;
+
+/** Look up a fresh year-in-review from the memo cache; rebuild on
+ *  miss. The invalidation tuple busts the entry the moment any of
+ *  the underlying signals advances (a fresh PR, run, or ingest tick
+ *  via the globalThis hook). */
+export function _yearInReviewCachedForTests(
+  db: DB, year: number, now: Date, opts?: { hourlyRateUsd?: number; hoursPerPr?: number; quietHoursActive?: boolean },
+): FleetYearInReview {
+  return getYearInReviewCached(db, year, now, opts);
+}
+
+function getYearInReviewCached(
+  db: DB, year: number, now: Date,
+  opts?: { hourlyRateUsd?: number; hoursPerPr?: number; quietHoursActive?: boolean },
+): FleetYearInReview {
+  const tuple = yearInReviewInvalidationTuple(db, year)
+    + `|${opts?.quietHoursActive ? "Q" : "L"}`
+    + `|${opts?.hourlyRateUsd ?? ""}`
+    + `|${opts?.hoursPerPr ?? ""}`;
+  const hit = yearInReviewCache.get(year);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  yearInReviewBuildCounter += 1;
+  const value = fleetYearInReview(db, year, now, opts);
+  yearInReviewCache.set(year, {
+    tuple, value, expires_at: Date.now() + YEAR_IN_REVIEW_TTL_MS,
+  });
+  return value;
+}
+
+/** Validate the `:year` route segment: must be a 4-digit integer.
+ *  Returns the parsed year, OR `null` for non-matching shapes so
+ *  the caller can 404. */
+function validateYearParam(raw: string): number | null {
+  if (!/^\d{4}$/.test(raw)) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+/** Strip token-shaped substrings + GitHub URLs from operator-visible
+ *  copy. Same shape as src/receipts.ts § redactSecrets — defence in
+ *  depth at the renderer boundary (LESSONS § "defence-in-depth secret
+ *  redaction at the renderer boundary"). */
+function redactSecretsForYearPage(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match) || /_/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+function escForYearPage(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Render the self-contained year-in-review HTML page. Inline
+ *  <style> reuses the existing portal style.css block (linked, NOT
+ *  inlined — the SW caches it via the shell strategy). No external
+ *  JS. */
+function renderYearInReviewPage(r: FleetYearInReview): string {
+  const year = r.year;
+  // Empty-fleet branch: zero projects, zero PRs.
+  if (r.project_count === 0 && r.total_merged_prs === 0) {
+    const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Fleet year-in-review ${escForYearPage(year)}</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body class="year-in-review-page">
+<main class="year-in-review" data-testid="year-in-review">
+  <div class="year-hero" data-testid="year-hero">
+    <div class="year-hero-headline">Nothing shipped in ${escForYearPage(year)}.</div>
+    <div class="year-hero-sub">Run <code>fleetctl onboard</code> to register your first project.</div>
+  </div>
+  <ul class="year-projects" data-testid="top-projects"></ul>
+  <ul class="year-lessons" data-testid="top-lessons"></ul>
+  <div class="year-sparkline" data-testid="year-sparkline">${renderSparklineSvg(r)}</div>
+  <button class="year-share" data-testid="copy-share-link" type="button">copy share link</button>
+</main>
+</body>
+</html>`;
+    return redactSecretsForYearPage(body);
+  }
+  // Hero numbers.
+  const heroPrs = String(r.total_merged_prs);
+  const heroSpend = "$" + (r.total_spend_usd >= 100
+    ? Math.round(r.total_spend_usd).toString()
+    : r.total_spend_usd.toFixed(2));
+  const heroRoi = r.roi_multiplier != null
+    ? `${r.roi_multiplier.toFixed(1)}x ROI`
+    : "ROI —";
+  const heroProjects = `${r.project_count} project${r.project_count === 1 ? "" : "s"}`;
+  // Top projects.
+  const projectCards = r.top_projects.map((p) => {
+    const slugSafe = escForYearPage(p.project_slug);
+    return `<li class="year-project" data-testid="top-project-${slugSafe}">`
+      + `<div class="year-project-slug">${slugSafe}</div>`
+      + `<div class="year-project-prose">${escForYearPage(p.prose)}</div>`
+      + `</li>`;
+  }).join("");
+  // Top lessons.
+  const lessonCards = r.top_lessons.map((L) => {
+    const slugSafe = escForYearPage(L.lesson_slug);
+    return `<li class="year-lesson" data-testid="top-lesson-${slugSafe}">`
+      + `<div class="year-lesson-slug">${slugSafe}</div>`
+      + `<div class="year-lesson-title">${escForYearPage(L.lesson_title)}</div>`
+      + `<div class="year-lesson-count">${escForYearPage(String(L.heal_count))} saves</div>`
+      + `<div class="year-lesson-date">${escForYearPage(L.lesson_date)}</div>`
+      + `</li>`;
+  }).join("");
+  const dipHeadline = r.dip_week
+    ? `<div class="year-dip-headline">${escForYearPage(r.dip_week.headline)}</div>`
+    : "";
+  const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Fleet year-in-review ${escForYearPage(year)}</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body class="year-in-review-page">
+<main class="year-in-review" data-testid="year-in-review">
+  <section class="year-hero" data-testid="year-hero">
+    <div class="year-hero-headline">in ${escForYearPage(year)} the fleet shipped ${escForYearPage(heroPrs)} PRs at ${escForYearPage(heroSpend)} spent</div>
+    <div class="year-hero-stats">
+      <span class="year-hero-stat">${escForYearPage(heroPrs)} PRs</span>
+      <span class="year-hero-stat">${escForYearPage(heroSpend)}</span>
+      <span class="year-hero-stat">${escForYearPage(heroRoi)}</span>
+      <span class="year-hero-stat">${escForYearPage(heroProjects)}</span>
+    </div>
+  </section>
+  <section class="year-sparkline" data-testid="year-sparkline">
+    ${renderSparklineSvg(r)}
+    ${dipHeadline}
+  </section>
+  <ul class="year-projects" data-testid="top-projects">${projectCards}</ul>
+  <ul class="year-lessons" data-testid="top-lessons">${lessonCards}</ul>
+  <button class="year-share" data-testid="copy-share-link" type="button">copy share link</button>
+</main>
+</body>
+</html>`;
+  return redactSecretsForYearPage(body);
+}
+
+/** Build the SVG sparkline for the weekly_merges series. 52 <rect>
+ *  children, one per ISO week. The dip-week bar (when present) gets
+ *  the `dip-week` testid + a red fill. */
+function renderSparklineSvg(r: FleetYearInReview): string {
+  // We always render exactly 52 bars even when the helper returned
+  // more (rare year-boundary spillover) so the test contract holds.
+  const series = r.weekly_merges.slice(0, 52);
+  while (series.length < 52) {
+    series.push({ week_iso: `${r.year}-W${String(series.length + 1).padStart(2, "0")}`, merged: 0, closed_unmerged: 0, spend_usd: 0 });
+  }
+  const max = Math.max(1, ...series.map((s) => s.merged));
+  const w = 4;
+  const gap = 2;
+  const h = 40;
+  const totalW = series.length * (w + gap);
+  const dipWeek = r.dip_week?.week_iso;
+  const bars = series.map((s, i) => {
+    const barH = Math.max(1, Math.round((s.merged / max) * h));
+    const x = i * (w + gap);
+    const y = h - barH;
+    const isDip = s.week_iso === dipWeek;
+    const fill = isDip ? "#c0392b" : "#7aa";
+    const testid = isDip ? ` data-testid="dip-week"` : "";
+    return `<rect x="${x}" y="${y}" width="${w}" height="${barH}" fill="${fill}"${testid}></rect>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${totalW} ${h}" width="100%" height="${h}" role="img" aria-label="weekly merges">${bars}</svg>`;
+}
+
+/** Single chokepoint the server hits for GET /year/<YYYY>. Returns the
+ *  status + headers + body the http handler emits. Pure so unit tests
+ *  can drive it directly. */
+function serveYearPage(
+  db: DB, cfg: FleetConfig, year: number, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const headers: Record<string, string> = {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "public, max-age=3600",
+  };
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const payload = getYearInReviewCached(db, year, now, { quietHoursActive: quiet });
+  const body = renderYearInReviewPage(payload);
+  return { status: 200, headers, body };
+}
+
 /** Stable per-actor key used for the home_last_seen_<actor> watermark
  *  + the monday-catchup cache partition. Loopback is the literal
  *  string "loopback"; a remote token is the token's id (the SHA-256
@@ -1698,6 +1965,34 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           });
           return res.end(body);
         }
+        // Ticket 0050: fleet year-in-review JSON route. Composes pr,
+        // cost_rollup_day, lesson_credit + the per-project worth-it
+        // verdict (0048) into the documented payload. 1-hour memo
+        // cache keyed by year + the cross-table invalidation tuple
+        // (PR signal = (MAX(fetched_at), COUNT(*)) per LESSONS
+        // 2026-06-07 "the pr table has no surrogate id"; run signal =
+        // (MAX(ended_at), COUNT(*))). Net-new route; no existing JSON
+        // shape to preserve. Empty / never-ingested years return 200
+        // with zero totals — a legit question with a legit answer.
+        // Years > now+1 year return 400.
+        const yearJsonMatch = path.match(/^\/api\/fleet\/year\/([^/]+)$/);
+        if (yearJsonMatch) {
+          const yr = validateYearParam(yearJsonMatch[1]);
+          if (yr == null) return json(res, { error: "year not found" }, 404);
+          const nowDate = new Date();
+          if (yr > nowDate.getUTCFullYear() + 1) {
+            return json(res, { error: "year out of range" }, 400);
+          }
+          const quiet = quietHoursActiveAnywhere(cfg, nowDate);
+          const v = getYearInReviewCached(db, yr, nowDate, { quietHoursActive: quiet });
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=3600",
+          });
+          return res.end(body);
+        }
         // Ticket 0048: per-project worth-it verdict — composes 0035
         // (cost-per-PR), 0022 (fleet temp), 0026 (streak), 0044
         // (spend-efficiency framing) plus a worth_it config block
@@ -2118,6 +2413,29 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       const rm = path.match(/^\/receipts\/([\w-]+)\/(\d{4}-\d{2})$/);
       if (rm && req.method === "GET") {
         const result = getReceiptsCached(db, rm[1], rm[2]);
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0050: fleet year-in-review HTML page. Self-contained
+      // single-column document (no external JS — the SPA does NOT
+      // own this rendering; the SW caches the page opportunistically
+      // via the existing cache-first shell strategy). No auth — the
+      // URL is intentionally local-only-by-default but loopback-safe
+      // (no operator state on the page). Mirrors the /receipts/<slug>/
+      // <month> precedent.
+      const ym = path.match(/^\/year\/(\d{4})$/);
+      if (ym && req.method === "GET") {
+        const yr = validateYearParam(ym[1]);
+        if (yr == null) {
+          res.writeHead(404, { "content-type": "text/plain" });
+          return res.end("year not found");
+        }
+        const now = new Date();
+        if (yr > now.getUTCFullYear() + 1) {
+          res.writeHead(400, { "content-type": "text/plain" });
+          return res.end("year out of range");
+        }
+        const result = serveYearPage(db, cfg, yr, now);
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }

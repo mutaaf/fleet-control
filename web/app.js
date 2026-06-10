@@ -4125,6 +4125,18 @@ async function route() {
       // home view's 5s refresh picks up new numbers via the summary
       // line.
       await costPerPr();
+    } else if (path.startsWith("year/")) {
+      // Ticket 0050: fleet year-in-review. The page is a SELF-CONTAINED
+      // server-rendered HTML document (like /receipts/<slug>/<month>);
+      // the SPA's job here is to navigate to the server route, never
+      // own the rendering. The SW (0029) caches the response via the
+      // cache-first shell branch so the offline fallback still works.
+      const yr = path.slice("year/".length);
+      if (/^\d{4}$/.test(yr)) {
+        location.href = "/year/" + yr;
+        return;
+      }
+      await home();
     } else {
       await home();
       timer = setInterval(() => home().catch(() => {}), 5000);

@@ -101,5 +101,15 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_worth_it_invalidate__?: () => void }).__fleet_worth_it_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0050: fleet year-in-review memo cache. Same globalThis-slot
+  // pattern as the changelog / autopsy / worth-it hooks above (per
+  // LESSONS 2026-06-05 "break ingest↔server cache-invalidation cycles
+  // via a globalThis slot, not a circular import"). A freshly-merged
+  // or freshly-closed PR is the page's main signal to refresh; the
+  // 1-hour TTL would otherwise stale the page for an hour.
+  try {
+    const hook = (globalThis as { __fleet_year_in_review_invalidate__?: () => void }).__fleet_year_in_review_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

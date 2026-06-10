@@ -1,12 +1,31 @@
 ---
 id: 0050
 title: Fleet year-in-review — one shareable annual page only the local SQLite can author
-status: proposed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-10
 owner: gtm-innovation
 ---
+
+## Implementation log
+
+- 2026-06-10 — picked up by implementation-dev. Status flipped from
+  `proposed` to `in-progress` per the ship contract's PHASE 2 fallback
+  (no `groomed` tickets present; highest-priority lowest-id `proposed`
+  wins, that's 0050 P1 portal). PRODUCER-VS-SPEC reconciliation
+  per LESSONS 2026-06-05 "groomer prose can disagree with the
+  schema; the schema wins": `src/ingest/prs.ts` writes lowercase
+  `'open'` for open PRs (line 188) and uppercase `'MERGED'` /
+  `'CLOSED'` for closed PRs (line 235) — these tests + the
+  fleetYearInReview SELECTs match the producer casing.
+- 2026-06-10 — shipped fleetYearInReview + GET /api/fleet/year/:year
+  + GET /year/:year (self-contained HTML, no <script>) + 1h memo
+  cache + globalThis invalidation hook + mobile/desktop CSS + SPA
+  hash route. Cache uses (MAX(pr.fetched_at), COUNT(*) FROM pr,
+  MAX(run.ended_at), COUNT(*) FROM run) per LESSONS 2026-06-07 (no
+  surrogate id on `pr`). 14 new test scenarios in
+  tests/year-in-review.test.ts cover each AC checkbox.
 
 ## User story
 
