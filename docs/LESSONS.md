@@ -532,3 +532,43 @@ day)`), `project_alias` (PK `alias_slug`), `pricing` (PK `model`),
 `watermark` (PK `source`), `inbox_dismissal` (PK `(kind,
 project_slug, payload_id)`), `home_last_seen` — same trap applies
 to any future cache keyed off "the latest row in any of these."
+
+## 2026-06-10 — when an ingester grows a second shell-out, legacy stubs that don't discriminate on argv silently collide
+
+Symptom: while shipping ticket 0049 I extended
+`src/ingest/prs.ts` to fire `gh pr list --state closed` alongside
+the existing `--state open` call. The new tests in
+`tests/prs-ingest-closed.test.ts` passed instantly, but three
+legacy test files (`tests/prs-ingest.test.ts`,
+`tests/correlate.test.ts`, `tests/health.test.ts`) started
+failing with `UNIQUE constraint failed: pr.project_id, pr.number`.
+Each of those legacy stubs is shaped
+`_setPrRunnerForTests((cmd, args) => { if (cmd === "gh" &&
+args[0] === "pr" && args[1] === "list") return JSON.stringify([
+{ number: 42, ... } ]); return ""; })` — it returned the SAME
+PR payload for ANY `gh pr list` invocation regardless of argv.
+Pre-0049 that was fine because the ingester only called gh once
+per pass. Post-0049 the same row tried to land twice (once
+through the open INSERT, once through the closed INSERT) and
+hit the composite PK. Cause: the test stubs simulated gh's
+behaviour at a coarser granularity than the production
+ingester's call surface — the stubs ignored the very flag
+(`--state`) that real gh uses to differentiate which rows it
+returns. Fix: tighten each affected stub to inspect
+`args.indexOf("--state")` and return `[]` for the non-target
+state (a refinement, not a weakening — real gh never returns
+the same PR row for both `--state open` AND `--state closed`).
+General rule for this repo: when adding a SECOND shell-out
+through an existing runner seam (`_setRunnerForTests`,
+`_setPrRunnerForTests`, etc.), audit every test that uses the
+seam — any stub that returns a non-empty payload for "any
+matching command" is a latent PK / dedup-key collision the
+moment the new shell-out reuses the same gh subcommand with
+different flags. The fix is always in the stub: discriminate
+on the same axis the real CLI does (`--state`, `--repo`,
+`--branch`, `--json` field projection, etc.). Same trap will
+bite any future ingester that grows from one→N shell-outs
+against the same `gh` / `launchctl` / `git` subcommand. The
+production side has an idempotency option (UPSERT or per-row
+dedup map) but that hides the test-stub gap; tightening the
+stub is the cleaner signal.
