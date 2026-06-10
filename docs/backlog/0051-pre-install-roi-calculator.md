@@ -1,12 +1,30 @@
 ---
 id: 0051
 title: Pre-install ROI calculator — public /calculator page projects fleet-control's value before any install
-status: proposed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-10
 owner: gtm-innovation
 ---
+
+## Implementation log
+
+- 2026-06-10 — implementation-dev: opened `feat/0051-pre-install-roi-calculator`.
+  Producer-vs-spec reconciliation (LESSONS 2026-06-05 + 0040 lesson): grepped
+  `src/ingest/prs.ts:184-244` — the producer writes `state='MERGED'`
+  uppercase (verbatim from gh) for merged PRs and the established readers
+  (`spendEfficiencyRanking` `src/views.ts:4297`, `projectWorthItVerdict`
+  `src/views.ts:5361`) match that casing literally. `is_agent` is the
+  producer's `AGENT_RE.test(p.headRefName)` (branches starting with
+  `feat/`, `chore/gtm-`, or `eng/`) — we reuse the same predicate by
+  filtering on `is_agent = 1` like 0044 / 0048 do. The `pr` table has
+  no surrogate id (PK `(project_id, number)` per LESSONS 2026-06-07),
+  so the cache invalidation tuple uses `(MAX(pr.fetched_at), COUNT(*),
+  MAX(run.ended_at))` — never `MAX(pr.id)`. The median helper composes
+  the same per-project monthly throughput primitive 0044 already
+  computes (per-project merged PRs over a window, JS-side aggregation
+  via the existing `_jsMedian` helper).
 
 ## User story
 
