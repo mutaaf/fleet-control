@@ -1,7 +1,7 @@
 ---
 id: 0051
 title: Pre-install ROI calculator — public /calculator page projects fleet-control's value before any install
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-10
