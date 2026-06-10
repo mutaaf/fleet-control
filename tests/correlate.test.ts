@@ -243,7 +243,12 @@ test("AC3: ingestProjectPRs populates first_fail_excerpt from gh run view --log-
     //   2. `gh run view --log-failed ...` → raw log payload.
     let logCallCount = 0;
     _setPrRunnerForTests((cmd, args) => {
+      // Ticket 0049: the ingester fires `gh pr list` once per state.
+      // This test exercises only the open path; closed returns [].
       if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        const stateIdx = args.indexOf("--state");
+        const state = stateIdx >= 0 ? args[stateIdx + 1] : "open";
+        if (state !== "open") return "[]";
         return JSON.stringify([
           {
             number: 99, title: "demo", headRefName: "feat/x",
@@ -286,7 +291,12 @@ test("AC3: PRs with no failing check leave first_fail_excerpt NULL", () => {
   try {
     const pid = seedProject(db, "happy");
     _setPrRunnerForTests((cmd, args) => {
+      // Ticket 0049: ingester fires open + closed `gh pr list` calls;
+      // this test exercises only the open path.
       if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        const stateIdx = args.indexOf("--state");
+        const state = stateIdx >= 0 ? args[stateIdx + 1] : "open";
+        if (state !== "open") return "[]";
         return JSON.stringify([
           {
             number: 7, title: "all good", headRefName: "feat/y",

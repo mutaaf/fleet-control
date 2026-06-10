@@ -168,7 +168,14 @@ test("AC2: ingestProjectPRs persists heal_attempts from gh commits payload", () 
   try {
     const pid = seedProject(db, "withheals");
     _setPrRunnerForTests((cmd, args) => {
+      // Ticket 0049: the ingester now fires `gh pr list --state open`
+      // AND `gh pr list --state closed`. This test exercises only the
+      // open path; the closed path returns an empty array so no extra
+      // rows land.
       if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        const stateIdx = args.indexOf("--state");
+        const state = stateIdx >= 0 ? args[stateIdx + 1] : "open";
+        if (state !== "open") return "[]";
         return JSON.stringify([
           ghRow({
             number: 11, title: "ship 0099", headRefName: "feat/0099-foo",
@@ -250,7 +257,13 @@ test("AC3: ingestProjectPRs persists first_fail_check from the rollup", () => {
   try {
     const pid = seedProject(db, "ingestme");
     _setPrRunnerForTests((cmd, args) => {
+      // Ticket 0049: ingester fires open + closed `gh pr list` calls.
+      // This test exercises only the open path; the closed path
+      // returns an empty array so no extra rows land.
       if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        const stateIdx = args.indexOf("--state");
+        const state = stateIdx >= 0 ? args[stateIdx + 1] : "open";
+        if (state !== "open") return "[]";
         return JSON.stringify([
           ghRow({
             number: 3, title: "red ship", headRefName: "feat/red",
@@ -302,7 +315,13 @@ test("AC4: re-ingesting the same gh payload twice keeps heal_attempts + first_fa
       }),
     ]);
     _setPrRunnerForTests((cmd, args) => {
-      if (cmd === "gh" && args[0] === "pr" && args[1] === "list") return payload;
+      // Ticket 0049: differentiate open vs closed fetches — this AC
+      // is about the open path's delete/insert idempotency.
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        const stateIdx = args.indexOf("--state");
+        const state = stateIdx >= 0 ? args[stateIdx + 1] : "open";
+        return state === "open" ? payload : "[]";
+      }
       return "";
     });
     try {

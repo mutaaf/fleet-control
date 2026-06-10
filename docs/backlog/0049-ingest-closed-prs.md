@@ -1,7 +1,7 @@
 ---
 id: 0049
 title: Ingest closed (non-merged) PRs into the pr table so the autopsy card lights up in production
-status: groomed
+status: in-progress
 priority: P1
 area: ingest
 created: 2026-06-09
@@ -92,3 +92,28 @@ small but worth its own PR because:
   for CLOSED + MERGED we write the gh value verbatim
   (matches the existing `state = 'MERGED'` reader
   convention).
+
+## Implementation log
+
+- 2026-06-10 — implementation-dev picked up; flipped status to
+  in-progress on `feat/0049-ingest-closed-prs`. Also folded the
+  0048 drift fix on this branch (PR #112 merged 2026-06-10 but
+  the frontmatter + README index row still read `in-progress`).
+  Verified producer/reader state casings: existing readers
+  scattered across `src/views.ts`, `src/server.ts`,
+  `src/receipts.ts`, `src/correlate.ts` only ever filter by
+  `'open'` (lowercase), `'MERGED'` (uppercase), or `'CLOSED'`
+  (uppercase). Writing gh's verbatim CLOSED/MERGED tokens is
+  structurally safe; open rows continue to write `'open'`
+  lowercase per the 0040 LESSON.
+- 2026-06-10 — stretch AC (closed_by + human_rejected cascade)
+  is OUT of scope for this PR. Reasoning: gh's `--json closedBy`
+  is not a documented field on `gh pr list`; surfacing it
+  requires a per-PR `gh pr view <n>` shell-out per closed PR
+  per tick. That is a meaningful new shell-out budget AND a
+  schema migration (ALTER TABLE pr ADD COLUMN closed_by). The
+  ticket's own Engineering Notes flag this as "Worth landing
+  inside this PR with its own tests" but per AGENTS.md
+  "Don't exceed scope to chase a stretch goal" — landing the
+  primary fetch + writer change in this PR, deferring the
+  closed_by column to a follow-up ticket.

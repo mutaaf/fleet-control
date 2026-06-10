@@ -1,7 +1,7 @@
 ---
 id: 0048
 title: Per-project worth-it verdict - each project card emits a yearly-trajectory "keep, watch, or sunset" call
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-09
