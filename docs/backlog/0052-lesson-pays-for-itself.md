@@ -1,12 +1,45 @@
 ---
 id: 0052
 title: Lesson-pays-for-itself ledger — each cross-fleet lesson grows a $$ saved tally from the heal-credit attributions
-status: proposed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-10
 owner: gtm-innovation
 ---
+
+## Implementation log
+
+- 2026-06-10 — Picked up by implementation-dev on
+  `feat/0052-lesson-pays-for-itself`. PRODUCER-VS-SPEC reconciliation:
+  - `run.outcome` failed-run literal: the producer in
+    `src/ingest/transcripts.ts:outcomeOf()` does NOT emit a "failed"
+    label directly (the seven branches are smoke, usage-limit, shipped,
+    healed, no-op, reviewed-changes, reviewed-ok, self-cancel). The
+    de-facto schema-language across the rest of the codebase
+    (`views.ts`, tests for `inbox`, `streak`, `badge`, `health`,
+    `monday-catchup`, `friday-wrap`, `glance`) treats `outcome =
+    'failure'` (lowercase) as the failed-run literal — that's the
+    fleet-control convention. Implementation matches: SELECT
+    `outcome = 'failure'`.
+  - `control_audit.action` heal literal: producer is the `audit()`
+    helper in `src/control.ts`. Existing helpers (`src/lessons.ts:627`,
+    `src/views.ts:3128, 4650, 4787, 4958`, `src/server.ts:265,504`)
+    all use `action = 'heal'` lowercase. Matches.
+  - Existing route `/api/fleet/lessons` (not `/api/lessons` as the
+    spec prose says). New route lands as `/api/fleet/lessons/savings`.
+    The additive `savings` field is appended onto the existing
+    `/api/fleet/lessons` shape per AC4.
+  - `lesson_credit` PK is composite `(lesson_slug, lesson_date,
+    heal_audit_id)` — no surrogate id. Cache invalidation tuple uses
+    `(MAX(created_at), COUNT(*))` on lesson_credit + `(MAX(ended_at),
+    COUNT(*))` on run filtered to `outcome = 'failure'`.
+  - GlobalThis slot for cache invalidation:
+    `__fleet_lesson_savings_invalidate__`. Registered from
+    `src/server.ts` on module load; read lazily from `runIngestPass`
+    (after COMMIT) and from `attributeHealsToLessons()` in
+    `src/lessons.ts` (after a non-zero insert count).
+  - USD formatter in SPA: `usd(n)` (not `fmtUsd` / `formatDollars`).
 
 ## User story
 
