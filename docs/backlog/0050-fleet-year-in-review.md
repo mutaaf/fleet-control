@@ -1,7 +1,7 @@
 ---
 id: 0050
 title: Fleet year-in-review — one shareable annual page only the local SQLite can author
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-10
