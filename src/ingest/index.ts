@@ -111,5 +111,19 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_year_in_review_invalidate__?: () => void }).__fleet_year_in_review_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0051: pre-install ROI calculator memo cache. Same
+  // globalThis-slot pattern as the changelog / autopsy / worth-it /
+  // year-in-review hooks above (per LESSONS 2026-06-05 "break
+  // ingest↔server cache-invalidation cycles via a globalThis slot,
+  // not a circular import"). The median composes pr + cost_rollup_day
+  // + run — any of which an ingest tick can touch — so the simplest
+  // correct behaviour is to clear the cache on every commit and let
+  // the next request rebuild. The /calculator HTML page reads from
+  // the same memo so its 5-min Cache-Control TTL also gets refreshed
+  // semantics on the server side.
+  try {
+    const hook = (globalThis as { __fleet_median_projection_invalidate__?: () => void }).__fleet_median_projection_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

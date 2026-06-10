@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -939,6 +939,428 @@ function worthItResolvedKnobs(cfg: FleetConfig): { rate: number; hours: number }
   const rate = typeof wt.hourly_rate_usd === "number" ? wt.hourly_rate_usd : 75;
   const hours = typeof wt.hours_per_pr === "number" ? wt.hours_per_pr : 1;
   return { rate, hours };
+}
+
+// Ticket 0051: "Pre-install ROI calculator" memo cache.
+//
+// 15-min TTL (matches Cache-Control: max-age=900 — the median moves
+// slowly; same window as 0044 / 0048). The cache is keyed per
+// (windowDays, percentile) so the public route's default (90d / p25)
+// and any future override request don't collide. Invalidation is a
+// THREE-VALUE tuple:
+//
+//   - latestPrFetchedAt = SELECT MAX(fetched_at) FROM pr
+//                           WHERE state='MERGED' AND is_agent=1
+//   - mergedPrCount     = SELECT COUNT(*)        FROM pr
+//                           WHERE state='MERGED' AND is_agent=1
+//   - latestRunEndedAt  = SELECT MAX(ended_at)   FROM run
+//
+// The `pr` table has NO surrogate `id` (PK is `(project_id, number)`)
+// so we proxy "fresh merge landed" via the (MAX(fetched_at), COUNT(*))
+// pair per LESSONS 2026-06-07 "the `pr` table has no surrogate `id`;
+// proxy 'latest landed' via (MAX(fetched_at), COUNT(*))" — NEVER
+// `MAX(pr.id)`. The third tuple value captures a fresh run-end so the
+// spend axis (which composes via cost_rollup_day, derived from `run`
+// rows on every ingest pass) also busts the cache when it shifts.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetMedianProjectionCacheForTests()`. Per
+// LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap" we also expose
+// `_getMedianProjectionCacheBuildsForTests()`; it ticks on every
+// cache MISS so route tests assert hit/miss semantics without
+// stubbing SQL. Production code never reads either.
+//
+// Per LESSONS 2026-06-05 "break ingest↔server cache-invalidation
+// cycles via a globalThis slot, not a circular import": the ingest
+// pass calls a hook registered on
+// `globalThis.__fleet_median_projection_invalidate__` so a fresh PR
+// ingest tick clears the cache without waiting out the TTL. The slot
+// is registered below at module load time and read lazily by the
+// ingest module — same shape as the 0039 changelog / 0047 autopsy /
+// 0048 worth-it / 0050 year-in-review hooks.
+interface MedianProjectionCacheEntry {
+  tuple: string;
+  value: FleetMedianProjection;
+  expires_at: number;
+}
+const MEDIAN_PROJECTION_TTL_MS = 900_000;
+const medianProjectionCache = new Map<string, MedianProjectionCacheEntry>();
+let medianProjectionBuildCounter = 0;
+
+export function _resetMedianProjectionCacheForTests(): void {
+  medianProjectionCache.clear();
+  medianProjectionBuildCounter = 0;
+}
+
+export function _getMedianProjectionCacheBuildsForTests(): number {
+  return medianProjectionBuildCounter;
+}
+
+interface MedianProjectionPrSummaryRow { mx: string | null; c: number | null; }
+interface MedianProjectionRunSummaryRow { mx: string | null; }
+
+function medianProjectionInvalidationTuple(
+  db: DB, windowDays: number, percentile: "p25" | "median",
+): string {
+  // (MAX(fetched_at), COUNT(*)) over merged agent PRs — the canonical
+  // "fresh merge landed" pair per LESSONS 2026-06-07. NEVER MAX(pr.id)
+  // (the column doesn't exist; PK is (project_id, number)).
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c "
+    + "  FROM pr WHERE state = 'MERGED' AND is_agent = 1",
+  ).get() as unknown as MedianProjectionPrSummaryRow | undefined;
+  // MAX(run.ended_at) captures a fresh run-end so the spend axis
+  // (derived from `run` rows on every ingest pass via
+  // recomputeRollups) busts the cache when it advances.
+  const runRow = db.prepare(
+    "SELECT MAX(ended_at) AS mx FROM run",
+  ).get() as unknown as MedianProjectionRunSummaryRow | undefined;
+  const mx = prRow?.mx ?? "";
+  const c = Number(prRow?.c ?? 0);
+  const rmx = runRow?.mx ?? "";
+  return `${windowDays}|${percentile}|${mx}|${c}|${rmx}`;
+}
+
+function medianProjectionCacheKey(windowDays: number, percentile: "p25" | "median"): string {
+  return `${windowDays}|${percentile}`;
+}
+
+function getMedianProjectionCached(
+  db: DB, now: Date, windowDays: number, percentile: "p25" | "median",
+): FleetMedianProjection {
+  const tuple = medianProjectionInvalidationTuple(db, windowDays, percentile);
+  const key = medianProjectionCacheKey(windowDays, percentile);
+  const hit = medianProjectionCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) {
+    return hit.value;
+  }
+  medianProjectionBuildCounter += 1;
+  const value = fleetMedianProjection(db, now, { windowDays, percentile });
+  medianProjectionCache.set(key, {
+    tuple, value, expires_at: Date.now() + MEDIAN_PROJECTION_TTL_MS,
+  });
+  return value;
+}
+
+/** Clear the median-projection memo so the next request rebuilds.
+ *  Called by the ingest pass via the globalThis slot below — same
+ *  shape as the changelog / autopsy / worth-it / year-in-review hooks
+ *  (registered at module load), so the ingest module never imports
+ *  server.ts. */
+export function _invalidateMedianProjectionCacheAfterIngest(): void {
+  medianProjectionCache.clear();
+}
+
+(globalThis as { __fleet_median_projection_invalidate__?: () => void })
+  .__fleet_median_projection_invalidate__ = _invalidateMedianProjectionCacheAfterIngest;
+
+// ────────────────────────────────────────────────────────────────────
+// /calculator HTML page (ticket 0051).
+//
+// Self-contained single-column document — NO external JS, NO bundled
+// SPA, NO new runtime deps. Inline <style> block carries the mobile-
+// first layout per the 0011 contract. Pure HTML form: action=/calculator
+// method=GET so the result URL is bookmarkable / shareable. The form
+// renders identically every time; when the URL carries query params we
+// additionally render a result block below.
+// ────────────────────────────────────────────────────────────────────
+
+/** Strip token-shaped substrings + GitHub URLs from operator-visible
+ *  copy. Same shape as src/receipts.ts § redactSecrets — defence in
+ *  depth at the renderer boundary (LESSONS § "defence-in-depth secret
+ *  redaction at the renderer boundary"). The aggregated calculator
+ *  carries no operator data by design, but a future regression that
+ *  embeds a token-shaped substring (e.g. a project slug that looks
+ *  like base64) is caught here before res.end. */
+function redactSecretsForCalculator(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match) || /_/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+function escForCalculator(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Constants for input validation — matched in both the route handler
+ *  and the test suite. */
+const REPOS_MIN = 1;
+const REPOS_MAX = 20;
+const RATE_MIN = 1;
+const RATE_MAX = 1000;
+const USERNAME_RE = /^[A-Za-z0-9-]{1,39}$/;
+
+interface CalculatorParsed {
+  repos: number;        // clamped to [REPOS_MIN, REPOS_MAX]
+  hourlyRateUsd: number; // clamped if valid
+  username: string;
+  // The raw values are kept for error rendering so the form retains
+  // the offending input rather than silently replacing it with the
+  // clamp.
+  rawRepos: string;
+  rawRate: string;
+  rawUsername: string;
+  errors: string[];
+  hasParams: boolean;
+}
+
+/** Parse + validate query params for /calculator. Separates the
+ *  URL-shape parse from the value-validation logic so error messages
+ *  stay precise (LESSONS § "route regex for 'owner/name' slugs needs
+ *  an embedded slash" — different surface, same principle: keep the
+ *  shape match permissive and the value validation strict). */
+function parseCalculatorParams(url: URL): CalculatorParsed {
+  const params = url.searchParams;
+  const rawUsername = params.get("u") ?? "";
+  const rawRepos = params.get("n") ?? "";
+  const rawRate = params.get("r") ?? "";
+  const hasParams = params.has("u") || params.has("n") || params.has("r");
+  const errors: string[] = [];
+
+  // Username validation: cosmetic (no GitHub API call). Empty is
+  // allowed so an unfilled form doesn't render the error block.
+  let username = rawUsername;
+  if (rawUsername && !USERNAME_RE.test(rawUsername)) {
+    errors.push(
+      "username must match GitHub rules: 1–39 chars, letters/digits/hyphens only",
+    );
+    // Keep the raw value for the form (the input retains it); the
+    // result-block render path skips when there are errors.
+    username = rawUsername;
+  }
+
+  // Repos: integer in [REPOS_MIN, REPOS_MAX]. Out-of-range numbers
+  // CLAMP silently (the AC's "submit n=999, assert clamps to 20"
+  // contract); non-numeric / negative values are an error.
+  let repos = 3; // default
+  if (rawRepos) {
+    const n = Number(rawRepos);
+    if (!Number.isFinite(n) || Math.floor(n) !== n || n < 0) {
+      errors.push("repos must be a positive integer");
+    } else if (n < REPOS_MIN) {
+      // Below the floor: clamp UP to the floor silently. (Sub-1 is
+      // not strictly "invalid" but is meaningless; the spec calls for
+      // a clamp at both ends.)
+      repos = REPOS_MIN;
+    } else if (n > REPOS_MAX) {
+      repos = REPOS_MAX;
+    } else {
+      repos = Math.floor(n);
+    }
+  }
+
+  // Hourly rate: number in [RATE_MIN, RATE_MAX]. Negative values are
+  // an error (the AC's "submit r=-5, assert form shows an error").
+  let hourlyRateUsd = 75; // default
+  if (rawRate) {
+    const r = Number(rawRate);
+    if (!Number.isFinite(r) || r < 0) {
+      errors.push("hourly rate must be a positive number");
+    } else if (r < RATE_MIN) {
+      hourlyRateUsd = RATE_MIN;
+    } else if (r > RATE_MAX) {
+      hourlyRateUsd = RATE_MAX;
+    } else {
+      hourlyRateUsd = r;
+    }
+  }
+
+  return {
+    repos, hourlyRateUsd, username,
+    rawRepos, rawRate, rawUsername,
+    errors, hasParams,
+  };
+}
+
+const CALCULATOR_FOOTER_REPO_URL = "https://github.com/" + "mutaaf/fleet-control";
+
+function fmtUsdForCalculator(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  if (n < 1) return "$" + n.toFixed(2);
+  if (n < 100) return "$" + n.toFixed(2);
+  return "$" + Math.round(n).toString();
+}
+
+function fmtNumberForCalculator(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  if (n < 1 && n > 0) return n.toFixed(2);
+  if (n < 10) return n.toFixed(1);
+  return Math.round(n).toString();
+}
+
+/** Render the self-contained /calculator HTML page. Pure HTML form;
+ *  optional result block when query params are present. Inline <style>
+ *  carries the mobile-first layout per the 0011 contract. */
+function renderCalculatorPage(
+  parsed: CalculatorParsed,
+  median: FleetMedianProjection,
+): string {
+  const insufficient = median.projects_observed < 2
+    || median.merged_prs_per_month <= 0
+    || median.cost_per_pr_usd == null;
+
+  const safeUsername = escForCalculator(parsed.rawUsername);
+  // For the repos + rate inputs: when validation succeeded we render
+  // the CLAMPED value (so `?n=999` shows `value="20"` per the AC's
+  // clamp contract); when validation failed we keep the raw value so
+  // the user can correct the offending input.
+  const reposErrorRaised = parsed.errors.some((e) => /repos/i.test(e));
+  const rateErrorRaised = parsed.errors.some((e) => /rate/i.test(e));
+  const safeRepos = escForCalculator(
+    reposErrorRaised
+      ? (parsed.rawRepos || String(parsed.repos))
+      : (parsed.rawRepos ? String(parsed.repos) : String(parsed.repos)),
+  );
+  const safeRate = escForCalculator(
+    rateErrorRaised
+      ? (parsed.rawRate || String(parsed.hourlyRateUsd))
+      : (parsed.rawRate ? String(parsed.hourlyRateUsd) : String(parsed.hourlyRateUsd)),
+  );
+
+  const errorBlock = parsed.errors.length > 0
+    ? `<div class="calc-error" data-testid="calculator-error">`
+      + parsed.errors.map((e) => `<div>${escForCalculator(e)}</div>`).join("")
+      + `</div>`
+    : "";
+
+  let resultBlock = "";
+  if (parsed.hasParams && parsed.errors.length === 0) {
+    if (insufficient) {
+      // Honest empty-fleet copy. Links to /demo for seeded numbers.
+      resultBlock = `<section class="calc-result" data-testid="calculator-result">`
+        + `<div class="calc-empty">`
+        + `<div class="calc-empty-title">This fleet is too small to compute a median yet.</div>`
+        + `<div class="calc-empty-body">Try the demo at <a href="/demo">/demo</a> for seeded numbers, or install fleet-control and let it observe your own runs.</div>`
+        + `</div></section>`;
+    } else {
+      const projection = computeRoiProjection(median, {
+        repos: parsed.repos,
+        hourlyRateUsd: parsed.hourlyRateUsd,
+      });
+      const prsLine = fmtNumberForCalculator(projection.projected_merged_prs);
+      const spendLine = fmtUsdForCalculator(projection.projected_spend_usd);
+      const cppLine = projection.projected_cost_per_pr_usd != null
+        ? fmtUsdForCalculator(projection.projected_cost_per_pr_usd)
+        : "—";
+      const roiLine = projection.roi_multiplier != null
+        ? projection.roi_multiplier.toFixed(1) + "x"
+        : "—";
+      const humanLine = fmtUsdForCalculator(projection.human_equivalent_cost_usd);
+      const usernameGreeting = parsed.username
+        ? escForCalculator(parsed.username) + ", here's your projection"
+        : "Your projection";
+      const medianLine = `Based on the ${escForCalculator(projection.percentile_label)}: ${fmtNumberForCalculator(median.merged_prs_per_month)} merged PRs/month at ${fmtUsdForCalculator(median.cost_per_pr_usd ?? 0)} per PR per project.`;
+      resultBlock = `<section class="calc-result" data-testid="calculator-result">`
+        + `<div class="calc-result-greeting">${usernameGreeting}</div>`
+        + `<div class="calc-result-stats">`
+        + `<div class="calc-stat"><div class="calc-stat-value calc-headline">${escForCalculator(prsLine)}</div><div class="calc-stat-label">projected merged PRs / month</div></div>`
+        + `<div class="calc-stat"><div class="calc-stat-value">${escForCalculator(spendLine)}</div><div class="calc-stat-label">projected spend / month</div></div>`
+        + `<div class="calc-stat"><div class="calc-stat-value">${escForCalculator(cppLine)}</div><div class="calc-stat-label">projected $ / PR</div></div>`
+        + `<div class="calc-stat"><div class="calc-stat-value">${escForCalculator(roiLine)}</div><div class="calc-stat-label">ROI multiplier</div></div>`
+        + `</div>`
+        + `<div class="calc-result-foot">vs ${escForCalculator(humanLine)} of engineer time at ${escForCalculator("$" + parsed.hourlyRateUsd)}/hr. ${escForCalculator(medianLine)}</div>`
+        + `</section>`;
+    }
+  }
+
+  const installCta = `<a class="calc-install-cta" data-testid="calculator-install-cta" href="${CALCULATOR_FOOTER_REPO_URL}">install fleet-control</a>`;
+
+  const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>fleet-control · pre-install ROI calculator</title>
+<meta name="robots" content="index, follow" />
+<style>
+  :root {
+    --bg: #0e0e0e; --fg: #fafafa; --dim: #888; --good: #36d399;
+    --warn: #fbbd23; --bad: #f87272; --accent: #67e8f9;
+    --card: #1a1a1a; --border: #2a2a2a;
+  }
+  * { box-sizing: border-box; }
+  body { font: 16px/1.5 -apple-system, system-ui, sans-serif;
+    margin: 0; padding: 16px; background: var(--bg); color: var(--fg); }
+  main { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .calc-sub { color: var(--dim); margin: 0 0 24px; font-size: 14px; }
+  form { display: flex; flex-direction: column; gap: 12px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 14px; color: var(--dim); }
+  input { font: inherit; padding: 12px 14px; background: var(--card);
+    color: var(--fg); border: 1px solid var(--border); border-radius: 8px;
+    min-height: 44px; width: 100%; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { font: inherit; padding: 12px 16px; background: var(--accent);
+    color: #0a0a0a; border: 0; border-radius: 8px; min-height: 44px;
+    width: 100%; font-weight: 600; cursor: pointer; }
+  .calc-error { background: rgba(248,114,114,0.12); border: 1px solid var(--bad);
+    color: var(--bad); padding: 12px 14px; border-radius: 8px;
+    margin-top: 16px; font-size: 14px; }
+  .calc-result { margin-top: 28px; padding: 20px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; }
+  .calc-result-greeting { color: var(--dim); font-size: 14px; margin-bottom: 8px; }
+  .calc-result-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+    margin-top: 4px; }
+  .calc-stat-value { font-size: 22px; font-weight: 600; color: var(--fg); }
+  .calc-headline { color: var(--good); font-size: 28px; }
+  .calc-stat-label { font-size: 12px; color: var(--dim); margin-top: 2px; }
+  .calc-result-foot { margin-top: 16px; padding-top: 16px;
+    border-top: 1px solid var(--border); font-size: 13px; color: var(--dim); }
+  .calc-empty { padding: 4px; }
+  .calc-empty-title { font-size: 16px; font-weight: 600; }
+  .calc-empty-body { font-size: 14px; color: var(--dim); margin-top: 6px; }
+  .calc-empty-body a { color: var(--accent); }
+  .calc-install-cta { display: block; text-align: center; margin-top: 24px;
+    padding: 14px 16px; background: transparent; border: 1px solid var(--border);
+    color: var(--fg); text-decoration: none; border-radius: 8px;
+    min-height: 44px; font-weight: 500; }
+  .calc-install-cta:hover { border-color: var(--accent); color: var(--accent); }
+  .calc-foot { margin-top: 32px; font-size: 12px; color: var(--dim); text-align: center; }
+  @media (max-width: 375px) {
+    body { padding: 12px; }
+    h1 { font-size: 20px; }
+    .calc-result-stats { grid-template-columns: 1fr; }
+    .calc-headline { font-size: 24px; }
+  }
+  @media (min-width: 768px) {
+    main { max-width: 640px; }
+    h1 { font-size: 26px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pre-install ROI calculator</h1>
+  <p class="calc-sub">Three inputs. One projection. Decide in 30 seconds.</p>
+  <form action="/calculator" method="GET">
+    <label>your GitHub username
+      <input type="text" name="u" value="${safeUsername}" data-testid="calculator-username" autocomplete="username" placeholder="octocat" />
+    </label>
+    <label>repos you would put on the loop (1–${REPOS_MAX})
+      <input type="number" name="n" value="${safeRepos}" min="${REPOS_MIN}" max="${REPOS_MAX}" data-testid="calculator-repos" inputmode="numeric" />
+    </label>
+    <label>your hourly rate (USD)
+      <input type="number" name="r" value="${safeRate}" min="${RATE_MIN}" max="${RATE_MAX}" data-testid="calculator-rate" inputmode="decimal" />
+    </label>
+    <button type="submit" data-testid="calculator-submit">calculate</button>
+  </form>
+  ${errorBlock}
+  ${resultBlock}
+  ${installCta}
+  <div class="calc-foot">Numbers are aggregated across the entire fleet — never per-project.</div>
+</main>
+</body>
+</html>`;
+  return redactSecretsForCalculator(body);
 }
 
 // Ticket 0038: "Monday morning catch-up" memo cache.
@@ -2029,6 +2451,33 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           });
           return res.end(body);
         }
+        // Ticket 0051: pre-install ROI calculator JSON API.
+        //
+        // PUBLIC route — NO auth, NO loopback gate (the page is the
+        // top-of-funnel acquisition surface; anyone with the URL can
+        // hit it). Returns the AGGREGATED median / p25 ONLY — never
+        // per-project rows, never project slugs, never any data that
+        // could be used to deanonymise a fleet. The
+        // fleetMedianProjection helper is designed so its return shape
+        // carries no per-project field; we additionally route the
+        // rendered string through `redactSecretsForCalculator` as a
+        // defence-in-depth backstop per LESSONS § "defence-in-depth
+        // secret redaction at the renderer boundary".
+        //
+        // 15-min memo cache keyed per (windowDays, percentile);
+        // invalidated by `(MAX(pr.fetched_at), COUNT(*),
+        // MAX(run.ended_at))` per LESSONS 2026-06-07 (the `pr` table
+        // has no surrogate id — NEVER MAX(pr.id)).
+        if (path === "/api/fleet/median-projection") {
+          const v = getMedianProjectionCached(db, new Date(), 90, "p25");
+          const body = redactSecretsForCalculator(JSON.stringify(v));
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=900",
+          });
+          return res.end(body);
+        }
         // Ticket 0039: fleet changelog — one chronological page of
         // every merged agent PR across every project, ticket-linked.
         // Composes pr + project + ticket_commit_link — no schema
@@ -2415,6 +2864,27 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         const result = getReceiptsCached(db, rm[1], rm[2]);
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
+      }
+      // Ticket 0051: pre-install ROI calculator HTML page.
+      // GET /calculator renders a self-contained single-column HTML
+      // page (NO external JS, NO bundled SPA route — pure HTML form).
+      // The form's action is /calculator and method=GET so the result
+      // URL is bookmarkable / shareable. PUBLIC — NO auth, NO loopback
+      // gate (top-of-funnel acquisition surface). Per LESSONS §
+      // "defence-in-depth secret redaction at the renderer boundary",
+      // the rendered HTML passes through `redactSecretsForCalculator`
+      // inside the renderer before we end the response. The route is
+      // mounted here alongside /receipts and /year so it inherits the
+      // no-token bypass posture.
+      if (path === "/calculator" && req.method === "GET") {
+        const parsed = parseCalculatorParams(url);
+        const median = getMedianProjectionCached(db, new Date(), 90, "p25");
+        const body = renderCalculatorPage(parsed, median);
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "public, max-age=300",
+        });
+        return res.end(body);
       }
       // Ticket 0050: fleet year-in-review HTML page. Self-contained
       // single-column document (no external JS — the SPA does NOT

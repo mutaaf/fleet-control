@@ -5922,3 +5922,247 @@ function _projectProse(
   };
   return `${slug} shipped ${mergedPrs} PRs at ${cppStr}. Verdict ${verdictLabel[verdict]}.`;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Pre-install ROI calculator (ticket 0051).
+//
+// Two helpers — `fleetMedianProjection` reads existing pr +
+// cost_rollup_day + project tables to compute a fleet-wide median (or
+// conservative p25) per-project per-month throughput and spend.
+// `computeRoiProjection` is a pure JS arithmetic helper that projects
+// what the prospect would see if they put N repos on the loop at their
+// own hourly rate. The two helpers feed the public `/calculator` HTML
+// page (zero auth, zero per-project leak) and the public
+// `/api/fleet/median-projection` JSON route.
+//
+// PRODUCER-VS-SPEC reconciliation (LESSONS 2026-06-05 + 0040 lesson):
+//   - merged PRs   = `state = 'MERGED'` uppercase + `is_agent = 1`
+//                    (matches costPerMergedPr / spendEfficiencyRanking
+//                    / projectWorthItVerdict). Producer writes the
+//                    gh-state token verbatim per src/ingest/prs.ts:184.
+//   - is_agent     = the producer's `AGENT_RE` predicate
+//                    (`/^(feat\/|chore\/gtm-|eng\/)/`) — we reuse the
+//                    column flag via `is_agent = 1` rather than
+//                    re-deriving from the branch name.
+// The `pr` table has NO surrogate `id` (PK `(project_id, number)` per
+// LESSONS 2026-06-07) so the route-side cache invalidation tuple uses
+// `(MAX(pr.fetched_at), COUNT(*), MAX(run.ended_at))` — never
+// `MAX(pr.id)`. Identifier strings stay plain words inside the
+// template-literal SQL per LESSONS 2026-05-26 "no backticks inside
+// template-literal SQL strings". Any sub-ms window arithmetic decomposes
+// via `strftime` (we don't need it here — the 90-day window framing is
+// date-level, not microsecond).
+//
+// Privacy note: the aggregated return shape carries NO per-project
+// fields. The percentile / median is computed JS-side over the
+// per-project array, then only the aggregate value is returned. The
+// caller (the JSON route + the /calculator HTML page) never sees the
+// per-project rows, so a defensive grep on the route response can never
+// find a project slug.
+
+export interface FleetMedianProjection {
+  window_days: number;
+  projects_observed: number;
+  merged_prs_per_month: number;
+  spend_usd_per_month: number;
+  cost_per_pr_usd: number | null;
+  percentile: "p25" | "median";
+  generated_at: string;
+}
+
+export interface FleetMedianProjectionOptions {
+  windowDays?: number;
+  percentile?: "p25" | "median";
+}
+
+interface MedianProjPrRow_internal { project_id: number; c: number | null; }
+interface MedianProjSpendRow_internal { project_id: number; spent_usd: number | null; }
+
+/** Conservative percentile of a sorted-ascending series. The "p25"
+ *  picker uses the nearest-rank method: index = ceil(0.25 * N) - 1
+ *  (1-based). The "median" picker reuses `_jsMedian` for the standard
+ *  50th-percentile semantics. Empty series → null. */
+function _pickPercentile(values: number[], percentile: "p25" | "median"): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  if (percentile === "median") return _jsMedian(sorted);
+  // p25 via nearest-rank: idx = ceil(0.25 * N) - 1 (1-based → 0-based).
+  // For N=5: ceil(1.25) - 1 = 1 → value at index 1 (the 2nd-smallest).
+  // For N=2: ceil(0.5)  - 1 = 0 → smallest (the conservative pick).
+  const idx = Math.max(0, Math.ceil(0.25 * sorted.length) - 1);
+  return sorted[idx];
+}
+
+/** Fleet-wide median (or conservative p25) per-project monthly
+ *  throughput + spend over a trailing window. Projects with fewer than
+ *  3 merged PRs in the window are EXCLUDED from the percentile
+ *  computation (matches the 0048 `insufficient_data` floor). When
+ *  fewer than 2 projects qualify, returns the documented "insufficient
+ *  fleet data" shape so the caller can render the demo-link fallback.
+ *
+ *  PRODUCER-VS-SPEC NOTE: the spec names the column literals upper-case
+ *  ('MERGED' + is_agent=1). The producer writes 'MERGED' upper-case
+ *  verbatim per src/ingest/prs.ts:184; we use that exact casing here.
+ *  Per LESSONS 2026-06-07 the `pr` table has no surrogate `id`; the
+ *  route-side cache invalidation uses `(MAX(fetched_at), COUNT(*),
+ *  MAX(run.ended_at))` rather than `MAX(pr.id)`. */
+export function fleetMedianProjection(
+  db: DB,
+  now: Date = new Date(),
+  opts: FleetMedianProjectionOptions = {},
+): FleetMedianProjection {
+  const windowDays = Math.max(1, Math.min(365, Math.floor(opts.windowDays ?? 90)));
+  const percentile: "p25" | "median" = opts.percentile === "median" ? "median" : "p25";
+
+  // Window bounds: end is today's UTC midnight + 1 day (half-open
+  // exclusive); start is windowDays before. Date-level (not
+  // sub-millisecond) so no julianday drift concern (LESSONS 2026-05-26).
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const endExclusive = new Date(end);
+  endExclusive.setUTCDate(endExclusive.getUTCDate() + 1);
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - windowDays);
+  const startStr = start.toISOString().slice(0, 10);
+  const endExclusiveStr = endExclusive.toISOString().slice(0, 10);
+
+  // Per-project merged-PR count over window. State casing matches the
+  // producer (LESSONS 2026-06-05).
+  const mergedRows = db.prepare(
+    "SELECT project_id, COUNT(*) AS c "
+    + "  FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) < ? "
+    + " GROUP BY project_id",
+  ).all(startStr, endExclusiveStr) as unknown as MedianProjPrRow_internal[];
+  const mergedByPid = new Map<number, number>();
+  for (const r of mergedRows) mergedByPid.set(r.project_id, Number(r.c ?? 0));
+
+  // Per-project spend over the same window (cost_rollup_day).
+  const spendRows = db.prepare(
+    "SELECT project_id, SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day < ? "
+    + " GROUP BY project_id",
+  ).all(startStr, endExclusiveStr) as unknown as MedianProjSpendRow_internal[];
+  const spendByPid = new Map<number, number>();
+  for (const r of spendRows) spendByPid.set(r.project_id, Number(r.spent_usd ?? 0));
+
+  // Union of project_ids with either merges OR spend in the window. We
+  // count projects_observed off this union so the caller's "insufficient
+  // fleet data" context line reflects every project the fleet saw
+  // (not only the qualifying ones).
+  const projectIds = new Set<number>();
+  for (const pid of mergedByPid.keys()) projectIds.add(pid);
+  for (const pid of spendByPid.keys()) projectIds.add(pid);
+  const projectsObserved = projectIds.size;
+
+  // Qualifying projects: those with >= 3 merged PRs in the window.
+  // Compute per-month throughput + per-month spend for each. Multiply
+  // by (30 / windowDays) so the values are normalised to a calendar
+  // month regardless of the window's literal length.
+  const monthScale = 30 / windowDays;
+  const qualifyingThroughput: number[] = [];
+  const qualifyingSpend: number[] = [];
+  for (const pid of projectIds) {
+    const merged = mergedByPid.get(pid) ?? 0;
+    if (merged < 3) continue; // excluded from the percentile.
+    const spend = spendByPid.get(pid) ?? 0;
+    qualifyingThroughput.push(merged * monthScale);
+    qualifyingSpend.push(spend * monthScale);
+  }
+
+  // Insufficient fleet: fewer than 2 qualifying projects → the caller
+  // can render the demo-link fallback honestly. We expose
+  // projects_observed so the page can say "fleet has N projects but
+  // none with >= 3 merged PRs in the window".
+  if (qualifyingThroughput.length < 2) {
+    return {
+      window_days: windowDays,
+      projects_observed: projectsObserved,
+      merged_prs_per_month: 0,
+      spend_usd_per_month: 0,
+      cost_per_pr_usd: null,
+      percentile,
+      generated_at: now.toISOString(),
+    };
+  }
+
+  // Pick the percentile point for throughput AND for spend
+  // INDEPENDENTLY. The two series may pick different per-project
+  // representatives (the conservative throughput project isn't
+  // necessarily the conservative spend project). cost_per_pr is then
+  // derived from those two aggregate values so the result is
+  // self-consistent at the aggregate level.
+  const throughputPick = _pickPercentile(qualifyingThroughput, percentile) ?? 0;
+  const spendPick = _pickPercentile(qualifyingSpend, percentile) ?? 0;
+  const costPerPr: number | null = throughputPick > 0 ? spendPick / throughputPick : null;
+
+  return {
+    window_days: windowDays,
+    projects_observed: projectsObserved,
+    merged_prs_per_month: throughputPick,
+    spend_usd_per_month: spendPick,
+    cost_per_pr_usd: costPerPr,
+    percentile,
+    generated_at: now.toISOString(),
+  };
+}
+
+export interface RoiProjection {
+  projected_merged_prs: number;
+  projected_spend_usd: number;
+  projected_cost_per_pr_usd: number | null;
+  human_equivalent_cost_usd: number;
+  roi_multiplier: number | null;
+  percentile_label: string;
+}
+
+export interface RoiProjectionInputs {
+  repos: number;
+  hourlyRateUsd: number;
+  /** Hours one engineer would spend shipping one of these PRs by hand.
+   *  Defaults to 1 (matches the 0048 worth-it verdict). */
+  hoursPerPr?: number;
+}
+
+/** Pure-JS arithmetic: project what N repos on the loop would yield at
+ *  the prospect's hourly rate, given the fleet's median (or
+ *  conservative p25) per-project per-month throughput. No DB read; the
+ *  caller hands in a `FleetMedianProjection` from
+ *  `fleetMedianProjection()`.
+ *
+ *  Formula:
+ *    projected_merged_prs   = median.merged_prs_per_month × inputs.repos
+ *    projected_spend_usd    = median.cost_per_pr_usd × projected_merged_prs
+ *    human_equivalent_cost  = projected_merged_prs × hoursPerPr × hourlyRateUsd
+ *    roi_multiplier         = human_equivalent_cost / projected_spend_usd
+ *
+ *  When spend is zero (insufficient fleet floor: cost_per_pr_usd is
+ *  null) `roi_multiplier` is null — no division by zero. */
+export function computeRoiProjection(
+  median: FleetMedianProjection,
+  inputs: RoiProjectionInputs,
+): RoiProjection {
+  const hoursPerPr = typeof inputs.hoursPerPr === "number" ? inputs.hoursPerPr : 1;
+  const repos = inputs.repos;
+  const projectedMergedPrs = median.merged_prs_per_month * repos;
+  const projectedSpendUsd = median.cost_per_pr_usd != null
+    ? median.cost_per_pr_usd * projectedMergedPrs
+    : 0;
+  const humanEquivalentCostUsd = projectedMergedPrs * hoursPerPr * inputs.hourlyRateUsd;
+  const roiMultiplier: number | null = projectedSpendUsd > 0
+    ? humanEquivalentCostUsd / projectedSpendUsd
+    : null;
+  const percentileLabel = median.percentile === "p25"
+    ? "conservative (25th percentile of fleet)"
+    : "median (50th percentile of fleet)";
+  return {
+    projected_merged_prs: projectedMergedPrs,
+    projected_spend_usd: projectedSpendUsd,
+    projected_cost_per_pr_usd: median.cost_per_pr_usd,
+    human_equivalent_cost_usd: humanEquivalentCostUsd,
+    roi_multiplier: roiMultiplier,
+    percentile_label: percentileLabel,
+  };
+}
