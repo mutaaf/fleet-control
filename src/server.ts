@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -820,6 +820,127 @@ export function _invalidatePrAutopsiesCacheAfterIngest(): void {
 (globalThis as { __fleet_pr_autopsies_invalidate__?: () => void })
   .__fleet_pr_autopsies_invalidate__ = _invalidatePrAutopsiesCacheAfterIngest;
 
+// Ticket 0048: "Per-project worth-it verdict" memo cache.
+//
+// 15-min TTL (matches Cache-Control: max-age=900 — the verdict moves
+// slowly; same window as 0044's spend-efficiency). The cache is
+// keyed per-project per-(window, rate, hours) so a global rate change
+// or per-call override doesn't collide with the default-knob cache
+// row. Invalidation is a THREE-VALUE per-project tuple:
+//
+//   - latestPrFetchedAt = SELECT MAX(fetched_at) FROM pr WHERE project_id = ?
+//   - prRowCount        = SELECT COUNT(*)        FROM pr WHERE project_id = ?
+//   - latestRunEndedAt  = SELECT MAX(ended_at)   FROM run WHERE project_id = ?
+//
+// The `pr` table has no surrogate id (PK is (project_id, number)) so
+// we proxy "fresh pr row landed for this project" via the
+// (MAX(fetched_at), COUNT(*)) pair per LESSONS 2026-06-07. Any of the
+// three moving busts the cache on the next call.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetWorthItCacheForTests()`. Per LESSONS §
+// "expose a build counter for cache-hit tests, not a fetcher swap"
+// we also expose `_getWorthItCacheBuildsForTests()`; it ticks on
+// every cache MISS so route tests assert hit/miss semantics without
+// stubbing SQL. Production code never reads either.
+//
+// Per LESSONS 2026-06-05 "break ingest↔server cache-invalidation
+// cycles via a globalThis slot, not a circular import": the ingest
+// pass calls a hook registered on `globalThis.__fleet_worth_it_invalidate__`
+// so a fresh PR ingest tick clears the cache without waiting out the TTL.
+// The slot is registered below at module load time and read lazily
+// by the ingest module — same shape as the 0039 changelog hook and
+// 0047 autopsy hook.
+interface WorthItCacheEntry {
+  tuple: string;
+  value: ProjectWorthItVerdict;
+  expires_at: number;
+}
+const WORTH_IT_TTL_MS = 900_000;
+const worthItCache = new Map<string, WorthItCacheEntry>();
+let worthItBuildCounter = 0;
+
+export function _resetWorthItCacheForTests(): void {
+  worthItCache.clear();
+  worthItBuildCounter = 0;
+}
+
+export function _getWorthItCacheBuildsForTests(): number {
+  return worthItBuildCounter;
+}
+
+interface WorthItPrSummaryRow { mx: string | null; c: number | null; }
+interface WorthItRunSummaryRow { mx: string | null; }
+
+function worthItInvalidationTuple(db: DB, projectId: number): string {
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c "
+    + "  FROM pr WHERE project_id = ?",
+  ).get(projectId) as unknown as WorthItPrSummaryRow | undefined;
+  const runRow = db.prepare(
+    "SELECT MAX(ended_at) AS mx FROM run WHERE project_id = ?",
+  ).get(projectId) as unknown as WorthItRunSummaryRow | undefined;
+  const mx = prRow?.mx ?? "";
+  const c = Number(prRow?.c ?? 0);
+  const rmx = runRow?.mx ?? "";
+  return `${mx}|${c}|${rmx}`;
+}
+
+function worthItCacheKey(
+  slug: string, windowDays: number, rate: number, hours: number,
+): string {
+  return `${slug}|w=${windowDays}|r=${rate}|h=${hours}`;
+}
+
+function getWorthItCached(
+  db: DB, cfg: FleetConfig, now: Date,
+  projectId: number, slug: string, windowDays: number,
+  rate: number, hours: number,
+): ProjectWorthItVerdict {
+  void cfg; // resolution happens inside the helper via opts; here we
+  // pass the explicit numbers through so the cache key matches the
+  // shape of the computed value (no implicit dependence on the
+  // ambient config).
+  const tuple = worthItInvalidationTuple(db, projectId);
+  const key = worthItCacheKey(slug, windowDays, rate, hours);
+  const hit = worthItCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) {
+    return hit.value;
+  }
+  worthItBuildCounter += 1;
+  const value = projectWorthItVerdict(db, projectId, now, {
+    windowDays,
+    humanEquivalentHourlyUsd: rate,
+    humanHoursPerPr: hours,
+  });
+  worthItCache.set(key, { tuple, value, expires_at: Date.now() + WORTH_IT_TTL_MS });
+  return value;
+}
+
+/** Clear the worth-it memo so the next request rebuilds. Called by
+ *  the ingest pass via the globalThis slot below — the changelog /
+ *  autopsy cache invalidator's pattern (registered at module load),
+ *  so the ingest module never imports server.ts. */
+export function _invalidateWorthItCacheAfterIngest(): void {
+  worthItCache.clear();
+}
+
+(globalThis as { __fleet_worth_it_invalidate__?: () => void })
+  .__fleet_worth_it_invalidate__ = _invalidateWorthItCacheAfterIngest;
+
+/** Resolve the (rate, hours) defaults the cache + handler use. Reads
+ *  cfg.worth_it.* if present; otherwise the documented defaults
+ *  (75 / 1) bake in. The helper signature mirrors what the
+ *  ProjectWorthItVerdictOptions resolution does inside the helper —
+ *  but the route layer needs the explicit numbers to compose the
+ *  cache key. */
+function worthItResolvedKnobs(cfg: FleetConfig): { rate: number; hours: number } {
+  const wt = cfg.worth_it ?? {};
+  const rate = typeof wt.hourly_rate_usd === "number" ? wt.hourly_rate_usd : 75;
+  const hours = typeof wt.hours_per_pr === "number" ? wt.hours_per_pr : 1;
+  return { rate, hours };
+}
+
 // Ticket 0038: "Monday morning catch-up" memo cache.
 //
 // 3-min TTL keyed by `(actor_key, day_iso)`. The catch-up data
@@ -1577,6 +1698,42 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           });
           return res.end(body);
         }
+        // Ticket 0048: per-project worth-it verdict — composes 0035
+        // (cost-per-PR), 0022 (fleet temp), 0026 (streak), 0044
+        // (spend-efficiency framing) plus a worth_it config block
+        // into a single per-project verdict
+        // (`net_positive | watch | sunset_candidate |
+        // insufficient_data`). Pure composition — no schema migration.
+        // 15-min memo cache keyed per `(slug, window, rate, hours)`;
+        // invalidated by `(MAX(pr.fetched_at), COUNT(*),
+        // MAX(run.ended_at))` per project. Quiet-hours suppression of
+        // the SUNSET-STICKY chip happens in the SPA renderer — the
+        // verdict line itself is information (always visible).
+        if (path === "/api/fleet/worth-it") {
+          const { rate, hours } = worthItResolvedKnobs(cfg);
+          // One row per project in slug order. The fleet endpoint
+          // shares the per-project cache: each entry comes from
+          // `getWorthItCached(db, ..., pid, slug, 30, rate, hours)`
+          // so a per-project route hit + a fleet-wide route hit
+          // never double-build.
+          const projectRows = db.prepare(
+            "SELECT id, slug FROM project ORDER BY slug",
+          ).all() as Array<{ id: number; slug: string }>;
+          const now = new Date();
+          const projectsList = projectRows.map(
+            (p) => getWorthItCached(db, cfg, now, p.id, p.slug, 30, rate, hours),
+          );
+          const body = JSON.stringify({
+            projects: projectsList,
+            generated_at: now.toISOString(),
+          });
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=900",
+          });
+          return res.end(body);
+        }
         // Ticket 0039: fleet changelog — one chronological page of
         // every merged agent PR across every project, ticket-linked.
         // Composes pr + project + ticket_commit_link — no schema
@@ -1734,6 +1891,27 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           const pid = projectIdBySlug(db, bdm[1]);
           if (pid == null) return json(res, { error: "not found" }, 404);
           return json(res, projectBurndown(db, pid));
+        }
+        // Ticket 0048: per-project worth-it verdict. Reads `read`
+        // scope (loopback bypasses); same posture as every other
+        // per-project GET. Shares the per-(slug,window,rate,hours)
+        // memo cache with the fleet endpoint so a card-level fetch
+        // doesn't double-build a freshly-cached fleet row. The
+        // 404 body uses the spec's "project not found" phrasing
+        // (matches the AC's "clear" framing).
+        const wim = path.match(/^\/api\/projects\/([\w-]+)\/worth-it$/);
+        if (wim) {
+          const pid = projectIdBySlug(db, wim[1]);
+          if (pid == null) return json(res, { error: "project not found" }, 404);
+          const { rate, hours } = worthItResolvedKnobs(cfg);
+          const v = getWorthItCached(db, cfg, new Date(), pid, wim[1], 30, rate, hours);
+          const body = JSON.stringify(v);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=900",
+          });
+          return res.end(body);
         }
         // Ticket 0034: self-baseline drift detector — per-project
         // detail. Returns {detected, baseline_window, current_window,

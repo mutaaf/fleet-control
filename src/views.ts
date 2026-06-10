@@ -5177,3 +5177,331 @@ export function prAutopsies(
     generated_at: generatedAt,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Per-project worth-it verdict (ticket 0048).
+//
+// Composes five existing primitives + one operator-settable hourly
+// rate into a single per-project verdict: "net positive", "watch",
+// "sunset candidate", or "insufficient data". The hard question the
+// operator carries at end-of-quarter — "is this project worth keeping
+// vs me doing it by hand?" — becomes one glance instead of a
+// spreadsheet exercise.
+//
+// PRODUCER-VS-SPEC reconciliation (LESSONS 2026-06-05 + 0040 lesson):
+//   - merged PRs   = `state = 'MERGED'` uppercase + `is_agent = 1`
+//                    (matches costPerMergedPr / spendEfficiencyRanking)
+//   - closed PRs   = `state = 'CLOSED'` uppercase + `is_agent = 1`
+//                    (matches prAutopsies)
+// The `pr` table has NO surrogate id (PK is `(project_id, number)`)
+// so any cache-invalidation tuple in the route layer proxies fresh
+// rows via `(MAX(fetched_at), COUNT(*))` per LESSONS 2026-06-07.
+//
+// Verdict cascade (top-down, deterministic):
+//   1. insufficient_data: merged_prs < 3
+//   2. sunset_candidate : roi < 1.0 OR (merge_ratio < 0.5 AND merged_prs < 5)
+//   3. watch            : roi < 2.0 OR merge_ratio < 0.7 OR streak_days === 0
+//   4. net_positive     : roi >= 2.0 AND merge_ratio >= 0.7 AND streak_days > 0
+//
+// Defaults:
+//   - hourly_rate_usd = 75 (mid-market US contractor rate)
+//   - hours_per_pr    = 1  (one engineer-hour per PR — conservative
+//                           midpoint per published industry benchmarks)
+//   - windowDays      = 30 (matches the 30d run-rate framing
+//                           operators read everywhere else)
+//
+// streak_days is per-project — not the fleetStreak() value. It counts
+// the number of consecutive trailing days (today walking back) where
+// THIS project merged at least one PR. A day with zero merges breaks
+// the walk. This matches the watch-trigger semantics ("no merged PR
+// today" when streak_days === 0).
+
+export interface ProjectWorthItVerdict {
+  project_slug: string;
+  project_name: string;
+  window_days: number;
+  merged_prs: number;
+  closed_prs: number;
+  merge_ratio: number | null;
+  spend_usd: number;
+  monthly_runrate_usd: number;
+  cost_per_pr_usd: number | null;
+  streak_days: number;
+  fleet_temp: number | null;
+  human_equivalent_cost_usd: number;
+  roi_multiplier: number | null;
+  hourly_rate_usd: number;
+  hours_per_pr: number;
+  verdict: "net_positive" | "watch" | "sunset_candidate" | "insufficient_data";
+  verdict_detail: string;
+  generated_at: string;
+}
+
+export interface ProjectWorthItVerdictOptions {
+  /** Trailing window. Defaults to 30 days. */
+  windowDays?: number;
+  /** Per-call override; falls back to `cfg.worth_it.hourly_rate_usd`
+   *  then the helper default of 75. */
+  humanEquivalentHourlyUsd?: number;
+  /** Per-call override; falls back to `cfg.worth_it.hours_per_pr`
+   *  then the helper default of 1. */
+  humanHoursPerPr?: number;
+  /** Optional fleet config — when present and `worth_it.*` is set
+   *  the values flow through as the resolved defaults. */
+  cfg?: FleetConfig;
+}
+
+export interface ProjectWorthItSticky {
+  verdict_now: ProjectWorthItVerdict["verdict"];
+  verdict_14d_ago: ProjectWorthItVerdict["verdict"];
+  sticky_days: number;
+}
+
+interface ProjectMetaRow_internal { slug: string; name: string | null; }
+interface CountAggRow_internal { c: number | null; }
+interface SpendAggRow_internal { spent_usd: number | null; }
+interface StreakDayRow_internal { day: string | null; c: number | null; }
+
+function _resolveWorthItDefaults(
+  opts: ProjectWorthItVerdictOptions,
+): { hourlyRateUsd: number; hoursPerPr: number; windowDays: number } {
+  // Per-call opts win > cfg.worth_it.* > documented defaults (75 / 1).
+  const cfgWorth = opts.cfg?.worth_it ?? {};
+  const hourlyRateUsd = opts.humanEquivalentHourlyUsd
+    ?? (typeof cfgWorth.hourly_rate_usd === "number" ? cfgWorth.hourly_rate_usd : 75);
+  const hoursPerPr = opts.humanHoursPerPr
+    ?? (typeof cfgWorth.hours_per_pr === "number" ? cfgWorth.hours_per_pr : 1);
+  const windowDays = Math.max(1, Math.min(180, Math.floor(opts.windowDays ?? 30)));
+  return { hourlyRateUsd, hoursPerPr, windowDays };
+}
+
+/** Per-project trailing streak: walk backwards from today (UTC) and
+ *  count consecutive days where the project merged at least one PR.
+ *  Stops at the first zero-merges day. */
+function _projectStreakDays(db: DB, projectId: number, now: Date): number {
+  // Pull every per-day merged-PR count in the trailing 90 days into JS
+  // (small N — at most 90 rows even at 100% activity). Walk the dates
+  // backwards from today; a day not in the map is treated as zero
+  // merges → streak break.
+  const today = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+  ));
+  const start = new Date(today);
+  start.setUTCDate(start.getUTCDate() - 89);
+  const startStr = start.toISOString().slice(0, 10);
+  const endStr = today.toISOString().slice(0, 10);
+  const rows = db.prepare(
+    "SELECT date(fetched_at) AS day, COUNT(*) AS c "
+    + "  FROM pr "
+    + " WHERE project_id = ? AND state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) <= ? "
+    + " GROUP BY date(fetched_at)",
+  ).all(projectId, startStr, endStr) as unknown as StreakDayRow_internal[];
+  const byDay = new Map<string, number>();
+  for (const r of rows) {
+    if (r.day) byDay.set(r.day, Number(r.c ?? 0));
+  }
+  let streak = 0;
+  const cursor = new Date(today);
+  for (let i = 0; i < 90; i++) {
+    const key = cursor.toISOString().slice(0, 10);
+    if ((byDay.get(key) ?? 0) > 0) {
+      streak += 1;
+      cursor.setUTCDate(cursor.getUTCDate() - 1);
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+/** Compute the per-project worth-it verdict (ticket 0048). Pure SQL +
+ *  JS arithmetic; no shell-out, no network. The route layer caches
+ *  per `(slug, window_days, rate, hours)` with a per-project
+ *  invalidation tuple. */
+export function projectWorthItVerdict(
+  db: DB, projectId: number, now: Date,
+  opts: ProjectWorthItVerdictOptions = {},
+): ProjectWorthItVerdict {
+  const { hourlyRateUsd, hoursPerPr, windowDays } = _resolveWorthItDefaults(opts);
+  // Window: end is today's UTC midnight + 1 day (half-open exclusive
+  // bound) so today's seed rows count. Start is `windowDays` before.
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const endExclusive = new Date(end);
+  endExclusive.setUTCDate(endExclusive.getUTCDate() + 1);
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - windowDays);
+  const startStr = start.toISOString().slice(0, 10);
+  const endExclusiveStr = endExclusive.toISOString().slice(0, 10);
+  const startIso = start.toISOString();
+  const endIsoExclusive = endExclusive.toISOString();
+
+  // Project metadata.
+  const meta = db.prepare(
+    "SELECT slug, name FROM project WHERE id = ?",
+  ).get(projectId) as unknown as ProjectMetaRow_internal | undefined;
+  const slug = meta?.slug ?? `id-${projectId}`;
+  const name = meta?.name ?? slug;
+
+  // Spend in window (cost_rollup_day; producer matches every other
+  // cost-axis helper).
+  const spendRow = db.prepare(
+    "SELECT SUM(COALESCE(cost_usd, 0)) AS spent_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE project_id = ? AND day >= ? AND day < ?",
+  ).get(projectId, startStr, endExclusiveStr) as unknown as SpendAggRow_internal | undefined;
+  const spendUsd = Number(spendRow?.spent_usd ?? 0) || 0;
+
+  // Merged PRs in window — state='MERGED' uppercase + is_agent=1
+  // bucketed by date(fetched_at) (matches costPerMergedPr /
+  // spendEfficiencyRanking).
+  const mergedRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE project_id = ? AND state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? AND date(fetched_at) < ?",
+  ).get(projectId, startStr, endExclusiveStr) as unknown as CountAggRow_internal | undefined;
+  const mergedPrs = Number(mergedRow?.c ?? 0) || 0;
+
+  // Closed non-merged PRs in window — state='CLOSED' uppercase + is_agent=1
+  // (matches prAutopsies). Falls back to fetched_at when closed_at is
+  // null (older rows from before the 0049 sibling lands close_at on
+  // every CLOSED row).
+  const closedRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE project_id = ? AND state = 'CLOSED' AND is_agent = 1 "
+    + "   AND ( "
+    + "        (closed_at IS NOT NULL AND closed_at >= ? AND closed_at < ?) "
+    + "     OR (closed_at IS NULL AND fetched_at IS NOT NULL "
+    + "         AND fetched_at >= ? AND fetched_at < ?) "
+    + "   )",
+  ).get(projectId, startIso, endIsoExclusive, startIso, endIsoExclusive) as unknown as CountAggRow_internal | undefined;
+  const closedPrs = Number(closedRow?.c ?? 0) || 0;
+
+  // Merge ratio: null when there are no closes (merged + closed === 0).
+  const totalDecided = mergedPrs + closedPrs;
+  const mergeRatio: number | null = totalDecided > 0
+    ? mergedPrs / totalDecided
+    : null;
+
+  // 30-day-projection of the trailing spend: spend × (30 / windowDays).
+  const monthlyRunrateUsd = windowDays > 0
+    ? spendUsd * (30 / windowDays)
+    : spendUsd;
+
+  const costPerPrUsd: number | null = mergedPrs > 0
+    ? spendUsd / mergedPrs
+    : null;
+
+  const humanEquivalentCostUsd = mergedPrs * hoursPerPr * hourlyRateUsd;
+  const roiMultiplier: number | null = spendUsd > 0
+    ? humanEquivalentCostUsd / spendUsd
+    : null;
+
+  const streakDays = _projectStreakDays(db, projectId, now);
+
+  // fleet_temp = projectHealth().score. The helper memoises so a
+  // batch call for the fleet endpoint shares one compute per project.
+  let fleetTemp: number | null = null;
+  try {
+    const h = projectHealth(db, projectId, now);
+    fleetTemp = h.score;
+  } catch { /* projectHealth tolerates partial state; we just leave null. */ }
+
+  // ── Verdict cascade ─────────────────────────────────────────────
+  let verdict: ProjectWorthItVerdict["verdict"];
+  let verdictDetail: string;
+
+  const moneyFmt = (n: number) => `$${n.toFixed(0)}`;
+  const arithmeticDetail = `${moneyFmt(monthlyRunrateUsd)}/mo vs ~${moneyFmt(humanEquivalentCostUsd * (30 / windowDays))}/mo human equivalent at ${hoursPerPr}h/PR`;
+
+  if (mergedPrs < 3) {
+    verdict = "insufficient_data";
+    verdictDetail = `need 3+ merged PRs in ${windowDays} days to verdict`;
+  } else if (
+    (roiMultiplier != null && roiMultiplier < 1.0)
+    || (mergeRatio != null && mergeRatio < 0.5 && mergedPrs < 5)
+  ) {
+    verdict = "sunset_candidate";
+    if (roiMultiplier != null && roiMultiplier < 1.0) {
+      verdictDetail = arithmeticDetail;
+    } else {
+      verdictDetail = `${mergedPrs}/${totalDecided} PRs merge; throughput low`;
+    }
+  } else if (
+    (roiMultiplier != null && roiMultiplier < 2.0)
+    || (mergeRatio != null && mergeRatio < 0.7)
+    || streakDays === 0
+  ) {
+    verdict = "watch";
+    // Name the weakest signal first. Order: ROI deficit, merge-ratio
+    // deficit, streak-zero. Deterministic across re-runs.
+    const triggers: Array<{ label: string; deficit: number }> = [];
+    if (roiMultiplier != null && roiMultiplier < 2.0) {
+      triggers.push({ label: "ROI < 2x", deficit: 2.0 - roiMultiplier });
+    }
+    if (mergeRatio != null && mergeRatio < 0.7) {
+      triggers.push({ label: "merge ratio <70%", deficit: 0.7 - mergeRatio });
+    }
+    if (streakDays === 0) {
+      triggers.push({ label: "no merged PR today", deficit: 1.0 });
+    }
+    // Sort by deficit DESC; stable order falls through to insertion order.
+    triggers.sort((a, b) => b.deficit - a.deficit);
+    verdictDetail = triggers[0]?.label ?? "ROI < 2x";
+  } else {
+    verdict = "net_positive";
+    verdictDetail = arithmeticDetail;
+  }
+
+  return {
+    project_slug: slug,
+    project_name: name,
+    window_days: windowDays,
+    merged_prs: mergedPrs,
+    closed_prs: closedPrs,
+    merge_ratio: mergeRatio,
+    spend_usd: spendUsd,
+    monthly_runrate_usd: monthlyRunrateUsd,
+    cost_per_pr_usd: costPerPrUsd,
+    streak_days: streakDays,
+    fleet_temp: fleetTemp,
+    human_equivalent_cost_usd: humanEquivalentCostUsd,
+    roi_multiplier: roiMultiplier,
+    hourly_rate_usd: hourlyRateUsd,
+    hours_per_pr: hoursPerPr,
+    verdict,
+    verdict_detail: verdictDetail,
+    generated_at: now.toISOString(),
+  };
+}
+
+/** Two-anchor sticky-sunset detector (AC8). Calls projectWorthItVerdict
+ *  twice — at `now` and at `now - 14 days` — and reports whether the
+ *  verdict has been `sunset_candidate` at BOTH anchors. Short-circuits
+ *  to `sticky_days: 0` when either verdict is `insufficient_data`
+ *  (the operator should not act on a stub project's two-week shape).
+ *
+ *  Used by the SPA to render the "sunset 14d+" chip near the verdict
+ *  label — but only OUTSIDE quiet hours (the chip is a prompt; the
+ *  verdict line itself is information). */
+export function projectWorthItSticky(
+  db: DB, projectId: number, now: Date,
+  opts: ProjectWorthItVerdictOptions = {},
+): ProjectWorthItSticky {
+  const verdictNow = projectWorthItVerdict(db, projectId, now, opts);
+  const past = new Date(now.getTime() - 14 * 86400_000);
+  const verdictPast = projectWorthItVerdict(db, projectId, past, opts);
+  const stickyDays = (
+    verdictNow.verdict === "sunset_candidate"
+    && verdictPast.verdict === "sunset_candidate"
+  )
+    ? 14
+    : 0;
+  return {
+    verdict_now: verdictNow.verdict,
+    verdict_14d_ago: verdictPast.verdict,
+    sticky_days: stickyDays,
+  };
+}

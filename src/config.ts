@@ -39,6 +39,19 @@ export interface FleetConfig {
    *  rare project that warrants 24/7 paging. An object overrides the
    *  fleet default's window/tz for that slug. */
   quietHoursOverride?: Record<string, false | { start: string; end: string; tz: string }>;
+  /** Worth-it verdict knobs (ticket 0048). A nested object — same
+   *  shape the in-process reader expects. The two keys (hourly rate
+   *  in USD + hours per merged PR) drive the per-project
+   *  worth-it-verdict's "human equivalent cost" calculation. Both are
+   *  optional with documented defaults (`75` and `1`) baked into the
+   *  helper; the operator overrides via `fleet-control.config.json`.
+   *  Per LESSONS 2026-05-25 "store cascading config values shaped to
+   *  the reader" - any future portal-side setter MUST write in this
+   *  same nested-object shape. */
+  worth_it?: {
+    hourly_rate_usd?: number;
+    hours_per_pr?: number;
+  };
 }
 
 const DEFAULTS: FleetConfig = {
