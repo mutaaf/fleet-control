@@ -407,15 +407,27 @@ test("AC6: ingestProjectPRs persists gh_created_at when gh emits createdAt", () 
   const { db, cleanup } = tempDb();
   try {
     const pid = seedProject(db, "ingestme");
-    _setPrRunnerForTests((_cmd, _args) => JSON.stringify([
-      {
-        number: 42, title: "demo", headRefName: "feat/x",
-        mergeStateStatus: "CLEAN", statusCheckRollup: [],
-        additions: 1, deletions: 0, author: { login: "me" },
-        url: "https://github.com/owner/ingestme/pull/42",
-        createdAt: "2026-05-20T10:00:00Z",
-      },
-    ]));
+    // Ticket 0049: differentiate open vs closed `gh pr list` calls
+    // by inspecting argv — closed returns [] so the open row (#42)
+    // doesn't collide on the pr PK when the ingester now fires both
+    // open AND closed fetches.
+    _setPrRunnerForTests((cmd, args) => {
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        const stateIdx = args.indexOf("--state");
+        const state = stateIdx >= 0 ? args[stateIdx + 1] : "open";
+        if (state !== "open") return "[]";
+        return JSON.stringify([
+          {
+            number: 42, title: "demo", headRefName: "feat/x",
+            mergeStateStatus: "CLEAN", statusCheckRollup: [],
+            additions: 1, deletions: 0, author: { login: "me" },
+            url: "https://github.com/owner/ingestme/pull/42",
+            createdAt: "2026-05-20T10:00:00Z",
+          },
+        ]);
+      }
+      return "";
+    });
     try {
       ingestProjectPRs(db, pid, "owner/ingestme");
     } finally { _resetPrRunnerForTests(); }

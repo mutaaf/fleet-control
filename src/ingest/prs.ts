@@ -139,31 +139,64 @@ export function ingestProjectPRs(db: DB, projectId: number, repo: string): void 
   const last = db.prepare("SELECT MAX(fetched_at) f FROM pr WHERE project_id=?").get(projectId) as any;
   if (last?.f && Date.now() - new Date(last.f).getTime() < TTL_MS) return; // fresh enough
 
-  let rows: any[] = [];
+  // Ticket 0049: fetch BOTH open and closed PRs so the 0047 autopsy
+  // card lights up against real fleet data. gh's `--state closed`
+  // returns both closed-non-merged AND merged PRs in the same call
+  // (the `state` field on each row carries the verbatim 'CLOSED' or
+  // 'MERGED' token we want to persist). Producer convention (per
+  // LESSONS 2026-06-05 "groomer prose can disagree with the schema;
+  // the schema wins"): open rows still write the hardcoded lowercase
+  // `'open'` per the 0040 LESSON so every existing
+  // `state = 'open'` reader keeps matching; closed/merged rows write
+  // the gh state verbatim ('CLOSED' / 'MERGED' uppercase) which
+  // matches the established `state = 'MERGED'` reader convention in
+  // src/views.ts and the new 0047 `state = 'CLOSED'` autopsy filter.
+  // Both fetches use the same `--json` projection plus the `state` +
+  // `closedAt` fields (additive on the gh JSON shape — no callers
+  // consume the gh stdout directly).
+  const JSON_FIELDS = "number,title,headRefName,mergeStateStatus,statusCheckRollup,additions,deletions,author,url,createdAt,closedAt,state,commits";
+  let openRows: any[] = [];
+  let closedRows: any[] = [];
   try {
-    // Ticket 0022: includes `createdAt` in the field list so the SQL
-    // schema's new gh_created_at column (added in src/db.ts) gets
-    // populated on every ingest pass. The extra field is additive on
-    // the gh JSON shape — no callers consume the gh stdout directly.
-    // Ticket 0023: also fetch `commits` so we can count heal-prefixed
-    // headlines via countHealCommits() and persist heal_attempts. gh
-    // returns one entry per commit with a `messageHeadline` (first
-    // line of the commit message) and a `messageBody` — we only need
-    // the headline.
-    const out = activeRunner("gh", ["pr", "list", "--repo", repo, "--state", "open", "--limit", "40",
-      "--json", "number,title,headRefName,mergeStateStatus,statusCheckRollup,additions,deletions,author,url,createdAt,commits"]);
-    rows = JSON.parse(out);
-  } catch { return; } // no gh/auth/network → keep last cache
+    const openOut = activeRunner("gh", ["pr", "list", "--repo", repo, "--state", "open", "--limit", "40",
+      "--json", JSON_FIELDS]);
+    openRows = JSON.parse(openOut);
+  } catch { return; } // no gh/auth/network → keep last cache for the whole project
+  try {
+    // The closed fetch is best-effort: if it fails (older gh, auth
+    // hiccup) we still write the open rows. The existing DELETE-then-
+    // INSERT pattern below removes the prior tick's closed rows, so
+    // a transient failure means the autopsy goes dark for one tick
+    // — not a regression on the existing open-PR surface.
+    const closedOut = activeRunner("gh", ["pr", "list", "--repo", repo, "--state", "closed", "--limit", "40",
+      "--json", JSON_FIELDS]);
+    closedRows = JSON.parse(closedOut);
+  } catch { closedRows = []; }
 
   const now = new Date().toISOString();
   db.prepare("DELETE FROM pr WHERE project_id=?").run(projectId);
-  const up = db.prepare(
+  // Two prepared statements: one hardcodes the 'open' lowercase
+  // literal (per the 0040 LESSON — open readers expect this exact
+  // casing), one accepts the gh state token verbatim ('CLOSED' or
+  // 'MERGED' uppercase). The closed-state stmt additionally carries
+  // a `closed_at` column write so the 0047 autopsy filter
+  // (`state='CLOSED' AND closed_at IS NOT NULL`) lights up.
+  const upOpen = db.prepare(
     "INSERT INTO pr(project_id,number,title,branch,state,ci_state,merge_state,is_agent,"
     + "additions,deletions,author,url,fetched_at,gh_created_at,"
     + "first_fail_check,first_fail_excerpt,heal_attempts) "
     + "VALUES(?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?,?)",
   );
-  for (const p of rows) {
+  const upClosed = db.prepare(
+    "INSERT INTO pr(project_id,number,title,branch,state,ci_state,merge_state,is_agent,"
+    + "additions,deletions,author,url,fetched_at,gh_created_at,closed_at,"
+    + "first_fail_check,first_fail_excerpt,heal_attempts) "
+    + "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+  );
+
+  // Open rows: hardcoded 'open' lowercase. closed_at stays NULL by
+  // schema default — the open INSERT never writes that column.
+  for (const p of openRows) {
     // Ticket 0023 + 0027: derive first_fail_check via the
     // startedAt-ascending picker (was: array order), then (when
     // non-null) pull the first 200 chars of the failing log via the
@@ -179,10 +212,34 @@ export function ingestProjectPRs(db: DB, projectId: number, repo: string): void 
     const firstFail = pickFirstFailingCheckName(p.statusCheckRollup);
     const excerpt = firstFail ? fetchFirstFailExcerpt(repo, p.number) : null;
     const heals = countHealCommits(p.commits);
-    up.run(projectId, p.number, p.title, p.headRefName, ciState(p.statusCheckRollup),
+    upOpen.run(projectId, p.number, p.title, p.headRefName, ciState(p.statusCheckRollup),
       p.mergeStateStatus ?? null, AGENT_RE.test(p.headRefName) ? 1 : 0,
       p.additions ?? 0, p.deletions ?? 0, p.author?.login ?? null, p.url ?? null, now,
       p.createdAt ?? null, firstFail, excerpt, heals);
+  }
+
+  // Closed/merged rows: gh state verbatim + closed_at populated from
+  // gh's `closedAt`. We DO NOT call fetchFirstFailExcerpt for closed
+  // rows — `gh run view --log-failed --branch pull/<n>/head` cannot
+  // resolve a workflow run for a closed PR head (the branch is
+  // typically gone), and the autopsy reader already carries the
+  // first_fail_check token from when the row was last open. We DO
+  // call pickFirstFailingCheckName so a merged-from-red PR
+  // (rare but legal) still carries the killing-check name.
+  for (const p of closedRows) {
+    // gh's state field for `--state closed` is one of 'CLOSED' or
+    // 'MERGED' (uppercase). Anything else (an OPEN row that snuck in
+    // via a re-open mid-tick — unlikely but possible) defaults to the
+    // safe 'CLOSED' token so the autopsy filter still matches.
+    const rawState = String(p.state ?? "").toUpperCase();
+    const state = rawState === "MERGED" ? "MERGED" : "CLOSED";
+    const firstFail = pickFirstFailingCheckName(p.statusCheckRollup);
+    const heals = countHealCommits(p.commits);
+    upClosed.run(projectId, p.number, p.title, p.headRefName, state,
+      ciState(p.statusCheckRollup), p.mergeStateStatus ?? null,
+      AGENT_RE.test(p.headRefName) ? 1 : 0,
+      p.additions ?? 0, p.deletions ?? 0, p.author?.login ?? null, p.url ?? null, now,
+      p.createdAt ?? null, p.closedAt ?? null, firstFail, null, heals);
   }
 }
 
