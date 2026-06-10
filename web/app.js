@@ -867,6 +867,18 @@ async function fetchPrAutopsies() {
   try { return await get("/api/fleet/pr-autopsies"); } catch { return null; }
 }
 
+// Ticket 0048: per-project worth-it verdict (fleet bulk endpoint).
+// One GET feeds every project card on the home grid — the per-project
+// route exists for the project page (out of scope for v1 home-only
+// render), but the home grid uses the bulk endpoint so an N-project
+// fleet pays one fetch, not N. Errors fall through silently so the
+// rest of the home page still renders. The 15-min server-side cache
+// (matching Cache-Control: max-age=900) keeps the round-trip cheap on
+// poll re-renders.
+async function fetchFleetWorthIt() {
+  try { return await get("/api/fleet/worth-it"); } catch { return null; }
+}
+
 /** Skeleton block shown while /api/fleet/glance is in flight. Carries
  *  `aria-busy="true"` so screen readers announce the loading state;
  *  the pulsing animation flattens under
@@ -1327,6 +1339,109 @@ function renderSpendEfficiencyCard(data) {
     </table>
   </div>`;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0048: Per-project worth-it verdict.
+//
+// Renders ONE verdict line inside each project card body (BELOW the
+// 0022 fleet-temp, 0026 streak, 0035 cost-per-PR and 0044 spend-
+// efficiency rows). Composes the fleet bulk worth-it payload — a
+// single `/api/fleet/worth-it` fetch keyed in home() — so per-card
+// renders don't fan out N requests. The verdict line is THREE possible
+// labels (net_positive, watch, sunset_candidate) plus the
+// insufficient_data short-circuit. Color follows the verdict:
+//   - net_positive       → --good
+//   - watch              → --warn
+//   - sunset_candidate   → --bad
+//   - insufficient_data  → --dim (neutral)
+// The sub-line carries `verdict_detail` (smaller font, hidden behind
+// a tap-to-expand chevron at 375px viewports per AC9).
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string passes through
+// redactSecrets.
+//
+// Per AC10: the SUNSET-STICKY chip (a separate `data-testid="sunset-sticky"`
+// span next to the verdict label, surfaced when the same project has
+// been sunset_candidate for >= 14 days) is HIDDEN when
+// `data.quiet_hours_active` is true — a midnight-portal-open should
+// not surface a 14-day sunset prompt. The verdict line itself stays
+// visible: information visible, prompt suppressed (matches the 0030
+// pull-vs-push contract).
+//
+// The fleet bulk endpoint does NOT carry per-project sticky / quiet
+// flags inline today (the sticky chip is rendered when present); the
+// SPA passes the fleet-wide `quiet_hours_active` flag in via the
+// `meta` argument so the renderer can do the right thing without a
+// second fetch.
+function renderWorthItVerdict(slug, meta) {
+  // `meta` shape: { verdict, verdict_detail, roi_multiplier,
+  // sticky_days, quiet_hours_active }. The caller passes null when
+  // the bulk fetch failed or the project isn't in the payload —
+  // returning "" keeps the card byte-identical to the pre-0048 render
+  // so a broken endpoint never corrupts the home grid.
+  if (!meta) return "";
+  const verdict = String(meta.verdict || "insufficient_data");
+  // Whitelist the verdict so a future server-side label that the
+  // CSS doesn't color-code can't sneak into the DOM as an
+  // unrecognised label. The four currently-valid verdicts each have
+  // a matching .worth-it-verdict-<verdict> rule in style.css:
+  //   net_positive, watch, sunset_candidate, insufficient_data
+  const validVerdicts = {
+    net_positive: "Net positive",
+    watch: "Watch",
+    sunset_candidate: "Sunset candidate",
+    insufficient_data: "Insufficient data",
+  };
+  const labelText = validVerdicts[verdict] || "Insufficient data";
+  const safeSlug = esc(redactSecrets(String(slug || "")));
+  const safeLabel = esc(redactSecrets(labelText));
+  const safeDetail = esc(redactSecrets(String(meta.verdict_detail || "")));
+  // ROI omitted when null/insufficient (per AC6 — color and sub-line
+  // adapt to the no-data case).
+  const roi = meta.roi_multiplier;
+  const roiPart = (verdict === "insufficient_data" || roi == null)
+    ? ""
+    : ` <span class="worth-it-roi">(${Number(roi).toFixed(1)}x ROI of human equivalent)</span>`;
+  // Sunset-sticky chip (AC8) — only rendered when sticky_days >= 14
+  // AND quiet hours are NOT active (AC10). The chip uses the
+  // documented `data-testid="sunset-sticky"` so AC8 + AC10 share one
+  // stable hook.
+  const sticky = Number(meta.sticky_days || 0) >= 14;
+  const quietHoursActive = !!meta.quiet_hours_active;
+  const stickyChip = (sticky && !quietHoursActive)
+    ? `<span class="worth-it-sticky-chip" data-testid="sunset-sticky">sunset 14d+</span>`
+    : "";
+  // Sub-line uses the smaller-text class shared with the spend-
+  // efficiency "why" line; on mobile the CSS media query collapses
+  // it behind the tap-to-expand chevron (AC9).
+  return `<div class="worth-it-verdict worth-it-verdict-${verdict}"
+    data-testid="project-card-verdict-${safeSlug}"
+    data-stop="1">
+    <div class="worth-it-verdict-head">
+      <span class="worth-it-verdict-label">Verdict:</span>
+      <b class="worth-it-verdict-name">${safeLabel}</b>${roiPart}
+      ${stickyChip}
+      <button class="worth-it-detail-toggle" data-worth-it-toggle="${safeSlug}" aria-label="Show worth-it detail">▾</button>
+    </div>
+    <div class="worth-it-verdict-detail dim">${safeDetail}</div>
+  </div>`;
+}
+
+// Tap-to-expand chevron handler (AC9): on 375px viewports the sub-
+// line is hidden by default; the chevron toggles a `.worth-it-expanded`
+// class on the parent that the mobile media query reverses.
+document.addEventListener("click", (e) => {
+  const toggle = e.target.closest("[data-worth-it-toggle]");
+  if (!toggle) return;
+  // Stop the parent <a class="card"> from navigating when the
+  // operator tapped the chevron specifically.
+  e.preventDefault();
+  e.stopPropagation();
+  const container = toggle.closest(".worth-it-verdict");
+  if (!container) return;
+  container.classList.toggle("worth-it-expanded");
+});
 
 // ────────────────────────────────────────────────────────────────────
 // Ticket 0047: PR autopsy card.
@@ -2195,8 +2310,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData, worthItData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(), fetchFleetWorthIt(),
   ]);
   // Ticket 0043: fetch the new-since-visit diff using the additive
   // `previous_last_seen` field from /api/fleet (the PRE-upsert
@@ -2214,6 +2329,29 @@ async function home() {
   summary.innerHTML = `${inboxCount ? `<a href="#inbox" class="inbox-badge" data-inbox-badge>Inbox ${inboxCount}</a> · ` : ""}${alerts.length ? `<span class="bell">${alerts.length} alert${alerts.length === 1 ? "" : "s"}</span> · ` : ""}<b>${data.projects.length}</b> projects · <b>${usd(data.totals.cost)}</b> est. effort · <a href="#/leaderboard" class="navlink">Compare ›</a>`;
   // Cache pace info so the "Set fleet pace" modal can show the current mix.
   window._allPaces = data.projects.map((p) => ({ slug: p.slug, pace: p.pace || "custom" }));
+  // Ticket 0048: stash the worth-it verdict for each project so the
+  // per-card render path (card(p)) can read it without an extra fetch.
+  // Augment each entry with quiet_hours_active (the inbox payload
+  // carries the canonical flag) so the renderer can suppress the
+  // sunset-sticky chip overnight per AC10 + the 0030 pull-vs-push
+  // contract.
+  window._worthItBySlug = {};
+  if (worthItData && Array.isArray(worthItData.projects)) {
+    for (const wi of worthItData.projects) {
+      if (!wi || !wi.project_slug) continue;
+      window._worthItBySlug[wi.project_slug] = {
+        verdict: wi.verdict,
+        verdict_detail: wi.verdict_detail,
+        roi_multiplier: wi.roi_multiplier,
+        // sticky_days isn't carried inline by the fleet endpoint v1
+        // (the two-anchor walk is per-project; the SPA fetches it
+        // lazily on tap if needed). Default to 0; the chip just
+        // stays hidden until a future ticket wires it in.
+        sticky_days: 0,
+        quiet_hours_active: quietHoursActive,
+      };
+    }
+  }
   app.innerHTML =
     renderNewSinceBanner(newSinceData, { quietHoursActive }) +
     digestBanner(digestData) +
@@ -2477,6 +2615,15 @@ function card(p) {
     ? `<div class="banner bad">Stopped working — its safety limit passed. Open it to restart.</div>`
     : sc != null && sc <= 3
       ? `<div class="banner">Stops working in ${sc} day${sc === 1 ? "" : "s"} unless you keep it running.</div>` : "";
+  // Ticket 0048: per-project worth-it verdict. Reads from the
+  // fleet bulk payload stashed by home() so an N-project grid pays
+  // ONE fetch, not N. The renderer returns "" when the bulk fetch
+  // failed or the slug isn't in the map (byte-identical to pre-0048
+  // render).
+  const worthItMeta = (typeof window !== "undefined" && window._worthItBySlug)
+    ? window._worthItBySlug[p.slug] || null
+    : null;
+  const worthItLine = renderWorthItVerdict(p.slug, worthItMeta);
   return `<a class="card" href="#/p/${p.slug}">
     <div class="card-head">${renderHealthDot(p.health, p.slug)}<span class="pname">${esc(p.name)}</span>
       <span class="state"><span class="dot ${cls}"></span>${label}${pausedCostPill(p)}${anomalyPill(p)}</span></div>
@@ -2489,7 +2636,8 @@ function card(p) {
       <span class="dim">${p.runs} runs</span>
     </div>
     ${renderBurndownSparkline(p)}
-    ${ulBanner}${akBanner}${banner}</a>`;
+    ${ulBanner}${akBanner}${banner}
+    ${worthItLine}</a>`;
 }
 // Ticket 0012: "Last week" digest banner — tap the head to expand
 // the per-project rows. Same toggle pattern as the PR card head.

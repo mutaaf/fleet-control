@@ -1681,3 +1681,53 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .receipts-modal .modal-body { width: 100%; height: 100%; max-height: 100vh;
     border-radius: 0; }
 }
+
+/* Ticket 0048: Per-project worth-it verdict line.
+ *
+ * One line at the bottom of each project card. The verdict label is
+ * color-coded via the four .worth-it-verdict-<verdict> rules below
+ * (reusing existing --good / --warn / --bad / --dim tokens — no new
+ * CSS variables introduced). The sub-line uses the same smaller-text
+ * pattern as the spend-efficiency "why" row; on phones (375px) it
+ * collapses behind a tap-to-expand chevron per AC9.
+ */
+.worth-it-verdict { margin-top: 10px; padding-top: 10px;
+  border-top: 1px dashed var(--line); font-family: var(--mono);
+  font-size: 12.5px; }
+.worth-it-verdict-head { display: flex; align-items: baseline;
+  gap: 8px; flex-wrap: wrap; }
+.worth-it-verdict-label { color: var(--faint); }
+.worth-it-verdict-name { font-weight: 600; }
+.worth-it-roi { font-size: 12px; color: var(--dim); }
+.worth-it-verdict-detail { margin-top: 4px; font-size: 12px;
+  color: var(--dim); line-height: 1.45; }
+.worth-it-detail-toggle { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); background: transparent; border: 0;
+  cursor: pointer; padding: 0 6px; margin-left: auto; }
+.worth-it-detail-toggle:hover { color: var(--accent); }
+.worth-it-sticky-chip { font-family: var(--mono); font-size: 11px;
+  padding: 1px 8px; border-radius: 20px;
+  border: 1px solid rgba(210,106,94,.55);
+  color: var(--bad); background: rgba(181,72,60,.14); }
+
+/* Verdict label colors — reuse existing tokens; no new variables. */
+.worth-it-verdict-net_positive .worth-it-verdict-name { color: var(--good); }
+.worth-it-verdict-watch .worth-it-verdict-name { color: var(--warn); }
+.worth-it-verdict-sunset_candidate .worth-it-verdict-name { color: var(--bad); }
+.worth-it-verdict-insufficient_data .worth-it-verdict-name { color: var(--dim); }
+
+/* Mobile: at <=375px the sub-line is hidden by default; the chevron
+ * (rendered by renderWorthItVerdict) toggles `.worth-it-expanded`
+ * on the parent, which re-reveals the sub-line. The verdict label
+ * + ROI line always renders. */
+@media (max-width: 375px) {
+  .worth-it-verdict-detail { display: none; }
+  .worth-it-verdict.worth-it-expanded .worth-it-verdict-detail { display: block; }
+}
+
+/* Tablet+: both lines render inline; the chevron is hidden because
+ * the sub-line is always visible — no tap-target needed. */
+@media (min-width: 600px) {
+  .worth-it-verdict-detail { display: block; }
+  .worth-it-detail-toggle { display: none; }
+}

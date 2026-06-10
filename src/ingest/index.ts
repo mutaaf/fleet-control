@@ -91,5 +91,15 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_pr_autopsies_invalidate__?: () => void }).__fleet_pr_autopsies_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0048: per-project worth-it verdict memo cache. The cache
+  // composes pr / cost_rollup_day / run / project — any of which an
+  // ingest tick can touch — so the simplest correct behaviour is to
+  // clear the whole map on every commit and let the next request
+  // rebuild the row it needs. Same globalThis-slot pattern as the
+  // changelog (0039) + autopsy (0047) hooks above.
+  try {
+    const hook = (globalThis as { __fleet_worth_it_invalidate__?: () => void }).__fleet_worth_it_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }
