@@ -1,8 +1,8 @@
 ---
 id: 0049
 title: Ingest closed (non-merged) PRs into the pr table so the autopsy card lights up in production
-status: proposed
-priority: P2
+status: groomed
+priority: P1
 area: ingest
 created: 2026-06-09
 owner: implementation-dev
