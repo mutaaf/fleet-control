@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -1856,6 +1856,9 @@ function renderYearInReviewPage(r: FleetYearInReview): string {
   <ul class="year-lessons" data-testid="top-lessons"></ul>
   <div class="year-sparkline" data-testid="year-sparkline">${renderSparklineSvg(r)}</div>
   <button class="year-share" data-testid="copy-share-link" type="button">copy share link</button>
+  <div class="year-foot">
+    <a data-testid="pulse-cross-link" href="/pulse">see this week's pulse at /pulse</a>
+  </div>
 </main>
 </body>
 </html>`;
@@ -1917,6 +1920,9 @@ function renderYearInReviewPage(r: FleetYearInReview): string {
   <ul class="year-projects" data-testid="top-projects">${projectCards}</ul>
   <ul class="year-lessons" data-testid="top-lessons">${lessonCards}</ul>
   <button class="year-share" data-testid="copy-share-link" type="button">copy share link</button>
+  <div class="year-foot">
+    <a data-testid="pulse-cross-link" href="/pulse">see this week's pulse at /pulse</a>
+  </div>
 </main>
 </body>
 </html>`;
@@ -1965,6 +1971,284 @@ function serveYearPage(
   const payload = getYearInReviewCached(db, year, now, { quietHoursActive: quiet });
   const body = renderYearInReviewPage(payload);
   return { status: 200, headers, body };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0054: public weekly fleet pulse.
+//
+// Two routes (both public, no auth):
+//   GET /pulse              → self-contained HTML, no <script>, no
+//                             /api/control/ surface.
+//   GET /api/fleet/pulse    → JSON payload matching FleetWeeklyPulse.
+//
+// Both routes share a per-week memo cache. The cache key embeds the
+// week_start_iso so the cache transparently rolls over at the Monday
+// boundary without an explicit invalidation. The cache tuple uses
+// (MAX(pr.fetched_at), COUNT(*) FROM pr WHERE state='MERGED',
+//  MAX(lesson_credit.created_at), COUNT(*) FROM lesson_credit,
+//  week_start_iso) per LESSONS 2026-06-07 "the `pr` table has no
+// surrogate `id`; proxy 'latest landed' via (MAX(fetched_at),
+// COUNT(*))".
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetPulseCacheForTests()`. Per LESSONS §
+// "expose a build counter for cache-hit tests, not a fetcher swap"
+// we expose `_getPulseCacheBuildsForTests()` that ticks on every
+// cache MISS.
+const PULSE_TTL_MS = 3600_000; // 1 hour — page moves slowly within a week.
+interface PulseCacheEntry {
+  tuple: string;
+  value: FleetWeeklyPulse;
+  expires_at: number;
+}
+const pulseCache = new Map<string, PulseCacheEntry>();
+let pulseBuildCounter = 0;
+
+export function _resetPulseCacheForTests(): void {
+  pulseCache.clear();
+  pulseBuildCounter = 0;
+}
+
+export function _getPulseCacheBuildsForTests(): number {
+  return pulseBuildCounter;
+}
+
+interface PulsePrSummaryRow { mx: string | null; c: number | null; }
+interface PulseLessonSummaryRow { mx: string | null; c: number | null; }
+
+function pulseInvalidationTuple(db: DB, weekStartIso: string): string {
+  // PR signal: (MAX(fetched_at), COUNT(*)) over MERGED rows. Per
+  // LESSONS 2026-06-07, NEVER MAX(pr.id) — the `pr` table has no
+  // surrogate id.
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr "
+    + " WHERE state = 'MERGED'",
+  ).get() as unknown as PulsePrSummaryRow | undefined;
+  // Lesson signal: (MAX(created_at), COUNT(*)) over the whole table.
+  // The freshest_lesson field depends on lesson_credit churn.
+  const lessonRow = db.prepare(
+    "SELECT MAX(created_at) AS mx, COUNT(*) AS c FROM lesson_credit",
+  ).get() as unknown as PulseLessonSummaryRow | undefined;
+  const prMx = prRow?.mx ?? "";
+  const prC = Number(prRow?.c ?? 0);
+  const lMx = lessonRow?.mx ?? "";
+  const lC = Number(lessonRow?.c ?? 0);
+  return `${weekStartIso}|${prMx}|${prC}|${lMx}|${lC}`;
+}
+
+/** Production cache-invalidation hook — called from the
+ *  `runIngestPass` post-COMMIT tail via the `globalThis` slot
+ *  (per LESSONS 2026-06-05 "break ingest↔server cache-invalidation
+ *  cycles via a globalThis slot, not a circular import"). Clearing
+ *  the map (not the build counter) lets tests observe a counter
+ *  increment on the next call after an ingest. */
+export function _invalidatePulseCacheAfterIngest(): void {
+  pulseCache.clear();
+}
+
+(globalThis as { __fleet_pulse_invalidate__?: () => void })
+  .__fleet_pulse_invalidate__ = _invalidatePulseCacheAfterIngest;
+
+/** Test-only handle on the cached pulse path. The AC3 cache test
+ *  imports this so it can observe the build counter increment on
+ *  miss / not-increment on hit, without touching SQL or hitting the
+ *  HTTP layer. Production code uses `servePulsePage` /
+ *  `servePulseJson`. */
+export function _pulseCachedForTests(db: DB, now: Date): FleetWeeklyPulse {
+  return getPulseCached(db, now);
+}
+
+/** Look up a fresh pulse from the memo cache; rebuild on miss. The
+ *  cache key is the week_start_iso so the entry naturally rolls over
+ *  at the Monday boundary. */
+function getPulseCached(db: DB, now: Date): FleetWeeklyPulse {
+  const value0 = fleetWeeklyPulse(db, { now });
+  const key = value0.week_start_iso;
+  const tuple = pulseInvalidationTuple(db, key);
+  const hit = pulseCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  pulseBuildCounter += 1;
+  pulseCache.set(key, {
+    tuple, value: value0, expires_at: Date.now() + PULSE_TTL_MS,
+  });
+  return value0;
+}
+
+/** Strip token-shaped substrings from individual operator-supplied
+ *  STRING VALUES on the pulse payload (project_name, lesson_title,
+ *  lesson_slug). Per LESSONS 2026-06-10 "redactSecrets on a JSON
+ *  body shreds your KEYS, not just your values": scrub the VALUES
+ *  BEFORE composition into HTML / JSON. Never scrub the body
+ *  string — a top-level JSON key like `cost_per_pr_usd` is letters-
+ *  and-underscores ONLY and would match the lenient `_`-as-digit
+ *  heuristic in receipts.ts / doctor.ts.
+ *
+ *  This redactor uses the tightened `hasDigit = /\d/.test(match)`
+ *  gate (no underscore special-case) — operator string values that
+ *  carry legitimate underscores (a lesson_title like
+ *  `average_failed_ship_cost_usd_lives_here`) survive intact, but a
+ *  real token-shape substring (always carries at least one numeric
+ *  digit) gets scrubbed.
+ *
+ *  Same character classes as src/server.ts § redactSecretsForLessonSavings. */
+function redactSecretsForPulse(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+/** Apply the renderer-boundary redactor to every operator-supplied
+ *  string field on the pulse payload. Numeric fields + JSON keys stay
+ *  byte-identical; only the values that originate in upstream data
+ *  (project_name, lesson_*) get the scrub. */
+function redactPulsePayload(p: FleetWeeklyPulse): FleetWeeklyPulse {
+  return {
+    ...p,
+    top_project: p.top_project ? {
+      ...p.top_project,
+      slug: redactSecretsForPulse(p.top_project.slug),
+      project_name: redactSecretsForPulse(p.top_project.project_name),
+    } : null,
+    freshest_lesson: p.freshest_lesson ? {
+      lesson_slug: redactSecretsForPulse(p.freshest_lesson.lesson_slug),
+      lesson_date: redactSecretsForPulse(p.freshest_lesson.lesson_date),
+      lesson_title: redactSecretsForPulse(p.freshest_lesson.lesson_title),
+    } : null,
+  };
+}
+
+function escForPulse(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+function fmtPulseUsd(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(Number(n))) return "—";
+  const v = Number(n);
+  return "$" + v.toFixed(2);
+}
+
+/** Test-only handle on the pulse renderer. Exported so tests can
+ *  drive the quiet-hours branch without booting startServer + the
+ *  cwd-mutating config seam (which is racy when test files run in
+ *  parallel processes). */
+export function _renderPulsePageForTests(
+  p: FleetWeeklyPulse,
+  opts: { quietHoursActive: boolean },
+): string {
+  return renderPulsePage(p, opts);
+}
+
+/** Render the self-contained /pulse HTML page. NO <script>, NO
+ *  `/api/control/` references, NO project list beyond `top_project`.
+ *  When merged_prs is zero the page renders the "fleet is quiet"
+ *  sentence per AC2 — honest copy, no fabricated upbeat language. */
+function renderPulsePage(p: FleetWeeklyPulse, opts: { quietHoursActive: boolean }): string {
+  const scrubbed = redactPulsePayload(p);
+  const weekStart = escForPulse(scrubbed.week_start_iso);
+  const weekEnd = escForPulse(scrubbed.week_end_iso);
+  // Empty-week branch — no per-stat testids, no CTA.
+  if (scrubbed.merged_prs === 0) {
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>fleet pulse · week of ${weekStart}</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+</head>
+<body class="pulse-page">
+<main class="pulse-main">
+  <div class="pulse-eyebrow">week of ${weekStart}</div>
+  <div class="pulse-empty" data-testid="pulse-empty">The fleet is quiet this week — nothing shipped.</div>
+</main>
+</body>
+</html>`;
+  }
+  const merged = String(scrubbed.merged_prs);
+  const spend = fmtPulseUsd(scrubbed.total_spend_usd);
+  const cpp = scrubbed.cost_per_pr_usd == null ? "—" : fmtPulseUsd(scrubbed.cost_per_pr_usd);
+  const streak = String(scrubbed.streak_days);
+  const topProject = scrubbed.top_project
+    ? `<div class="pulse-line" data-testid="pulse-top-project">top project: ${escForPulse(scrubbed.top_project.slug)} (${escForPulse(String(scrubbed.top_project.merged_prs))} PRs)</div>`
+    : `<div class="pulse-line" data-testid="pulse-top-project">top project: —</div>`;
+  const freshestLesson = scrubbed.freshest_lesson
+    ? `<div class="pulse-line" data-testid="pulse-freshest-lesson">freshest lesson: ${escForPulse(scrubbed.freshest_lesson.lesson_date)} · ${escForPulse(scrubbed.freshest_lesson.lesson_title)}</div>`
+    : `<div class="pulse-line" data-testid="pulse-freshest-lesson">freshest lesson: —</div>`;
+  const pausedLine = scrubbed.paused_count > 0
+    ? `<div class="pulse-line" data-testid="pulse-paused-count">${escForPulse(String(scrubbed.paused_count))} paused — see /graveyard</div>`
+    : `<div class="pulse-line" data-testid="pulse-paused-count">0 sunset projects this week</div>`;
+  // CTA: quiet hours suppress the nudge per 0030 precedent.
+  const cta = opts.quietHoursActive
+    ? ""
+    : `<a class="pulse-cta" data-testid="pulse-cta" href="/calculator">see the full receipts at /calculator</a>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>fleet pulse · week of ${weekStart}</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+</head>
+<body class="pulse-page">
+<main class="pulse-main">
+  <div class="pulse-eyebrow">week of ${weekStart} → ${weekEnd}</div>
+  <h1 class="pulse-headline" data-testid="pulse-headline">${merged} PRs shipped · ${spend} spent · ${cpp} per merged PR · streak ${streak} days</h1>
+  <div class="pulse-stats">
+    <div class="pulse-stat" data-testid="pulse-merged-prs"><span class="pulse-stat-value">${merged}</span><span class="pulse-stat-label">PRs merged</span></div>
+    <div class="pulse-stat" data-testid="pulse-spend"><span class="pulse-stat-value">${spend}</span><span class="pulse-stat-label">spent</span></div>
+    <div class="pulse-stat" data-testid="pulse-cost-per-pr"><span class="pulse-stat-value">${cpp}</span><span class="pulse-stat-label">per merged PR</span></div>
+    <div class="pulse-stat" data-testid="pulse-streak"><span class="pulse-stat-value">${streak}</span><span class="pulse-stat-label">streak days</span></div>
+  </div>
+  ${topProject}
+  ${freshestLesson}
+  ${pausedLine}
+  ${cta}
+</main>
+</body>
+</html>`;
+}
+
+/** Single chokepoint the server hits for GET /pulse. Returns the
+ *  status + headers + body the http handler emits. */
+function servePulsePage(
+  db: DB, cfg: FleetConfig, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = getPulseCached(db, now);
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const body = renderPulsePage(payload, { quietHoursActive: quiet });
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body,
+  };
+}
+
+/** Single chokepoint for GET /api/fleet/pulse. Returns the scrubbed
+ *  JSON payload. */
+function servePulseJson(db: DB, now: Date): { body: string; headers: Record<string, string> } {
+  const payload = getPulseCached(db, now);
+  const scrubbed = redactPulsePayload(payload);
+  return {
+    body: JSON.stringify(scrubbed),
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "cache-control": "public, max-age=3600",
+    },
+  };
 }
 
 /** Stable per-actor key used for the home_last_seen_<actor> watermark
@@ -2272,6 +2556,18 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           res.writeHead(500, { "content-type": "text/plain" });
           res.end(String(e?.message ?? e));
         });
+      }
+      // Ticket 0054: public weekly fleet pulse JSON. PUBLIC — NO auth,
+      // NO loopback gate (the page + JSON are the same public surface;
+      // the bookmark is the value). Handled BEFORE the
+      // `path.startsWith("/api/")` auth gate so a remote caller without
+      // a token gets 200 — same posture as the /pulse HTML route below
+      // and the existing /receipts / /year / /calculator routes (which
+      // are HTML; this is the JSON sibling).
+      if (path === "/api/fleet/pulse" && req.method === "GET") {
+        const result = servePulseJson(db, new Date());
+        res.writeHead(200, result.headers);
+        return res.end(result.body);
       }
       if (path.startsWith("/api/")) {
         // All read endpoints require the `read` scope (loopback bypasses).
@@ -3139,6 +3435,23 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           return res.end("year out of range");
         }
         const result = serveYearPage(db, cfg, yr, now);
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0054: public weekly fleet pulse — stable /pulse URL.
+      // Public, unauthenticated — the URL is the bookmark shape and
+      // the cadence is the value. Mirrors the /receipts + /year
+      // precedent (mounted in the no-token bypass block alongside
+      // the other public surfaces). Cache-Control: public,
+      // max-age=3600 — the page moves slowly within a week; the
+      // cache key embeds week_start_iso so the entry naturally rolls
+      // over at the Monday boundary.
+      //
+      // NB: the JSON sibling `/api/fleet/pulse` is mounted EARLIER
+      // (before the `if (path.startsWith("/api/"))` auth gate) so it
+      // shares the same no-auth posture as this HTML route.
+      if (path === "/pulse" && req.method === "GET") {
+        const result = servePulsePage(db, cfg, new Date());
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }

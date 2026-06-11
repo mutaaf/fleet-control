@@ -137,5 +137,15 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_lesson_savings_invalidate__?: () => void }).__fleet_lesson_savings_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0054: public weekly fleet pulse memo cache. Same
+  // globalThis-slot pattern as every other read-side cache. A
+  // freshly-merged PR shifts merged_prs / top_project; a fresh
+  // lesson_credit shifts freshest_lesson. Clearing the cache on
+  // every commit lets the next /pulse render rebuild the row
+  // without waiting out the 1-hour TTL.
+  try {
+    const hook = (globalThis as { __fleet_pulse_invalidate__?: () => void }).__fleet_pulse_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }
