@@ -20,7 +20,7 @@ proposes new ones, `review` grades them.
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
 | 0053 | Project graveyard - paused / sunset projects get a memorial page tallying lifetime ROI and what they taught the fleet | P2 | proposed | portal |
-| 0052 | Lesson-pays-for-itself ledger - each cross-fleet lesson grows a $$ saved tally from the heal-credit attributions | P1 | in-progress | observability |
+| 0052 | Lesson-pays-for-itself ledger - each cross-fleet lesson grows a $$ saved tally from the heal-credit attributions | P1 | shipped | observability |
 | 0051 | Pre-install ROI calculator - public /calculator page projects fleet-control's value before any install | P1 | shipped | portal |
 | 0050 | Fleet year-in-review - one shareable annual page only the local SQLite can author | P1 | shipped | portal |
 | 0049 | Ingest closed (non-merged) PRs into the pr table so the autopsy card lights up in production | P1 | shipped | ingest |
