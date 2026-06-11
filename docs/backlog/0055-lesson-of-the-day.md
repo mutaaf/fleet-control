@@ -1,7 +1,7 @@
 ---
 id: 0055
 title: Lesson of the day — one cross-fleet lesson rotates onto the home card each morning so the operator gets a daily intellectual reward
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-11
