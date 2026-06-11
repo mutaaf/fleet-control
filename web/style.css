@@ -1724,6 +1724,60 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
     border-radius: 0; }
 }
 
+/* Ticket 0056 — per-card "time saved this month" line.
+ *
+ * One compact muted-grey line sitting below the .metarow (spend +
+ * forecast + runs) on every project card. Reuses existing
+ * --dim / --mono tokens; no new CSS variables.
+ *
+ * At 375px the line sits inline with the spend stat (the parent
+ * .metarow has flex-wrap, and the time-saved line claims the row
+ * below by default — at small viewports it folds back inline). At
+ * >=600px the line claims its own row right-aligned beneath the
+ * spend, matching the spec's "own row right-aligned" framing for
+ * tablet+ viewports.
+ *
+ * The link variant (non-empty) and the span variant (empty-state)
+ * share the base selector; only the empty variant gets the
+ * .project-card-time-saved-empty modifier (rendered in a slightly
+ * lighter dim shade so the empty-state reads as honest signal).
+ */
+.project-card-time-saved {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--dim);
+  text-decoration: none;
+}
+.project-card-time-saved:hover { color: var(--accent); }
+.project-card-time-saved-empty {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* Mobile (<=375px): the line sits inline with the spend stat — the
+ * .metarow above wraps onto a second row, so we collapse the margin
+ * to keep the card compact. */
+@media (max-width: 375px) {
+  .project-card-time-saved {
+    display: inline-block;
+    margin-top: 2px;
+    margin-left: 6px;
+  }
+}
+
+/* Tablet+ (>=600px): the time-saved line claims its own row right-
+ * aligned beneath the metarow, per the spec's "own row right-
+ * aligned" framing. */
+@media (min-width: 600px) {
+  .project-card-time-saved {
+    display: block;
+    text-align: right;
+    margin-top: 4px;
+  }
+}
+
 /* Ticket 0048: Per-project worth-it verdict line.
  *
  * One line at the bottom of each project card. The verdict label is

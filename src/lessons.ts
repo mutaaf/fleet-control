@@ -719,6 +719,16 @@ export function attributeHealsToLessons(
         .__fleet_lesson_of_the_day_invalidate__;
       if (typeof lotdHook === "function") lotdHook();
     } catch { /* never let an in-process cache fail an attribution */ }
+    // Ticket 0056: the per-project savings rollup composes the SAME
+    // lesson_credit + run signals as the parent 0052 savings rollup,
+    // so a fresh credit row must bust the per-project cache too. Same
+    // globalThis-slot pattern; registered by src/server.ts on module
+    // load (never an import cycle).
+    try {
+      const byProjectHook = (globalThis as { __fleet_lesson_savings_by_project_invalidate__?: () => void })
+        .__fleet_lesson_savings_by_project_invalidate__;
+      if (typeof byProjectHook === "function") byProjectHook();
+    } catch { /* never let an in-process cache fail an attribution */ }
   }
   return { credits_inserted: inserted, heals_examined: healRows.length };
 }
