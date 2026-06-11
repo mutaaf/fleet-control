@@ -1,7 +1,7 @@
 ---
 id: 0052
 title: Lesson-pays-for-itself ledger — each cross-fleet lesson grows a $$ saved tally from the heal-credit attributions
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-10
