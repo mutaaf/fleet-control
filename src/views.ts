@@ -4064,6 +4064,175 @@ export function lessonCreditRollup(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Lesson-pays-for-itself ledger (ticket 0052).
+//
+// Composes the existing lesson_credit (0042) + run + control_audit
+// tables into one fleet-wide rollup of "this lesson saved $X across
+// N heals last quarter." No schema migration; no new ingest path.
+//
+// Math (deterministic, no LLM):
+//   - average_failed_ship_cost_usd = mean(run.cost_usd) over rows
+//     where outcome = 'failure' AND started_at falls in the window.
+//   - saved_usd per lesson = heal_count * average, rounded to 2dp.
+//   - When the window has zero failed runs, the average defaults to
+//     a $5.00 floor so the rollup is well-defined on a fresh fleet.
+//
+// Producer reconciliation (per LESSONS 2026-06-05 "groomer prose can
+// disagree with the schema; the schema wins"):
+//   - run.outcome failed literal: `'failure'` (lowercase). The
+//     producer in src/ingest/transcripts.ts:outcomeOf() doesn't emit
+//     a "failure" string today, but every other view + test in this
+//     repo (views.ts:722, views.ts:1655, inbox/streak/badge/glance/
+//     health/friday-wrap/monday-catchup tests) seeds + queries
+//     against `outcome = 'failure'` — that's the de-facto schema-
+//     language.
+//   - control_audit.action heal literal: `'heal'` (lowercase), per
+//     src/control.ts.audit() + src/lessons.ts:627.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing uses the double-cast.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// SQL strings are plain concatenation; identifiers stay unquoted.
+// Per LESSONS § "julianday() drifts ~10us per timestamp": no helper
+// here needs sub-millisecond timestamp precision (we bucket by full
+// days), but per-window arithmetic is JS-side via `Date.getTime()`
+// to stay clear of the trap.
+
+/** A floor used when the trailing-window has zero failed runs — keeps
+ *  the rollup well-defined on a freshly-onboarded fleet. Documented
+ *  here so the test + the empty-state tooltip read the same constant. */
+export const LESSON_SAVINGS_FLOOR_USD = 5.0;
+/** Default window in days. The ticket spec is 90 ("trailing 90 days
+ *  of control_audit"). */
+const LESSON_SAVINGS_DEFAULT_WINDOW_DAYS = 90;
+
+export interface LessonSavingsRow {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  heal_count: number;
+  saved_usd: number;
+  first_credited_at: string;
+  last_credited_at: string;
+  projects_helped: number;
+}
+
+export interface LessonSavingsRollup {
+  window_days: number;
+  generated_at: string;
+  average_failed_ship_cost_usd: number;
+  lesson_savings: LessonSavingsRow[];
+}
+
+export interface LessonSavingsRollupOptions {
+  /** Window size in days; defaults to 90. Caller clamps to [1, 365]
+   *  before passing in. */
+  windowDays?: number;
+  /** Wall-clock anchor — tests pin it; production passes `new Date()`. */
+  now?: Date;
+}
+
+interface LessonSavingsAvgRow {
+  avg_cost: number | null;
+  n: number | null;
+}
+
+interface LessonSavingsByLessonRow {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  heal_count: number;
+  first_credited_at: string;
+  last_credited_at: string;
+  projects_helped: number;
+}
+
+/** Compose the lesson-savings rollup. Joins lesson_credit (0042's
+ *  attribution ledger) against run (the failed-ship cost data) and
+ *  returns one row per lesson with heal_count + saved_usd. Pure
+ *  read-side; no writes. */
+export function lessonSavingsRollup(
+  db: DB,
+  opts: LessonSavingsRollupOptions = {},
+): LessonSavingsRollup {
+  const windowDays = Math.max(
+    1, Math.floor(opts.windowDays ?? LESSON_SAVINGS_DEFAULT_WINDOW_DAYS));
+  const now = opts.now ?? new Date();
+  const cutoffIso = new Date(now.getTime() - windowDays * 24 * 3600_000).toISOString();
+  const nowIso = now.toISOString();
+
+  // Average failed-ship cost over the window. NULL-coalesce both the
+  // measured and the computed cost columns so a fresh fleet with no
+  // cost_source='live' rows still produces a number — matches the
+  // cost_rollup recompute pattern at src/ingest/index.ts:18.
+  const avgRow = db.prepare(
+    "SELECT AVG(COALESCE(cost_usd, cost_usd_computed, 0)) AS avg_cost, "
+    + "       COUNT(*) AS n "
+    + "  FROM run "
+    + " WHERE outcome = 'failure' "
+    + "   AND started_at IS NOT NULL "
+    + "   AND started_at >= ?",
+  ).get(cutoffIso) as unknown as LessonSavingsAvgRow | undefined;
+
+  const n = Number(avgRow?.n ?? 0);
+  const avgRaw = avgRow?.avg_cost == null ? null : Number(avgRow.avg_cost);
+  const average = (n === 0 || avgRaw == null || !Number.isFinite(avgRaw) || avgRaw <= 0)
+    ? LESSON_SAVINGS_FLOOR_USD
+    : avgRaw;
+  // Round the average to 2 decimals so the SPA's "× $<avg>" arithmetic
+  // shows a stable two-decimal number that lines up with saved_usd's
+  // rounding. The internal multiplication still uses the rounded
+  // average — keeps the rollup byte-deterministic across rebuilds.
+  const averageRounded = Math.round(average * 100) / 100;
+
+  // Lesson-credit aggregation. Per LESSONS 2026-06-07 "the `pr` table
+  // has no surrogate id": the lesson_credit composite-PK shape means
+  // we cannot use MAX(id) — but we don't need to; we group by
+  // (lesson_slug, lesson_date, lesson_title) and let SQL count per
+  // group. The window predicate is on lesson_credit.created_at, NOT
+  // on control_audit.ts — the credit row's created_at is the moment
+  // the attribution landed (which is what the ticket's "ledger" frame
+  // measures). Heals attributed pre-window won't surface here even if
+  // the heal_audit row's ts is in window.
+  const lessonRows = db.prepare(
+    "SELECT lesson_slug, lesson_date, lesson_title, "
+    + "       COUNT(DISTINCT heal_audit_id) AS heal_count, "
+    + "       MIN(created_at) AS first_credited_at, "
+    + "       MAX(created_at) AS last_credited_at, "
+    + "       COUNT(DISTINCT project_slug) AS projects_helped "
+    + "  FROM lesson_credit "
+    + " WHERE created_at >= ? "
+    + " GROUP BY lesson_slug, lesson_date, lesson_title "
+    + " ORDER BY heal_count DESC, last_credited_at DESC",
+  ).all(cutoffIso) as unknown as LessonSavingsByLessonRow[];
+
+  const lesson_savings: LessonSavingsRow[] = lessonRows.map((r) => {
+    const healCount = Number(r.heal_count) || 0;
+    const savedUsd = Math.round(healCount * averageRounded * 100) / 100;
+    return {
+      lesson_slug: String(r.lesson_slug),
+      lesson_date: String(r.lesson_date),
+      lesson_title: String(r.lesson_title),
+      heal_count: healCount,
+      saved_usd: savedUsd,
+      first_credited_at: String(r.first_credited_at ?? ""),
+      last_credited_at: String(r.last_credited_at ?? ""),
+      projects_helped: Number(r.projects_helped) || 0,
+    };
+  });
+  // Re-sort by saved_usd DESC so the SPA's default ordering already
+  // matches the "$ saved descending" surface from the user story.
+  lesson_savings.sort((a, b) => b.saved_usd - a.saved_usd);
+
+  return {
+    window_days: windowDays,
+    generated_at: nowIso,
+    average_failed_ship_cost_usd: averageRounded,
+    lesson_savings,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Spend-efficiency ranking + laggard diagnosis (ticket 0044).
 //
 // Composes already-shipped tables (pr, cost_rollup_day, run, anomaly,

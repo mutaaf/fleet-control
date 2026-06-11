@@ -3975,6 +3975,164 @@ function decorateLessonRowsWithCredits(container, rollup) {
   }
 }
 
+// ---- Lesson-pays-for-itself savings ledger (ticket 0052) ---------------
+//
+// Renders one extra column on the cross-fleet lessons page: a
+// right-aligned monospace "$ saved" cell per lesson, sortable by
+// `saved_usd_desc`. The column lives in the data-testid'd cell so
+// text-level tests can assert presence / formatting without jsdom.
+// The hover tooltip carries the arithmetic for transparency:
+// "<heal_count> heals × $<avg>/avg failed ship = $<saved> saved
+// (trailing <N> days)". Per LESSONS §
+// "defence-in-depth secret redaction at the renderer boundary" every
+// operator-visible string passes through `redactSecrets` before HTML
+// interpolation.
+//
+// Quiet-hours integration (AC8): when `quiet_hours_active` is true
+// the SORT control on the column header is suppressed (information
+// visible, prompts suppressed — same shape as 0044's spend-efficiency
+// laggard CTA, 0048's worth-it verdict, 0050's year-in-review).
+//
+// Empty-fleet behaviour (AC7): a lesson with zero saves renders the
+// dash literal "--" (NOT "$0.00" — the dash communicates "no data
+// yet" rather than "this lesson is worthless"). The tooltip reads
+// "no heals attributed yet — lessons earn savings as the fleet
+// avoids known failures."
+
+const SAVED_USD_EMPTY = "--";
+
+/** Format a dollar amount for the savings column. Reuses the `usd()`
+ *  helper at the top of this file (the canonical $-formatter for the
+ *  fleet) so the column matches every other dollar surface (yesterday-
+ *  glance, monday-catchup, spend-efficiency, etc.). */
+function formatSavedUsd(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return SAVED_USD_EMPTY;
+  return usd(v);
+}
+
+/** Build the arithmetic tooltip text for one lesson row. Pure string
+ *  composition — the caller wraps with esc + redactSecrets at the
+ *  boundary. `windowDays` is the rollup's trailing window so the
+ *  copy stays honest about how far back the math reaches. */
+function lessonSavedUsdTooltip(row, average, windowDays) {
+  const heals = Number(row && row.heal_count || 0);
+  const saved = Number(row && row.saved_usd || 0);
+  const avg = Number(average);
+  if (!heals) {
+    return "no heals attributed yet — lessons earn savings as the fleet avoids known failures.";
+  }
+  return heals + " heal" + (heals === 1 ? "" : "s") + " × $"
+    + avg.toFixed(2) + "/avg failed ship = $" + saved.toFixed(2)
+    + " saved (trailing " + windowDays + " days)";
+}
+
+/** Render the clickable column header for the savings column. When
+ *  `quietHoursActive` is true the header still renders the label
+ *  (information visible) but with NO data-testid, NO click handler,
+ *  and the `dim` class — the operator can still SEE the column, they
+ *  just can't sort by it overnight. The `data-testid` attribute on
+ *  the active (non-quiet) variant is the test seam. */
+function renderLessonsSavedUsdHeader(quietHoursActive) {
+  const label = esc(redactSecrets("$ saved"));
+  if (quietHoursActive) {
+    return '<span class="lessons-saved-usd-header dim" aria-disabled="true">'
+      + label + "</span>";
+  }
+  return '<button type="button" class="lessons-saved-usd-header" '
+    + 'data-testid="lessons-saved-usd-header" '
+    + 'data-sort="saved_usd_desc" title="Sort by $ saved (descending)">'
+    + label + "</button>";
+}
+
+/** Render one per-row saved_usd cell. Carries:
+ *   - data-testid="lessons-saved-usd-<slug>" so a row-level assertion
+ *     can pick it out without DOM tree walking.
+ *   - data-testid="lessons-saved-usd-tooltip-<slug>" on the inner
+ *     <span> so the tooltip arithmetic can be asserted separately.
+ *  Per the AC: zero-saves rows render the dash literal "--" (not
+ *  "$0.00") and the tooltip carries the empty-fleet message. */
+function renderLessonsSavedUsdCell(lessonSlug, row, average, windowDays) {
+  const safeSlug = esc(redactSecrets(String(lessonSlug || "")));
+  const heals = Number(row && row.heal_count || 0);
+  // Empty state literal "--" — the renderer's deliberate choice per
+  // AC7 (the dash beats $0.00 because it communicates "no data yet"
+  // rather than "this lesson is worthless").
+  const dollarsText = heals
+    ? formatSavedUsd(row && row.saved_usd)
+    : SAVED_USD_EMPTY;
+  const safeDollars = esc(redactSecrets(String(dollarsText)));
+  const tooltip = lessonSavedUsdTooltip(row || {}, average, windowDays);
+  const safeTooltip = esc(redactSecrets(tooltip));
+  return '<span class="lessons-saved-usd" '
+    + 'data-testid="lessons-saved-usd-' + safeSlug + '">'
+    + '<span class="lessons-saved-usd-amount">' + safeDollars + "</span>"
+    + '<span class="lessons-saved-usd-tooltip" '
+    + 'data-testid="lessons-saved-usd-tooltip-' + safeSlug + '">'
+    + safeTooltip + "</span>"
+    + "</span>";
+}
+
+/** Walk the freshly-rendered .lesson nodes and attach a saved_usd
+ *  cell to every entry that has a date (so the (slug, date) join
+ *  key is well-defined). Lessons with zero saves still get a cell —
+ *  rendered as "--" with the empty-fleet tooltip. */
+function decorateLessonRowsWithSavings(container, savings) {
+  if (!container || !savings) return;
+  const bySlugDate = new Map();
+  for (const row of (savings.lesson_savings || [])) {
+    if (!row || !row.lesson_slug || !row.lesson_date) continue;
+    bySlugDate.set(row.lesson_slug + "|" + row.lesson_date, row);
+  }
+  const windowDays = Number(savings.window_days || 90);
+  const avg = Number(savings.average_failed_ship_cost_usd || 0);
+  const projects = container.querySelectorAll(".lessons-project");
+  for (const section of projects) {
+    const slug = section.getAttribute("data-lessons-project") || "";
+    const entries = section.querySelectorAll(".lesson");
+    for (const entry of entries) {
+      const date = entry.getAttribute("data-lesson-date") || "";
+      if (!date) continue;
+      const row = bySlugDate.get(slug + "|" + date);
+      const sum = entry.querySelector("summary");
+      if (!sum) continue;
+      sum.insertAdjacentHTML("beforeend", " " + renderLessonsSavedUsdCell(slug, row || null, avg, windowDays));
+    }
+  }
+}
+
+/** Wire the column-header click → sort by `saved_usd_desc`. The
+ *  sort itself is a stable in-DOM walk: collect lesson <details>
+ *  nodes per project section, sort by their saved_usd attribute,
+ *  re-attach. Cheap on the ~50 rows the fixture file produces. */
+function wireLessonsSavedUsdSort(container) {
+  if (!container) return;
+  const header = container.querySelector('[data-testid="lessons-saved-usd-header"]');
+  if (!header) return; // quiet hours → no clickable surface
+  header.addEventListener("click", () => {
+    const sortKey = header.getAttribute("data-sort") || "saved_usd_desc";
+    if (sortKey !== "saved_usd_desc") return;
+    const sections = container.querySelectorAll(".lessons-project");
+    for (const section of sections) {
+      const grid = section.querySelector(".lessons-entries");
+      if (!grid) continue;
+      const items = Array.from(grid.querySelectorAll(".lesson"));
+      items.sort((a, b) => {
+        const av = Number(
+          (a.querySelector(".lessons-saved-usd-amount")?.textContent || "0")
+            .replace(/[^0-9.]/g, ""),
+        ) || 0;
+        const bv = Number(
+          (b.querySelector(".lessons-saved-usd-amount")?.textContent || "0")
+            .replace(/[^0-9.]/g, ""),
+        ) || 0;
+        return bv - av;
+      });
+      for (const item of items) grid.appendChild(item);
+    }
+  });
+}
+
 /** base64-decode a UTF-8 string emitted by the 0047 autopsy card's
  *  draft tap-target. Pairs with `_autopsyBase64Encode` above; tolerant
  *  of malformed input — a decode failure returns null and the lessons
@@ -4031,6 +4189,20 @@ async function lessons(params) {
   try {
     credits = await get("/api/fleet/lesson-credits");
   } catch { credits = null; }
+  // Ticket 0052: lesson-pays-for-itself savings ledger — best-effort
+  // fetch. The payload carries `quiet_hours_active` so the renderer
+  // can gate the SORT control overnight (information visible,
+  // prompts suppressed).
+  let savings = null;
+  try {
+    savings = await get("/api/fleet/lessons/savings");
+  } catch { savings = null; }
+  const quietHoursActive = !!(savings && savings.quiet_hours_active);
+  const savingsHeaderHtml = savings
+    ? '<div class="lessons-savings-head" data-testid="lessons-savings-head">'
+      + renderLessonsSavedUsdHeader(quietHoursActive)
+      + "</div>"
+    : "";
   const newThisWeek = (data && data.new_this_week) || 0;
   const total = (data && data.total) || 0;
   const projectCount = (data && data.projects && data.projects.length) || 0;
@@ -4060,6 +4232,7 @@ async function lessons(params) {
         </label>
       </div>
       ${creditSummaryHtml}
+      ${savingsHeaderHtml}
     </div>
     ${draftHtml}
     ${renderLessonsPage(data)}
@@ -4069,6 +4242,10 @@ async function lessons(params) {
   if (container) {
     wireLessonsFilters(container, { initialFilterNew });
     if (credits) decorateLessonRowsWithCredits(container, credits);
+    if (savings) {
+      decorateLessonRowsWithSavings(container, savings);
+      wireLessonsSavedUsdSort(container);
+    }
   }
 }
 
