@@ -618,3 +618,47 @@ text renderer — the symptom is silent JSON shape mangling
 typecheck CAN'T catch (it's a runtime string op over a
 serialised body) and which tests catch only if they assert
 shape, not just status code.
+
+## 2026-06-11 — startServer() tests that mutate `fleet-control.config.json` race against parallel test files; expose a renderer-direct seam for branch tests
+
+Symptom: while shipping ticket 0054 I wrote an AC7 quiet-hours
+test that booted `startServer()` against a tmp DB and planted a
+`{ quietHours: { start: "00:01", end: "00:00", tz: "UTC" } }` config
+in cwd to drive the CTA-suppression branch. The test passed when
+run in isolation (`node --test tests/pulse.test.ts`) and passed
+again under `--test-concurrency=1`, but failed the moment another
+test file (e.g. `tests/receipts.test.ts` or
+`tests/year-in-review.test.ts`) ran concurrently: my `boot()`
+helper wrote the quietHours config, a parallel test file's
+`boot()` (in its own subprocess) wrote a DIFFERENT config to the
+SAME `fleet-control.config.json`, and `startServer`'s
+`loadConfig()` then read whichever write landed last — the CTA
+either appeared (quietHours dropped on the floor) or the page
+404'd (someone else's malformed config). Cause: `process.cwd()`
+is shared across all node:test subprocesses on the same machine;
+the `savedConfigText` snapshot in the test's `boot()` helper is
+per-process; the FILE is global. Each subprocess thinks IT owns
+the config; the filesystem disagrees. The receipts/year/lesson-
+savings tests don't see this because none of them mutate
+quietHours — they all write the same empty-roots shape, so a race
+between two identical writes is invisible. The first test to
+mutate a NON-DEFAULT config key (quietHours, projectRoots
+overrides, etc.) is the one that exposes the race. Fix: for any
+test that needs to drive a BRANCH that depends on configuration,
+export a renderer-level test seam (e.g.
+`_renderPulsePageForTests(payload, { quietHoursActive: true })`)
+so the test can hand-roll the input the renderer would have
+received from `quietHoursActiveAnywhere(cfg, now)` — zero cwd
+mutation, zero HTTP, zero race. The boot-path tests stay valuable
+for the integration shape (route exists, content-type, cache-
+control, testids present) but the cfg-dependent BRANCHES belong
+in renderer-direct unit tests. General rule for this repo: any
+new test that needs to write a NON-DEFAULT field to
+`fleet-control.config.json` is a smell — extract the renderer
+function, export a `_render*ForTests` seam, and drive the branch
+directly. The boot-path test is for "the route is wired"; the
+renderer-direct test is for "this input produces this output."
+Same trap will bite any future ticket that needs to drive an
+auth-gated, quietHours-gated, or per-project-override-gated
+branch through a startServer() boot — `--test-concurrency=1`
+"fixes" the symptom but doesn't fix the architecture.
