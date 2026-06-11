@@ -662,3 +662,56 @@ Same trap will bite any future ticket that needs to drive an
 auth-gated, quietHours-gated, or per-project-override-gated
 branch through a startServer() boot — `--test-concurrency=1`
 "fixes" the symptom but doesn't fix the architecture.
+
+## 2026-06-11 — character-window source greps leak into sibling helpers; backticked identifiers in adjacent comments break the slice
+
+Symptom: while shipping ticket 0056 I added a new sibling helper
+`lessonSavingsByProject` immediately after `lessonSavingsRollup`
+in `src/views.ts`. The new helper's leading comment block
+referenced existing identifiers like `` `lessonSavingsRollup` ``,
+`` `'failure'` ``, and `` `heal_count` `` — backticked because
+that's the standard markdown-in-comment convention this codebase
+uses for inline code. My ticket's typecheck + my new test suite
+were both green, but the existing 0052 AC10 grep test
+(`tests/lesson-savings.test.ts:783`) — which asserts
+"`lessonSavingsRollup` must not embed SQL keywords inside a
+backtick template literal" — started failing. Cause: the 0052
+test computes `const idx = VIEWS_TS.indexOf("lessonSavingsRollup")`
+then slices `VIEWS_TS.slice(idx, idx + 4000)` and regex-greps for
+`` /`[\s\S]*?(SELECT|FROM|WHERE|GROUP BY|ORDER BY)[\s\S]*?`/i ``.
+That slice doesn't end at the closing brace of
+`lessonSavingsRollup`; it just walks 4000 characters forward.
+When I inserted the new helper right after, the slice now
+contained: (a) the first backtick from a comment INSIDE
+`lessonSavingsRollup` (`` `pr` table ``), (b) the actual SQL
+string-concatenation inside `lessonSavingsRollup` (full of
+SELECT/FROM/WHERE), and (c) a second backtick from MY new
+comment block (`` `lessonSavingsRollup` `` as a cross-reference).
+The non-greedy `[\s\S]*?` happily stretched from (a) to (c),
+matching all the SQL keywords in between — even though no SQL
+keyword was ever inside a backtick template literal. The regex
+is correct in shape (any backtick-to-backtick run that contains
+a SQL keyword IS suspicious) but the character-window slice is
+too greedy when there's a sibling helper next door. Fix: drop
+the backticked identifiers from the new helper's comment block
+— plain prose like `lessonSavingsRollup` (no backticks) reads
+identically and stops the regex from matching across helpers.
+The 0052 test stays untouched (it's still the correct guard for
+the helper it names); the new helper just doesn't carry the
+backtick-comment style that overlaps the slice window. General
+rule for this repo: when a test does
+`VIEWS_TS.slice(indexOf(name), indexOf(name) + N)` to scope a
+grep to "this helper", any future sibling inserted within `N`
+chars inherits the test's regex constraints. The safer slicing
+pattern is `VIEWS_TS.slice(indexOf(name),
+VIEWS_TS.indexOf("\n}\n", indexOf(name)))` (walk to the closing
+brace at column 0) — but retrofitting that across every existing
+guard is more churn than just keeping new comment blocks free of
+backticked SQL-adjacent identifiers. Pre-flight check for any
+ticket that adds a sibling helper next to an existing one: grep
+the test suite for that helper's name + ".slice(" or ".indexOf("
+and confirm the new sibling's comment block won't poison the
+window. Same trap will bite any future ticket that adds a helper
+adjacent to one with a character-window source grep
+(views.ts has several: lessonSavingsRollup, lessonCreditRollup,
+fleetWeeklyPulse, etc.).
