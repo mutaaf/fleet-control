@@ -624,6 +624,22 @@ async function fetchMondayCatchUp() {
   try { return await get("/api/fleet/monday-catchup"); } catch { return null; }
 }
 
+// Ticket 0055: "Lesson of the day" rotating home card. ONE cross-
+// fleet lesson surfaces between the 0033 glance card and the 0017
+// inbox card, deterministic per UTC day and weighted by the 0052
+// savings ledger so high-value lessons rotate up more often. Errors
+// fall through silently — the card just disappears for that render
+// cycle and the rest of the home page still loads. The empty-state
+// is "Your fleet is still learning — lessons will surface here as
+// the agents accumulate them."; the operator can dismiss the card
+// for the day via localStorage flag fleet:lesson-of-the-day-
+// dismissed:<YYYY-MM-DD>. Quiet hours suppress the dismiss chevron
+// and soften the eyebrow ("tip of the day" → "tonight's lesson") per
+// the 0030 pull-vs-push contract.
+async function fetchLessonOfTheDay() {
+  try { return await get("/api/fleet/lesson-of-the-day"); } catch { return null; }
+}
+
 // Ticket 0043: new-since-last-visit diff. The SPA fetches this with
 // `?since=` set to the PRE-upsert `previous_last_seen` from
 // /api/fleet so the diff is against the previous visit, not the
@@ -2071,6 +2087,95 @@ function renderQuietDivider(quietHoursUntil, count) {
   </div>`;
 }
 
+// Ticket 0055: Lesson-of-the-day rotating home card. Render function
+// is exported under the stable name renderLessonOfTheDay so the
+// implementation-grep contract tests can confirm the renderer
+// exists. The dismiss flag is keyed by today's UTC date so a
+// dismissal naturally expires at midnight UTC (matches the rotation
+// cadence). Quiet hours suppress the dismiss chevron and swap the
+// eyebrow label per the 0030 contract; "information visible, prompts
+// suppressed".
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string passes through
+// redactSecrets before HTML interpolation. The server already
+// scrubs token-shape substrings at the JSON boundary; the SPA
+// re-applies the same scrub as a backstop the same way the inbox
+// and correlation surfaces do.
+function todayUtcKey() {
+  // YYYY-MM-DD in UTC, matching the rotation's cache key boundary.
+  return new Date().toISOString().slice(0, 10);
+}
+
+function renderLessonOfTheDay(data, opts) {
+  if (!data) return "";
+  const dismissedFlag = (opts && opts.dismissed === true) ? true : false;
+  const isOffline = !!(opts && opts.offline === true);
+  const totalIndexed = Number(data.total_lessons_indexed || 0);
+  const quietHoursActive = !!data.quiet_hours_active;
+  // Empty state: lesson is null AND the server is reachable. We
+  // render an honest "still learning" card so the operator knows the
+  // surface exists and will surface as the fleet accumulates more
+  // lessons.
+  if (!data.lesson_slug) {
+    return `<a class="lesson-of-the-day lesson-of-the-day-empty" data-testid="lesson-of-the-day-empty" href="#/lessons" aria-label="Lessons archive — still learning">
+      <div class="lesson-of-the-day-eyebrow" data-testid="lesson-of-the-day-eyebrow">${quietHoursActive ? "tonight’s lesson" : "tip of the day"}</div>
+      <div class="lesson-of-the-day-empty-copy">Your fleet is still learning — lessons will surface here as the agents accumulate them.</div>
+      <div class="lesson-of-the-day-empty-count dim">${totalIndexed} lesson${totalIndexed === 1 ? "" : "s"} indexed so far</div>
+    </a>`;
+  }
+  // Dismissed today: render nothing (the rest of home is intact).
+  if (dismissedFlag) return "";
+  const lesson_slug = redactSecrets(String(data.lesson_slug || ""));
+  const lesson_date = redactSecrets(String(data.lesson_date || ""));
+  const lesson_title = redactSecrets(String(data.lesson_title || ""));
+  const lesson_excerpt = redactSecrets(String(data.lesson_excerpt || ""));
+  const saved_usd = Number(data.saved_usd || 0);
+  const safeAnchor = encodeURIComponent(lesson_slug + "|" + lesson_date);
+  const href = "#/lessons#" + safeAnchor;
+  const eyebrow = quietHoursActive ? "tonight’s lesson" : "tip of the day";
+  // Dismiss chevron — when data.quiet_hours_active is true the dismiss
+  // button is hidden (the midnight visit must not lose the tip).
+  // Same posture as the 0048 / 0050 / 0053 sunset chips.
+  const dismissBtn = quietHoursActive ? "" : `<button class="lesson-of-the-day-dismiss" data-testid="lesson-of-the-day-dismiss" data-act="lesson-of-the-day-dismiss" aria-label="Dismiss for today" type="button">×</button>`;
+  // Offline / cached suffix per AC8 (PWA contract). The SPA only
+  // sets opts.offline when the network fetch failed but the SW
+  // returned a cached payload.
+  const cachedSuffix = isOffline ? ` <span class="lesson-of-the-day-cached-suffix dim" data-testid="lesson-of-the-day-cached-suffix">(cached)</span>` : "";
+  const savedBadge = `<span class="lesson-of-the-day-saved" data-testid="lesson-of-the-day-saved" title="Fleet savings attributed to this lesson over the rolling window">${esc(usd(saved_usd))} saved</span>`;
+  return `<a class="lesson-of-the-day" data-testid="lesson-of-the-day" href="${href}" aria-label="Tip of the day — tap for the lessons archive">
+    <div class="lesson-of-the-day-head">
+      <span class="lesson-of-the-day-eyebrow" data-testid="lesson-of-the-day-eyebrow">${eyebrow}${cachedSuffix}</span>
+      <span class="lesson-of-the-day-date dim">${esc(lesson_date)}</span>
+      ${dismissBtn}
+    </div>
+    <div class="lesson-of-the-day-title" data-testid="lesson-of-the-day-title">${esc(lesson_title)}</div>
+    <div class="lesson-of-the-day-excerpt" data-testid="lesson-of-the-day-excerpt">${esc(lesson_excerpt)}</div>
+    ${savedBadge}
+  </a>`;
+}
+
+// Dismiss handler — toggle the per-day localStorage flag and re-render
+// home so the card disappears. localStorage key per the AC:
+// `fleet:lesson-of-the-day-dismissed:<YYYY-MM-DD>`.
+function lessonOfTheDayDismissKey() {
+  return "fleet:lesson-of-the-day-dismissed:" + todayUtcKey();
+}
+function isLessonOfTheDayDismissed() {
+  try { return localStorage.getItem(lessonOfTheDayDismissKey()) === "1"; }
+  catch { return false; }
+}
+document.addEventListener("click", (e) => {
+  const b = e.target && e.target.closest && e.target.closest("[data-act='lesson-of-the-day-dismiss']");
+  if (!b) return;
+  e.preventDefault();
+  e.stopPropagation();
+  try { localStorage.setItem(lessonOfTheDayDismissKey(), "1"); }
+  catch { /* private mode / quota — fall through, card stays */ }
+  const card = b.closest && b.closest("[data-testid='lesson-of-the-day']");
+  if (card && card.parentNode) card.parentNode.removeChild(card);
+});
+
 function renderInbox(data) {
   if (!data) return "";
   const items = data.items || [];
@@ -2310,8 +2415,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData, worthItData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(), fetchFleetWorthIt(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData, worthItData, lessonOfTheDayData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(), fetchFleetWorthIt(), fetchLessonOfTheDay(),
   ]);
   // Ticket 0043: fetch the new-since-visit diff using the additive
   // `previous_last_seen` field from /api/fleet (the PRE-upsert
@@ -2359,6 +2464,7 @@ async function home() {
     renderFridayWrap(fridayWrapData) +
     renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +
+    renderLessonOfTheDay(lessonOfTheDayData, { dismissed: isLessonOfTheDayDismissed() }) +
     renderRiskiestPr(riskiestPrData) +
     renderStuckPrTaxonomyCard(stuckPrTaxonomyData) +
     renderPrAutopsyCard(prAutopsiesData) +

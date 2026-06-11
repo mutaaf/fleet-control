@@ -705,10 +705,239 @@ export function attributeHealsToLessons(
   // this module but not the server).
   if (inserted > 0) {
     try {
-      const hook = (globalThis as { __fleet_lesson_savings_invalidate__?: () => void })
+      const savingsHook = (globalThis as { __fleet_lesson_savings_invalidate__?: () => void })
         .__fleet_lesson_savings_invalidate__;
-      if (typeof hook === "function") hook();
+      if (typeof savingsHook === "function") savingsHook();
+    } catch { /* never let an in-process cache fail an attribution */ }
+    // Ticket 0055: the lesson-of-the-day rotation list is keyed off
+    // savings ranking, so a fresh lesson_credit row may re-order the
+    // rotation. Wake the lesson-of-the-day memo via the same
+    // globalThis-slot pattern (registered by src/server.ts on module
+    // load) — never an import cycle.
+    try {
+      const lotdHook = (globalThis as { __fleet_lesson_of_the_day_invalidate__?: () => void })
+        .__fleet_lesson_of_the_day_invalidate__;
+      if (typeof lotdHook === "function") lotdHook();
     } catch { /* never let an in-process cache fail an attribution */ }
   }
   return { credits_inserted: inserted, heals_examined: healRows.length };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0055 — Lesson of the day.
+//
+// Pure helper that selects ONE cross-fleet lesson per UTC day, weighted
+// by the lesson_credit-based savings ledger (0052). Composes the
+// existing cross-fleet lessons file (0036) with the existing
+// `lessonSavingsRollup()` helper (0052) — no new schema, no new
+// ingest, no new control surface.
+//
+// Selection algorithm:
+//   1. Load the parsed cross-fleet lessons via `loadCrossLessons()`.
+//   2. If fewer than 5 dated lessons exist → return null (the SPA
+//      renders the "still learning" empty state).
+//   3. Build `ranked_lessons` = lessons sorted by `saved_usd` DESC
+//      (stable secondary sort by `lesson_slug` ASC then `lesson_date`
+//      ASC). Lessons with zero credits get `saved_usd = 0` and sort
+//      to the tail.
+//   4. Apply a savings-decile bias: every lesson whose `saved_usd`
+//      is in the top decile (>= the 90th-percentile threshold of the
+//      non-zero values) appears TWICE in the rotation list. This
+//      gives the highest-value lessons ~2x the surface frequency
+//      without changing the deterministic shape of the rotation.
+//   5. Compute `day_index = floor(epoch_ms / 86_400_000)` (UTC days
+//      since the unix epoch).
+//   6. Pick `ranked_lessons[day_index mod ranked_lessons.length]`.
+//
+// PRODUCER-VS-SPEC: the spec prose names a `lesson_slug` field on the
+// parsed entry, but `parseCrossLessons()` exposes the slug on the
+// PARENT `ProjectLessons.slug` (not on each `LessonEntry`). We join
+// `lesson_slug = project.slug` and `lesson_date = entry.date` so the
+// rotation key matches `lessonSavingsRollup`'s (lesson_slug,
+// lesson_date) row identity.
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing in lessonSavingsRollup already uses the double
+// cast — we just consume the typed result here.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// this helper issues no raw SQL; it composes pure-JS rollups.
+// Per LESSONS § "time-pinned tests must NOT derive seed timestamps
+// from `new Date()`": the helper accepts `opts.now` so tests pin the
+// rotation day deterministically.
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" AND § "expose a build counter for cache-hit tests, not
+// a fetcher swap": the caching + reset + counter seam live in
+// src/server.ts where the route handler reads the cache; the helper
+// itself is pure.
+// ────────────────────────────────────────────────────────────────────
+
+import { lessonSavingsRollup, type LessonSavingsRow } from "./views.ts";
+
+/** Minimum number of dated lessons before the rotation surfaces a
+ *  card. Below this the SPA shows an honest "still learning" empty
+ *  state per the user story. */
+export const LESSON_OF_THE_DAY_MIN_LESSONS = 5;
+
+/** Window in days for the savings rollup we join against. Wide
+ *  enough to cover the lifetime of the lesson_credit ledger — the
+ *  rotation is a "wisdom-accounting" surface, not a recency surface,
+ *  so a credit landed N years ago still ranks the lesson it
+ *  attributed to. The 0052 savings route still defaults to 90; this
+ *  is a deliberate per-feature widening so the daily rotation's slot
+ *  doesn't shift mid-month as a 91-day-old credit ages out of the
+ *  shorter window. */
+export const LESSON_OF_THE_DAY_SAVINGS_WINDOW_DAYS = 3650;
+
+/** Hard cap on the excerpt length so the SPA's mobile card layout
+ *  stays predictable. Per the user story: "~120 chars, first sentence
+ *  of the symptom-cause-fix paragraph". */
+export const LESSON_OF_THE_DAY_EXCERPT_CHARS = 120;
+
+export interface LessonOfTheDay {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  lesson_excerpt: string;
+  saved_usd: number;
+  total_lessons_indexed: number;
+  rotation_day_index: number;
+}
+
+export interface LessonOfTheDayOptions {
+  /** Pin the rotation day. Defaults to `new Date()`. Tests MUST set
+   *  this per LESSONS § "time-pinned tests must NOT derive seed
+   *  timestamps from `new Date()`". */
+  now?: Date;
+}
+
+interface RankedLesson {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  lesson_body: string;
+  saved_usd: number;
+}
+
+/** First-sentence excerpt up to `LESSON_OF_THE_DAY_EXCERPT_CHARS`
+ *  chars, ending on a word boundary. Returns "" when the body is
+ *  empty so the SPA can render an em-dash placeholder. */
+function buildExcerpt(body: string): string {
+  const text = String(body ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  // Prefer the first sentence — split on '.', '\n', '!', '?' .
+  const firstSentenceMatch = text.match(/^[^.\n!?]+[.!?]?/);
+  const firstSentence = firstSentenceMatch ? firstSentenceMatch[0].trim() : text;
+  if (firstSentence.length <= LESSON_OF_THE_DAY_EXCERPT_CHARS) return firstSentence;
+  // Clip on a word boundary. Walk back from the cap to the previous
+  // space so we don't slice mid-word.
+  const clipped = firstSentence.slice(0, LESSON_OF_THE_DAY_EXCERPT_CHARS);
+  const lastSpace = clipped.lastIndexOf(" ");
+  if (lastSpace > 0) return clipped.slice(0, lastSpace) + "…";
+  return clipped + "…";
+}
+
+/** Compute the 90th-percentile threshold over the strictly positive
+ *  `saved_usd` values. Returns `Infinity` when no values are positive
+ *  (no top-decile bias when the fleet has no savings). */
+function topDecileThreshold(savedUsds: number[]): number {
+  const positives = savedUsds.filter((v) => v > 0);
+  if (positives.length === 0) return Infinity;
+  // Sort ascending and pick the value at the 90th percentile index.
+  // We use the nearest-rank method which is fine for our purposes
+  // (it's just a frequency bias, not a statistical threshold).
+  const sorted = positives.slice().sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.ceil(0.9 * sorted.length) - 1);
+  return sorted[idx];
+}
+
+/** Pick the deterministic lesson-of-the-day. Returns `null` when the
+ *  cross-fleet lessons file carries fewer than
+ *  `LESSON_OF_THE_DAY_MIN_LESSONS` dated lessons. */
+export function lessonOfTheDay(
+  db: DB,
+  opts: LessonOfTheDayOptions = {},
+): LessonOfTheDay | null {
+  const now = opts.now ?? new Date();
+  const lessonsPath = defaultLessonsPath();
+  const parsed = loadCrossLessons(lessonsPath);
+  // Empty / oversized / missing → no rotation. The route translates
+  // this into a `{ lesson: null }` 200 so the SPA renders the honest
+  // empty state.
+  if (!parsed.source_present || parsed.oversized) return null;
+
+  // Collect every dated lesson; the rotation joins on (slug, date) so
+  // undated entries (legacy headers, free-form sections) are dropped.
+  const flat: Array<{ slug: string; date: string; title: string; body: string }> = [];
+  for (const p of parsed.projects) {
+    for (const l of p.lessons) {
+      if (!l.date) continue;
+      flat.push({
+        slug: p.slug,
+        date: l.date,
+        title: String(l.title ?? ""),
+        body: String(l.body ?? ""),
+      });
+    }
+  }
+  if (flat.length < LESSON_OF_THE_DAY_MIN_LESSONS) return null;
+
+  // Join with the savings rollup (0052) so each lesson carries a
+  // saved_usd value. Lessons with no credits get $0.
+  const savings = lessonSavingsRollup(db, {
+    now,
+    windowDays: LESSON_OF_THE_DAY_SAVINGS_WINDOW_DAYS,
+  });
+  const savingsByKey = new Map<string, LessonSavingsRow>();
+  for (const row of savings.lesson_savings) {
+    savingsByKey.set(row.lesson_slug + "|" + row.lesson_date, row);
+  }
+
+  const ranked: RankedLesson[] = flat.map((f) => {
+    const row = savingsByKey.get(f.slug + "|" + f.date);
+    return {
+      lesson_slug: f.slug,
+      lesson_date: f.date,
+      lesson_title: f.title,
+      lesson_body: f.body,
+      saved_usd: row ? Number(row.saved_usd) || 0 : 0,
+    };
+  });
+
+  // Primary sort: saved_usd DESC. Secondary stable sort: lesson_slug
+  // ASC, then lesson_date ASC. This makes the rotation deterministic
+  // regardless of file order — operators get the same slot for the
+  // same day.
+  ranked.sort((a, b) => {
+    if (b.saved_usd !== a.saved_usd) return b.saved_usd - a.saved_usd;
+    if (a.lesson_slug !== b.lesson_slug) return a.lesson_slug < b.lesson_slug ? -1 : 1;
+    return a.lesson_date < b.lesson_date ? -1 : (a.lesson_date > b.lesson_date ? 1 : 0);
+  });
+
+  // Savings-decile bias: top-decile lessons appear TWICE in the
+  // rotation list so the modular indexing surfaces them ~2x as often.
+  const threshold = topDecileThreshold(ranked.map((r) => r.saved_usd));
+  const rotationList: RankedLesson[] = [];
+  for (const r of ranked) {
+    rotationList.push(r);
+    if (Number.isFinite(threshold) && r.saved_usd >= threshold && r.saved_usd > 0) {
+      rotationList.push(r);
+    }
+  }
+
+  // Day index — UTC days since unix epoch. Stable per calendar day
+  // regardless of local tz; rolls over at midnight UTC, which is the
+  // cache boundary the route honours via Cache-Control: max-age=3600.
+  const dayIndex = Math.floor(now.getTime() / 86_400_000);
+  const slot = ((dayIndex % rotationList.length) + rotationList.length) % rotationList.length;
+  const pick = rotationList[slot];
+
+  return {
+    lesson_slug: pick.lesson_slug,
+    lesson_date: pick.lesson_date,
+    lesson_title: pick.lesson_title,
+    lesson_excerpt: buildExcerpt(pick.lesson_body),
+    saved_usd: pick.saved_usd,
+    total_lessons_indexed: flat.length,
+    rotation_day_index: dayIndex,
+  };
 }
