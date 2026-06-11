@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -300,6 +300,172 @@ function clampLessonCreditWindow(raw: string | null): number {
   const n = parseInt(raw, 10);
   if (!Number.isFinite(n)) return 30;
   return Math.max(1, Math.min(90, n));
+}
+
+// Ticket 0052: lesson-pays-for-itself ledger memo cache.
+//
+// 15-minute TTL (matches Cache-Control: max-age=900 — the savings
+// rollup moves on two signals: a fresh lesson_credit row OR a fresh
+// failed run, and both are minute-scale in practice). Keyed by
+// (windowDays, lessons_total). Invalidation tuple is FOUR-VALUE:
+//
+//   - lessonCreditMaxCreatedAt = SELECT MAX(created_at) FROM
+//                                lesson_credit
+//   - lessonCreditCount        = SELECT COUNT(*)        FROM
+//                                lesson_credit
+//   - runMaxEndedAt            = SELECT MAX(ended_at)   FROM run
+//                                WHERE outcome = 'failure'
+//   - runFailureCount          = SELECT COUNT(*)        FROM run
+//                                WHERE outcome = 'failure'
+//
+// Per LESSONS 2026-06-07 "the `pr` table has no surrogate `id`; proxy
+// 'latest landed' via (MAX(fetched_at), COUNT(*))": the lesson_credit
+// table's PK is composite (lesson_slug, lesson_date, heal_audit_id)
+// — NO surrogate id — so we proxy "fresh credit row landed" via the
+// (MAX(created_at), COUNT(*)) pair. Either side moving busts the
+// cache. The same shape applies to the failed-run signal.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetLessonSavingsCacheForTests()`. Per
+// LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap" we also expose
+// `_getLessonSavingsCacheBuildsForTests()` that ticks on every cache
+// MISS so route tests can assert hit/miss semantics without stubbing
+// SQL. Production code never reads either.
+interface LessonSavingsCacheEntry {
+  tuple: string;
+  value: LessonSavingsRollup & { quiet_hours_active: boolean };
+  expires_at: number;
+}
+const LESSON_SAVINGS_TTL_MS = 900_000; // 15 minutes per AC3.
+const lessonSavingsCache = new Map<string, LessonSavingsCacheEntry>();
+let lessonSavingsBuildCounter = 0;
+
+export function _resetLessonSavingsCacheForTests(): void {
+  lessonSavingsCache.clear();
+  lessonSavingsBuildCounter = 0;
+}
+
+export function _getLessonSavingsCacheBuildsForTests(): number {
+  return lessonSavingsBuildCounter;
+}
+
+interface LessonSavingsCreditTupleRow { mx: string | null; c: number | null; }
+interface LessonSavingsFailedRunTupleRow { mx: string | null; c: number | null; }
+
+function lessonSavingsInvalidationTuple(
+  db: DB, windowDays: number, lessonsTotal: number,
+): string {
+  const credit = db.prepare(
+    "SELECT MAX(created_at) AS mx, COUNT(*) AS c FROM lesson_credit",
+  ).get() as unknown as LessonSavingsCreditTupleRow | undefined;
+  const failed = db.prepare(
+    "SELECT MAX(ended_at) AS mx, COUNT(*) AS c "
+    + "  FROM run WHERE outcome = 'failure'",
+  ).get() as unknown as LessonSavingsFailedRunTupleRow | undefined;
+  const cmx = credit?.mx ?? "";
+  const cc = Number(credit?.c ?? 0);
+  const fmx = failed?.mx ?? "";
+  const fc = Number(failed?.c ?? 0);
+  return "w=" + windowDays + "|cmx=" + cmx + "|cc=" + cc
+    + "|fmx=" + fmx + "|fc=" + fc + "|n=" + lessonsTotal;
+}
+
+/** Look up a fresh lesson-savings rollup from the memo cache;
+ *  attribute + rebuild on miss. The attribution step runs on the
+ *  same tick as the rollup so a freshly-landed heal that pattern-
+ *  matches a lesson gets credited inside the TTL without waiting for
+ *  the daemon hook to fire — same shape as getLessonCreditCached. */
+function getLessonSavingsCached(
+  db: DB, cfg: FleetConfig, windowDays: number,
+  parsed: CrossLessonsLoadResult, now: Date,
+): LessonSavingsRollup & { quiet_hours_active: boolean } {
+  const tuple = lessonSavingsInvalidationTuple(db, windowDays, parsed.total);
+  const hit = lessonSavingsCache.get(String(windowDays));
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  lessonSavingsBuildCounter += 1;
+  try {
+    attributeHealsToLessons(db, parsed, now, { windowDays });
+  } catch { /* keep serving — the rollup will surface whatever is in the table */ }
+  const inner = lessonSavingsRollup(db, { now, windowDays });
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const value = { ...inner, quiet_hours_active: quiet };
+  lessonSavingsCache.set(String(windowDays), {
+    tuple, value, expires_at: Date.now() + LESSON_SAVINGS_TTL_MS,
+  });
+  return value;
+}
+
+/** Cache-invalidation hook fired from `runIngestPass` (after the
+ *  ingest pass COMMITs) AND from `attributeHealsToLessons` (after a
+ *  non-zero lesson_credit insert). The cycle-break is registered on
+ *  `globalThis.__fleet_lesson_savings_invalidate__` so the producer
+ *  modules (ingest/index.ts, lessons.ts) don't have to import
+ *  server.ts (which would deadlock — server.ts already imports both).
+ *  Per LESSONS 2026-06-05 "break ingest↔server cache-invalidation
+ *  cycles via a globalThis slot, not a circular import". */
+export function _invalidateLessonSavingsCacheAfterIngest(): void {
+  lessonSavingsCache.clear();
+}
+
+(globalThis as { __fleet_lesson_savings_invalidate__?: () => void })
+  .__fleet_lesson_savings_invalidate__ = _invalidateLessonSavingsCacheAfterIngest;
+
+/** Clamp the ?window=<days> query param for the savings route.
+ *  Defaults to 90 per the ticket spec; clamps to [1, 365] so the
+ *  operator can ask for a full-year view if they want. */
+function clampLessonSavingsWindow(raw: string | null): number {
+  if (!raw) return 90;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 90;
+  return Math.max(1, Math.min(365, n));
+}
+
+/** Strip token-shaped substrings from individual operator-visible
+ *  STRING VALUES embedded in the savings rollup (lesson_title,
+ *  matched_substring, etc.) BEFORE the rollup is JSON-encoded. We do
+ *  the scrub on the values, not on the JSON body string, because a
+ *  whole-body sweep would happily match long JSON KEY names (e.g.
+ *  `average_failed_ship_cost_usd` is 27 chars with letters+`_`) and
+ *  shred the shape. Same character classes as src/receipts.ts §
+ *  redactSecrets — defence-in-depth at the renderer boundary per
+ *  LESSONS § "defence-in-depth secret redaction at the renderer
+ *  boundary". A lesson title or matched_substring drawn from an
+ *  upstream heal stdout tail can in theory carry a leaked token;
+ *  this is the chokepoint. */
+function redactSecretsForLessonSavings(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  // Long alphanumeric (token-shaped) runs that mix letters AND digits
+  // (NOT just letters + underscores — JSON keys like
+  // `average_failed_ship_cost_usd` are letters-and-underscores ONLY
+  // and must survive the scrub). The `\d` check is what gates this
+  // — a real underscore-separated JSON key has no digits.
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+/** Apply the renderer-boundary redactor to every operator-supplied
+ *  string field on the rollup. The keys + the numeric fields stay
+ *  byte-identical; only the values that originate in upstream data
+ *  (lesson_title, lesson_slug, lesson_date) get the scrub. */
+function redactLessonSavingsRollup<
+  T extends LessonSavingsRollup & { quiet_hours_active?: boolean },
+>(rollup: T): T {
+  return {
+    ...rollup,
+    lesson_savings: rollup.lesson_savings.map((row) => ({
+      ...row,
+      lesson_slug: redactSecretsForLessonSavings(row.lesson_slug),
+      lesson_date: redactSecretsForLessonSavings(row.lesson_date),
+      lesson_title: redactSecretsForLessonSavings(row.lesson_title),
+    })),
+  };
 }
 
 // Ticket 0037: "Friday wrap" memo cache.
@@ -2556,8 +2722,43 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           const lessonsPath = defaultLessonsPath();
           const v = getLessonsCached(lessonsPath);
           const nwt = newThisWeekCount(v, new Date());
+          // Ticket 0052: amend the existing 0036 lessons payload with
+          // ONE additive optional `savings` field per lesson entry.
+          // Per AGENTS.md "Never break the JSON shape of an existing
+          // /api/... route without bumping a version", an ADDITIVE
+          // optional field is allowed under the existing shape
+          // contract — no existing field changes type, meaning, or
+          // removal. Older SPA clients gracefully ignore the field.
+          //
+          // The savings join is by (lesson_slug, lesson_date) where
+          // the parser's project slug is the slug-component and the
+          // entry's `date` is the date-component. Lessons with zero
+          // credits surface `savings: null` so the SPA can render
+          // "--" uniformly (per AC7).
+          let projectsOut = v.projects;
+          try {
+            const savings = getLessonSavingsCached(db, cfg, 90, v, new Date());
+            const byKey = new Map<string, LessonSavingsRow>();
+            for (const row of savings.lesson_savings) {
+              byKey.set(row.lesson_slug + "|" + row.lesson_date, row);
+            }
+            projectsOut = v.projects.map((p) => ({
+              ...p,
+              lessons: p.lessons.map((l) => {
+                const key = p.slug + "|" + (l.date ?? "");
+                const row = byKey.get(key);
+                return {
+                  ...l,
+                  savings: row
+                    ? { lesson_slug: row.lesson_slug, saved_usd: row.saved_usd }
+                    : null,
+                };
+              }),
+            }));
+          } catch { /* keep the legacy payload shape — the savings cache surfaces
+                       its own JSON error from its own route */ }
           const body = JSON.stringify({
-            projects: v.projects,
+            projects: projectsOut,
             parsed_at: v.parsed_at,
             total: v.total,
             source_present: v.source_present,
@@ -2568,6 +2769,38 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=120",
+          });
+          return res.end(body);
+        }
+        // Ticket 0052: lesson-pays-for-itself ledger. Returns one row
+        // per cross-fleet lesson with heal_count + saved_usd over the
+        // requested window (default 90 days, clamped to [1, 365]).
+        // Composes lesson_credit (populated by the daemon hook +
+        // route-side attribution on cache miss) and run rows with
+        // outcome='failure' (the failed-ship cost data). Cache-Control:
+        // max-age=900 mirrors the 15-min memo TTL; the memo
+        // invalidates on every fresh lesson_credit row OR fresh failed
+        // run (per the four-value tuple in
+        // lessonSavingsInvalidationTuple). Per LESSONS § "defence-in-
+        // depth secret redaction at the renderer boundary" the body
+        // routes through redactSecretsForLessonSavings before
+        // res.end — a lesson title drawn from upstream heal stdout
+        // tails can in theory carry a leaked token.
+        if (path === "/api/fleet/lessons/savings") {
+          const windowDays = clampLessonSavingsWindow(url.searchParams.get("window"));
+          const lessonsPath = defaultLessonsPath();
+          const parsed = getLessonsCached(lessonsPath);
+          // getLessonSavingsCached() appends `quiet_hours_active` to
+          // the payload so the SPA can hide the SORT control overnight
+          // per AC8 (the 0030 pull-vs-push contract: information
+          // visible, prompts suppressed). Same shape as 0044's spend-
+          // efficiency, 0045's stuck-PR taxonomy, 0047's PR autopsy.
+          const value = getLessonSavingsCached(db, cfg, windowDays, parsed, new Date());
+          const body = JSON.stringify(redactLessonSavingsRollup(value));
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=900",
           });
           return res.end(body);
         }

@@ -692,5 +692,23 @@ export function attributeHealsToLessons(
     );
     if (r.changes > 0) inserted += 1;
   }
+  // Ticket 0052: invalidate the lesson-savings memo cache the moment
+  // a fresh lesson_credit row lands so the next /api/fleet/lessons/
+  // savings or /api/fleet/lessons request sees the new ledger entry
+  // without waiting out the 15-min TTL. Per LESSONS 2026-06-05
+  // "break ingest↔server cache-invalidation cycles via a globalThis
+  // slot, not a circular import": the slot
+  // `__fleet_lesson_savings_invalidate__` is registered from
+  // src/server.ts on module load; we read it lazily here so this
+  // module never has to import server.ts. The hook is a no-op when
+  // the server module hasn't loaded (the launchd daemon imports
+  // this module but not the server).
+  if (inserted > 0) {
+    try {
+      const hook = (globalThis as { __fleet_lesson_savings_invalidate__?: () => void })
+        .__fleet_lesson_savings_invalidate__;
+      if (typeof hook === "function") hook();
+    } catch { /* never let an in-process cache fail an attribution */ }
+  }
   return { credits_inserted: inserted, heals_examined: healRows.length };
 }

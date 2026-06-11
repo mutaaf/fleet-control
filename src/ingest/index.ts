@@ -125,5 +125,17 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_median_projection_invalidate__?: () => void }).__fleet_median_projection_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0052: lesson-pays-for-itself savings memo cache. Same
+  // globalThis-slot pattern as the changelog / autopsy / worth-it /
+  // year-in-review / median-projection hooks above. The savings
+  // rollup composes lesson_credit + run — both of which an ingest
+  // tick can touch (a freshly-landed run.outcome='failure' row
+  // shifts the average-failed-ship-cost denominator), so the
+  // simplest correct behaviour is to clear the cache on every
+  // commit and let the next request rebuild.
+  try {
+    const hook = (globalThis as { __fleet_lesson_savings_invalidate__?: () => void }).__fleet_lesson_savings_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

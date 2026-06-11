@@ -1555,6 +1555,48 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .lesson-credit-summary { font-size: 13px; }
 }
 
+/* ── Lesson-pays-for-itself savings (ticket 0052) ───────────────────
+ * Per AC5 the savings column header is a sortable, clickable button
+ * (cursor: pointer); per AC6 the per-row cell renders inline with
+ * the lesson title at 375px (mobile) and as a right-aligned
+ * monospace cell at >=600px (desktop). The hover tooltip carries
+ * the arithmetic for transparency; it's display:none by default
+ * and only renders on :hover / :focus-within so the operator
+ * doesn't pay layout cost on the default render. */
+.lessons-savings-head { margin-top: 8px; font-size: 12.5px; }
+.lessons-saved-usd-header { display: inline-block; font-family: var(--mono);
+  font-size: 12px; color: var(--accent); padding: 2px 8px;
+  background: transparent; border: 1px solid rgba(200, 132, 30, 0.45);
+  border-radius: 10px; cursor: pointer; }
+.lessons-saved-usd-header.dim { color: var(--dim); cursor: default;
+  border-color: rgba(120, 120, 120, 0.3); }
+.lessons-saved-usd { display: inline-block; font-family: var(--mono);
+  font-size: 12px; color: var(--accent); margin-left: 8px;
+  position: relative; white-space: nowrap; text-align: right; }
+.lessons-saved-usd-amount { font-family: var(--mono); text-align: right; }
+.lessons-saved-usd-tooltip { display: none; position: absolute; right: 0;
+  top: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--dim);
+  padding: 4px 8px; font-size: 11.5px; white-space: normal; max-width: 280px;
+  z-index: 5; border-radius: 4px; }
+.lessons-saved-usd:hover .lessons-saved-usd-tooltip,
+.lessons-saved-usd:focus-within .lessons-saved-usd-tooltip { display: block; }
+@media (max-width: 599px) {
+  /* Phone: the column collapses INLINE with the lesson title so the
+   * row stays a single tap target. The header stays visible above
+   * the project sections (it shrinks but doesn't disappear). */
+  .lessons-saved-usd { margin-top: 4px; margin-left: 0; display: inline-block; }
+}
+@media (min-width: 600px) {
+  /* Desktop: the cell renders as a separate right-aligned monospace
+   * column inside the lesson summary. The .lesson > summary rule
+   * above is flex; margin-left:auto pushes it to the right edge so
+   * the column lines up across rows. */
+  .lessons-saved-usd { margin-left: auto; text-align: right;
+    font-family: var(--mono); }
+  .lessons-saved-usd-amount { font-family: var(--mono); text-align: right;
+    min-width: 64px; display: inline-block; }
+}
+
 /* ── Fleet changelog page (ticket 0039) ─────────────────────────────
  * Mobile-first: filters stack (search on its own line, project + date
  * dropdowns on the next), rows collapse to two lines (title on top,
