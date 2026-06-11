@@ -6335,3 +6335,215 @@ export function computeRoiProjection(
     percentile_label: percentileLabel,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Public weekly fleet pulse (ticket 0054).
+//
+// One evergreen URL surface: /pulse renders the MOST-RECENT COMPLETE
+// ISO week (Mon 00:00 UTC → Sun 23:59:59.999 UTC). Composes existing
+// `pr` + `cost_rollup_day` + `lesson_credit` + `project_pause` tables
+// — no new schema. Reuses the existing `fleetStreak()` helper for the
+// streak_days field so the pulse and the home banner agree on that
+// number byte-for-byte.
+//
+// PRODUCER-VS-SPEC reconciliation (per LESSONS 2026-06-05 "groomer
+// prose can disagree with the schema; the schema wins"):
+//   - `pr.state = 'MERGED'` (uppercase) — matches src/ingest/prs.ts:
+//     152 + src/views.ts:706 fleetStreak.
+//   - `project_pause` has NO `active` column — a row's mere presence
+//     means paused (per src/db.ts:189). `paused_count` = COUNT(*).
+//   - `lesson_credit.created_at` — freshest = ORDER BY DESC LIMIT 1.
+//   - `cost_rollup_day.day` is yyyy-mm-dd (per src/db.ts:72). Use
+//     literal-string range matching (no julianday() — LESSONS
+//     2026-05-26 julianday drift).
+//
+// Per LESSONS § "node:sqlite's .all() needs `as unknown as T[]`":
+// every row narrowing in this helper uses the double-cast.
+
+/** ISO-week boundary helper: given a wall-clock anchor, returns the
+ *  Monday-to-Sunday boundary for the MOST RECENT COMPLETE week.
+ *
+ *  Rules (per the ticket):
+ *    - now = Wed 2026-06-10 → window Mon 2026-06-01 → Sun 2026-06-07.
+ *    - now = Sun 2026-06-07 23:59 → same window (still Mon-Sun of THIS
+ *      week, only the in-progress window-bound is the in-progress day).
+ *    - now = Mon 2026-06-08 → window Mon 2026-06-01 → Sun 2026-06-07
+ *      (previous week is the most-recent COMPLETE one).
+ *
+ *  We snap to the START of the most-recently-CLOSED week by walking
+ *  back to the Monday of the week PRECEDING the in-progress one. */
+function pulseWeekBoundary(now: Date): { startIso: string; endIso: string } {
+  // UTC midnight of today.
+  const today = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+  ));
+  // ISO weekday: Mon=1..Sun=7. JS getUTCDay: Sun=0..Sat=6.
+  const isoDay = (today.getUTCDay() + 6) % 7 + 1;
+  // Sunday of the most-recent COMPLETE week.
+  // If today is Monday (isoDay=1), the most-recent complete week
+  // ended yesterday (Sunday) — go back 1 day.
+  // If today is Sunday (isoDay=7), today is the LAST in-progress
+  // day, so the most-recent COMPLETE week ended LAST Sunday — back 7.
+  // General: most-recent complete Sunday = today - isoDay days.
+  const sunday = new Date(today);
+  sunday.setUTCDate(sunday.getUTCDate() - isoDay);
+  // Monday of that week is six days earlier.
+  const monday = new Date(sunday);
+  monday.setUTCDate(monday.getUTCDate() - 6);
+  return {
+    startIso: monday.toISOString().slice(0, 10),
+    endIso: sunday.toISOString().slice(0, 10),
+  };
+}
+
+export interface FleetWeeklyPulseTopProject {
+  slug: string;
+  project_name: string;
+  merged_prs: number;
+}
+
+export interface FleetWeeklyPulseFreshestLesson {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+}
+
+export interface FleetWeeklyPulse {
+  generated_at: string;
+  week_start_iso: string;
+  week_end_iso: string;
+  merged_prs: number;
+  total_spend_usd: number;
+  cost_per_pr_usd: number | null;
+  streak_days: number;
+  top_project: FleetWeeklyPulseTopProject | null;
+  freshest_lesson: FleetWeeklyPulseFreshestLesson | null;
+  paused_count: number;
+}
+
+export interface FleetWeeklyPulseOptions {
+  /** Wall-clock anchor. Tests pin this; production passes `new Date()`. */
+  now?: Date;
+  /** Reserved for future ROI multipliers; the v1 pulse helper does
+   *  not use this but the parameter is part of the public surface
+   *  so the route doesn't have to special-case it. */
+  hourlyRateUsd?: number;
+}
+
+interface PulseMergedRow { c: number; }
+interface PulseTopProjectRow { slug: string; name: string | null; c: number; }
+interface PulseSpendRow { s: number | null; }
+interface PulseFreshLessonRow {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+}
+interface PulsePauseRow { c: number; }
+
+/** Compose the weekly pulse. Pure read-side; no writes. The helper is
+ *  memoised at the server.ts level via getPulseCached(); this function
+ *  is the cache-miss workhorse. */
+export function fleetWeeklyPulse(
+  db: DB,
+  opts: FleetWeeklyPulseOptions = {},
+): FleetWeeklyPulse {
+  const now = opts.now ?? new Date();
+  const { startIso, endIso } = pulseWeekBoundary(now);
+  // PR window: fetched_at falls inside [startIso, endIso] (inclusive
+  // on both ends, since endIso is the Sunday DATE — date() drops the
+  // sub-day component). Casing: 'MERGED' uppercase per the producer
+  // in src/ingest/prs.ts:152.
+  const mergedRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE state = 'MERGED' "
+    + "   AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND date(fetched_at) >= ? "
+    + "   AND date(fetched_at) <= ?",
+  ).get(startIso, endIso) as unknown as PulseMergedRow | undefined;
+  const merged_prs = Number(mergedRow?.c ?? 0);
+
+  // total spend in window: SUM cost_rollup_day.cost_usd where day
+  // falls in [startIso, endIso].
+  const spendRow = db.prepare(
+    "SELECT SUM(cost_usd) AS s FROM cost_rollup_day "
+    + " WHERE day >= ? AND day <= ?",
+  ).get(startIso, endIso) as unknown as PulseSpendRow | undefined;
+  const total_spend_usd = Number(spendRow?.s ?? 0) || 0;
+
+  const cost_per_pr_usd: number | null = merged_prs > 0
+    ? total_spend_usd / merged_prs
+    : null;
+
+  // streak_days: reuse the existing fleetStreak helper so the pulse
+  // and the home banner agree byte-for-byte.
+  const streak = fleetStreak(db, { now: now.toISOString() });
+  const streak_days = streak.streak_days;
+
+  // top_project: the project with the most merged PRs in the window.
+  // Tie-break by slug ASC. Returns null when no merges in the window.
+  let top_project: FleetWeeklyPulseTopProject | null = null;
+  if (merged_prs > 0) {
+    const topRow = db.prepare(
+      "SELECT p.slug AS slug, p.name AS name, COUNT(*) AS c "
+      + "  FROM pr LEFT JOIN project p ON p.id = pr.project_id "
+      + " WHERE pr.state = 'MERGED' "
+      + "   AND pr.is_agent = 1 "
+      + "   AND pr.fetched_at IS NOT NULL "
+      + "   AND date(pr.fetched_at) >= ? "
+      + "   AND date(pr.fetched_at) <= ? "
+      + " GROUP BY p.id "
+      + " ORDER BY c DESC, p.slug ASC "
+      + " LIMIT 1",
+    ).get(startIso, endIso) as unknown as PulseTopProjectRow | undefined;
+    if (topRow && topRow.slug) {
+      top_project = {
+        slug: String(topRow.slug),
+        project_name: String(topRow.name ?? topRow.slug),
+        merged_prs: Number(topRow.c) || 0,
+      };
+    }
+  }
+
+  // freshest_lesson: the most-recently-credited lesson_credit row
+  // whose created_at falls in the window. Range is on the timestamp
+  // string (ISO-8601 sorts lexicographically), with the upper bound
+  // expressed as "T23:59:59.999Z" so a created_at at Sun 23:59 lands
+  // INSIDE the window.
+  const lowerTs = `${startIso}T00:00:00.000Z`;
+  const upperTs = `${endIso}T23:59:59.999Z`;
+  const freshRow = db.prepare(
+    "SELECT lesson_slug, lesson_date, lesson_title "
+    + "  FROM lesson_credit "
+    + " WHERE created_at >= ? AND created_at <= ? "
+    + " ORDER BY created_at DESC "
+    + " LIMIT 1",
+  ).get(lowerTs, upperTs) as unknown as PulseFreshLessonRow | undefined;
+  const freshest_lesson: FleetWeeklyPulseFreshestLesson | null = freshRow
+    ? {
+        lesson_slug: String(freshRow.lesson_slug),
+        lesson_date: String(freshRow.lesson_date),
+        lesson_title: String(freshRow.lesson_title),
+      }
+    : null;
+
+  // paused_count: project_pause has no `active` column — a row's
+  // mere presence means paused. COUNT(*) is the contract.
+  const pauseRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM project_pause",
+  ).get() as unknown as PulsePauseRow | undefined;
+  const paused_count = Number(pauseRow?.c ?? 0);
+
+  return {
+    generated_at: now.toISOString(),
+    week_start_iso: startIso,
+    week_end_iso: endIso,
+    merged_prs,
+    total_spend_usd,
+    cost_per_pr_usd,
+    streak_days,
+    top_project,
+    freshest_lesson,
+    paused_count,
+  };
+}
