@@ -1,7 +1,7 @@
 ---
 id: 0056
 title: Time saved this month — each project card surfaces ~Nh saved from cross-fleet lessons so the moat becomes visible on the home grid
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-11
