@@ -1,8 +1,8 @@
 ---
 id: 0053
 title: Project graveyard — paused / sunset projects get a memorial page tallying lifetime ROI and what they taught the fleet
-status: proposed
-priority: P2
+status: groomed
+priority: P1
 area: portal
 created: 2026-06-10
 owner: gtm-innovation
