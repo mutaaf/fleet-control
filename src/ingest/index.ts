@@ -147,5 +147,13 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_pulse_invalidate__?: () => void }).__fleet_pulse_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0055: lesson-of-the-day rotation memo cache. Same
+  // globalThis-slot pattern; the rotation list is keyed off lesson_
+  // credit ranking, so a freshly-landed credit row (from the route's
+  // attribution pass during a cache-miss build) shifts the slot.
+  try {
+    const hook = (globalThis as { __fleet_lesson_of_the_day_invalidate__?: () => void }).__fleet_lesson_of_the_day_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

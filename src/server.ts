@@ -27,7 +27,9 @@ import { weeklyDigest } from "./digest.ts";
 import {
   loadCrossLessons, defaultLessonsPath, newThisWeekCount,
   attributeHealsToLessons,
+  lessonOfTheDay,
   type CrossLessonsLoadResult,
+  type LessonOfTheDay,
 } from "./lessons.ts";
 import { statSync } from "node:fs";
 import { serveShare } from "./snapshot.ts";
@@ -410,6 +412,119 @@ export function _invalidateLessonSavingsCacheAfterIngest(): void {
 
 (globalThis as { __fleet_lesson_savings_invalidate__?: () => void })
   .__fleet_lesson_savings_invalidate__ = _invalidateLessonSavingsCacheAfterIngest;
+
+// Ticket 0055: lesson-of-the-day memo cache.
+//
+// Keyed by the four-value invalidation tuple:
+//   - date(now) in UTC  — rolls over at midnight UTC so a 9am visit
+//                         doesn't reuse the previous day's tip.
+//   - MAX(created_at) FROM lesson_credit — a fresh credit may re-rank.
+//   - COUNT(*)        FROM lesson_credit — same composite-PK proxy.
+//   - mtime(lessons-file) — a fresh `fleet lessons-sync` writes the
+//                         file; the next call must re-parse.
+//
+// Per LESSONS 2026-06-07 "the `pr` table has no surrogate `id`; proxy
+// 'latest landed' via (MAX(fetched_at), COUNT(*))": the lesson_credit
+// table is composite-PK too — we use the same (MAX, COUNT) pair.
+// Per LESSONS § "in-process dedup sets need an explicit reset hook
+// for tests" we expose `_resetLessonOfTheDayCacheForTests()`. Per
+// LESSONS § "expose a build counter for cache-hit tests, not a
+// fetcher swap" we also expose
+// `_getLessonOfTheDayCacheBuildsForTests()` that ticks on every cache
+// MISS. Production code never reads either.
+interface LessonOfTheDayCacheEntry {
+  tuple: string;
+  value: LessonOfTheDay | null;
+  built_at: number;
+}
+const lessonOfTheDayCache = new Map<string, LessonOfTheDayCacheEntry>();
+let lessonOfTheDayBuildCounter = 0;
+
+export function _resetLessonOfTheDayCacheForTests(): void {
+  lessonOfTheDayCache.clear();
+  lessonOfTheDayBuildCounter = 0;
+}
+
+export function _getLessonOfTheDayCacheBuildsForTests(): number {
+  return lessonOfTheDayBuildCounter;
+}
+
+interface LessonOfTheDayCreditTupleRow { mx: string | null; c: number | null; }
+
+function lessonOfTheDayInvalidationTuple(db: DB, lessonsPath: string, now: Date): string {
+  const credit = db.prepare(
+    "SELECT MAX(created_at) AS mx, COUNT(*) AS c FROM lesson_credit",
+  ).get() as unknown as LessonOfTheDayCreditTupleRow | undefined;
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(lessonsPath).mtimeMs; } catch { mtimeMs = 0; }
+  const utcDay = now.toISOString().slice(0, 10);
+  const cmx = credit?.mx ?? "";
+  const cc = Number(credit?.c ?? 0);
+  return "d=" + utcDay + "|cmx=" + cmx + "|cc=" + cc + "|m=" + mtimeMs;
+}
+
+/** Look up a fresh lesson-of-the-day pick from the memo cache; rebuild
+ *  on miss. The build counter ticks on every miss so route tests can
+ *  assert hit/miss semantics without stubbing SQL. */
+function getLessonOfTheDayCached(db: DB, now: Date): LessonOfTheDay | null {
+  const lessonsPath = defaultLessonsPath();
+  const tuple = lessonOfTheDayInvalidationTuple(db, lessonsPath, now);
+  const hit = lessonOfTheDayCache.get("v1");
+  if (hit && hit.tuple === tuple) return hit.value;
+  lessonOfTheDayBuildCounter += 1;
+  const value = lessonOfTheDay(db, { now });
+  lessonOfTheDayCache.set("v1", { tuple, value, built_at: Date.now() });
+  return value;
+}
+
+/** Cache-invalidation hook fired from `runIngestPass` (after the
+ *  ingest pass COMMITs) AND from `attributeHealsToLessons` (after a
+ *  non-zero lesson_credit insert). Registered on the globalThis slot
+ *  per LESSONS 2026-06-05 "break ingest↔server cache-invalidation
+ *  cycles via a globalThis slot, not a circular import". */
+export function _invalidateLessonOfTheDayCacheAfterIngest(): void {
+  lessonOfTheDayCache.clear();
+}
+
+(globalThis as { __fleet_lesson_of_the_day_invalidate__?: () => void })
+  .__fleet_lesson_of_the_day_invalidate__ = _invalidateLessonOfTheDayCacheAfterIngest;
+
+/** Strip token-shaped substrings from operator-visible STRING VALUES
+ *  on the lesson-of-the-day pick BEFORE the payload is JSON-encoded.
+ *  Same posture as `redactSecretsForLessonSavings`: scrub the values,
+ *  NOT the body string — per LESSONS 2026-06-10 "redactSecrets on a
+ *  JSON body shreds your KEYS". The token-shape heuristic gates on
+ *  `\d` (a real digit) so JSON keys like `total_lessons_indexed` (22
+ *  chars, letters + underscores only) survive intact. */
+function redactSecretsForLessonOfTheDay(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+/** Apply the renderer-boundary redactor to every operator-supplied
+ *  string field on the lesson-of-the-day pick. Numeric + structural
+ *  fields stay byte-identical; only the upstream-data values
+ *  (lesson_slug / lesson_date / lesson_title / lesson_excerpt) get
+ *  the scrub. Returns null untouched. */
+function redactLessonOfTheDayPick(
+  pick: LessonOfTheDay | null,
+): LessonOfTheDay | null {
+  if (!pick) return null;
+  return {
+    ...pick,
+    lesson_slug: redactSecretsForLessonOfTheDay(pick.lesson_slug),
+    lesson_date: redactSecretsForLessonOfTheDay(pick.lesson_date),
+    lesson_title: redactSecretsForLessonOfTheDay(pick.lesson_title),
+    lesson_excerpt: redactSecretsForLessonOfTheDay(pick.lesson_excerpt),
+  };
+}
 
 /** Clamp the ?window=<days> query param for the savings route.
  *  Defaults to 90 per the ticket spec; clamps to [1, 365] so the
@@ -3097,6 +3212,61 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=900",
+          });
+          return res.end(body);
+        }
+        // Ticket 0055: lesson-of-the-day rotation card. Composes the
+        // cross-fleet lessons file (0036) with the lessonSavingsRollup
+        // helper (0052) to deterministically surface ONE lesson per
+        // UTC day, weighted by the lesson_credit-based savings ledger.
+        // Empty fleets (<5 indexed lessons) get a `{ lesson: null,
+        // total_lessons_indexed: N }` body so the SPA can render the
+        // "still learning" honest empty state. Cache-Control:
+        // max-age=3600 — the rotation rolls over once per UTC day, so
+        // an hourly client cache is generous AND safe (the in-process
+        // memo busts on any fresh lesson_credit row OR a fresh
+        // lessons-file mtime, so the at-the-edge re-fetch picks up
+        // changes before the 1h horizon). The redactor scrubs
+        // operator-supplied STRING VALUES (lesson_title +
+        // lesson_excerpt + slug/date) BEFORE JSON.stringify so a
+        // future ingester regression that smuggles a token-shape
+        // substring is defanged at the renderer boundary; per
+        // LESSONS 2026-06-10 we scrub the VALUES, not the JSON body,
+        // so the 22-char `total_lessons_indexed` field name survives.
+        // The handler appends `quiet_hours_active` to the payload so
+        // the SPA can suppress the dismiss chevron overnight per the
+        // 0030 pull-vs-push contract (same posture as 0048 / 0050 /
+        // 0053).
+        if (path === "/api/fleet/lesson-of-the-day") {
+          const now = new Date();
+          const pick = getLessonOfTheDayCached(db, now);
+          const quiet = quietHoursActiveAnywhere(cfg, now);
+          // Determine total_lessons_indexed even on the null branch so
+          // the SPA can render "N lessons indexed" copy in the empty
+          // state. We re-parse via the existing getLessonsCached memo
+          // (mtime-keyed; effectively free).
+          const lessonsPath = defaultLessonsPath();
+          const parsed = getLessonsCached(lessonsPath);
+          let totalIndexed = 0;
+          for (const p of parsed.projects) {
+            for (const l of p.lessons) {
+              if (l.date) totalIndexed += 1;
+            }
+          }
+          const body = pick
+            ? JSON.stringify({
+                ...(redactLessonOfTheDayPick(pick) as LessonOfTheDay),
+                quiet_hours_active: quiet,
+              })
+            : JSON.stringify({
+                lesson: null,
+                total_lessons_indexed: totalIndexed,
+                quiet_hours_active: quiet,
+              });
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=3600",
           });
           return res.end(body);
         }

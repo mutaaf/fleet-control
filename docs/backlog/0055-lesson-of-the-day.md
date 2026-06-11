@@ -395,3 +395,53 @@ shape before composing the rotation helper.
   inbox. (4) CSS in `web/style.css` reusing existing card structure.
   (5) sw.js already covers `/api/*` via network-first — no change
   needed there.
+- 2026-06-11 [ship/0055] Implementation landed. Helper widens the
+  savings window from 90 → 3650 days inside `lessonOfTheDay` (a
+  per-feature widening; the 0052 savings route keeps the 90-day
+  default for its own rollup): the rotation is a wisdom-accounting
+  surface, not a recency surface — a credit landed >90 days ago
+  still ranks the lesson it attributed to. The savings-decile bias
+  picks the 90th-percentile threshold over the strictly-positive
+  saved_usd values; lessons at or above the threshold appear TWICE
+  in the rotation list so the modular indexing surfaces them ~2x
+  per the AC2 assertion. Cache lives in `src/server.ts` keyed by
+  `(utc_date, MAX(lesson_credit.created_at), COUNT(*) FROM
+  lesson_credit, mtime(CROSS_LESSONS.md))` — UTC-date term rolls
+  the cache at midnight without explicit invalidation. The
+  globalThis invalidation slot
+  `__fleet_lesson_of_the_day_invalidate__` is registered from
+  server.ts on module load AND woken from `runIngestPass()` after
+  every COMMIT AND from `attributeHealsToLessons()` after a
+  non-zero credit insert (same posture as 0052's savings
+  invalidation chain). The route appends `quiet_hours_active` to
+  the payload so the SPA can hide the dismiss chevron overnight
+  per the 0030 contract. Defence-in-depth redactor scrubs the
+  VALUES (`lesson_title`, `lesson_excerpt`, `lesson_slug`,
+  `lesson_date`) BEFORE `JSON.stringify` per LESSONS 2026-06-10
+  "redactSecrets on a JSON body shreds your KEYS". Home card sits
+  between the 0033 glance card and the 0040 riskiest-PR card;
+  dismiss flag is keyed by `fleet:lesson-of-the-day-dismissed:
+  <YYYY-MM-DD>` in localStorage (per-day key naturally expires at
+  midnight UTC). Empty-state copy "Your fleet is still learning…"
+  renders against any fleet with <5 dated lessons. Service-worker
+  `web/sw.js` already network-first caches `/api/*` routes — no
+  change needed.
+- 2026-06-11 [ship/0055] Producer-vs-spec reconciliations: (a) the
+  parser exposes lessons as `LessonEntry { date, title, body, kind
+  }` with the slug on the parent `ProjectLessons` row — the
+  rotation derives `lesson_slug = project.slug` and `lesson_date =
+  entry.date` to match `lessonSavingsRollup`'s row identity. (b)
+  `web/sw.js` blanket-caches every `/api/*` GET; no per-route
+  allowlist edit was needed (the ticket's engineering note
+  pointed at "the existing cache-route allowlist" but the worker
+  doesn't maintain one — it's network-first across all `/api/*`).
+- 2026-06-11 [ship/0055] Local gate green: `npx tsc --noEmit`
+  clean, `node scripts/check-backlog.mjs` clean, the new
+  `tests/lesson-of-the-day.test.ts` suite is 23/23. Pre-existing
+  full-suite failures (~28 across welcome / digest / leaderboard
+  / prs-merged / inbox-AC6 / streak-AC7 / demo) reproduce on
+  `main` with my changes stashed — they are time-pinned /
+  subprocess-boot flakes unrelated to this ticket. Per LESSONS
+  2026-05-29 "time-pinned tests must NOT derive seed timestamps
+  from new Date()" these stay-on-main flakes are not in scope
+  for this ship.
