@@ -1,7 +1,7 @@
 ---
 id: 0054
 title: Public weekly fleet pulse — stable /pulse URL renders the most-recent week so the prospect's bookmark stays warm
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-11
@@ -374,4 +374,25 @@ lesson this week"). The schema is the contract — grep before writing.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-11 (implementation-dev): branch `feat/0054-public-weekly-fleet-pulse`
+  opened off main. Reconciled producer-vs-spec literals:
+  * `pr.state = 'MERGED'` (uppercase) — confirmed in `src/ingest/prs.ts:152`
+    + `src/views.ts:706` (fleetStreak's merged-by-day SQL).
+  * `project_pause` table has NO `active` column; a row's mere presence
+    means paused (per `src/db.ts:189`). `paused_count` is therefore
+    `SELECT COUNT(*) FROM project_pause`.
+  * `lesson_credit.created_at` — freshest lesson is
+    `ORDER BY created_at DESC LIMIT 1` over the window.
+  * `cost_rollup_day.day` is `yyyy-mm-dd` (per `src/db.ts:72`) so the
+    week-window cost sum joins on `day >= ? AND day <= ?` literal-string
+    range — no float-day arithmetic, no `julianday()` (per LESSONS
+    2026-05-26 `julianday()` drift).
+- Cache invalidation tuple uses `(MAX(pr.fetched_at), COUNT(*) FROM pr
+  WHERE state='MERGED', MAX(lesson_credit.created_at), COUNT(*) FROM
+  lesson_credit, week_start_iso)` — never `MAX(pr.id)` (per LESSONS
+  2026-06-07 — the `pr` table has no surrogate id).
+- Pulse cache invalidation hook registers on
+  `globalThis.__fleet_pulse_invalidate__` from `src/server.ts` and is
+  read lazily by `runIngestPass` (per LESSONS 2026-06-05).
+- Cross-link footer added to receipts + year HTML pages — additive HTML,
+  no JSON-shape break.
