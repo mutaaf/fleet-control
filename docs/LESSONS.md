@@ -572,3 +572,49 @@ against the same `gh` / `launchctl` / `git` subcommand. The
 production side has an idempotency option (UPSERT or per-row
 dedup map) but that hides the test-stub gap; tightening the
 stub is the cleaner signal.
+
+## 2026-06-10 — `redactSecrets` on a JSON body shreds your KEYS, not just your values
+
+Symptom: while shipping ticket 0052 I wired the new
+`/api/fleet/lessons/savings` JSON route to defence-in-depth-
+scrub token-shape substrings before `res.end`, copy-pasting the
+existing `redactSecrets()` regex from `src/receipts.ts` /
+`src/doctor.ts`. The first test against an empty fleet asserted
+`average_failed_ship_cost_usd` (the documented top-level
+number) and got back `undefined` — the field name was missing
+from the JSON entirely. Cause: the `redactSecrets` regex
+`\b[A-Za-z0-9_]{24,}\b` with the `hasDigit = /\d/.test(match)
+|| /_/.test(match)` heuristic treats UNDERSCORE as a digit-
+qualifier. That's the right call when scanning narrative TEXT
+(a token like `gh_abcdef…` has letters and may have underscores
+but no digits — the underscore stand-in is what gates the
+classifier). It's the WRONG call when the input is a JSON body:
+my own top-level keys (`average_failed_ship_cost_usd` is 27
+chars, letters-and-underscores ONLY) match the
+`[A-Za-z0-9_]{24,}` shape AND the `hasLetter && hasDigit` gate
+(because `_` is "digit"). So `JSON.parse(redactSecrets(JSON.
+stringify(rollup)))` mangled my schema — the JSON parser saw
+`"<redacted>"` where the key name used to be, and the test's
+`typeof j.average_failed_ship_cost_usd === "number"` assertion
+hit `undefined`. Fix: route the redactor through the rollup's
+operator-supplied STRING VALUES (lesson_slug, lesson_date,
+lesson_title) BEFORE the rollup is `JSON.stringify`'d, not over
+the JSON body string. The values are the surface that can
+carry an upstream-tail-leaked token; the keys are repo-authored
+and structurally safe. I also tightened the regex's digit gate
+(`hasDigit = /\d/.test(match)` — no longer treating `_` as a
+digit-qualifier) for this redactor specifically; a real
+token-shape substring always carries at least one numeric
+digit. General rule for this repo: when a defence-in-depth
+redactor moves from text/HTML routes to a JSON route, scrub
+the values, NOT the body string. The token-shape heuristic is
+LATENT-ambiguous between "long underscore-separated identifier"
+(safe — your JSON key) and "long underscore-laden secret"
+(unsafe — your leaked token), and the only side that always
+gets the right answer is the value side. Same trap will bite
+any future JSON route that copy-pastes `redactSecrets` from a
+text renderer — the symptom is silent JSON shape mangling
+(your field names get replaced by `<redacted>`), which the
+typecheck CAN'T catch (it's a runtime string op over a
+serialised body) and which tests catch only if they assert
+shape, not just status code.
