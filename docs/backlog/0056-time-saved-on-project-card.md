@@ -1,7 +1,7 @@
 ---
 id: 0056
 title: Time saved this month — each project card surfaces ~Nh saved from cross-fleet lessons so the moat becomes visible on the home grid
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-11
@@ -386,4 +386,53 @@ schema (per `src/db.ts:~282`) before writing the SELECT.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-11 (implementation-dev): Picked up groomed ticket on
+  `feat/0056-time-saved-on-project-card`. PRODUCER-VS-SPEC
+  reconciliations confirmed via grep before composing any SELECT:
+  - Home-grid backing route is `GET /api/fleet` (not
+    `/api/fleet/home` or `/api/fleet/projects` as the spec
+    hedged); the response is composed by `fleetView()` in
+    `src/views.ts`. We will inject `time_saved_this_month` per
+    project row inside `fleetView` so the existing handler does
+    not need to grow a second JOIN.
+  - `lessonSavingsRollup()` is at `src/views.ts:4154` (spec
+    estimate matched). Its JOIN against `lesson_credit` uses the
+    PK columns `(lesson_slug, lesson_date, lesson_title)` for the
+    group key + `project_slug` for the multi-project axis. The
+    new `lessonSavingsByProject()` mirrors the same predicate
+    (`created_at >= cutoff`), splits per `project_slug`, and
+    fair-shares each lesson's `saved_usd` by `heal_count_for_
+    project / heal_count_for_lesson` — the math invariant from
+    the AC.
+  - `lesson_credit.project_slug` exists on the schema (per
+    `src/db.ts:287`). No new column needed.
+  - `run.outcome = 'failure'` lowercase, `control_audit.action =
+    'heal'` lowercase — already reconciled in the 0052
+    implementation; we inherit the math (mean of failure costs)
+    via `lessonSavingsRollup`'s `average_failed_ship_cost_usd`
+    rather than re-deriving it. Single source of truth.
+  - The home grid already fans out fetches via `Promise.all` in
+    `home()`. We pin the time-saved data onto the per-project
+    row of `/api/fleet` (additive optional field) so an N-project
+    grid pays zero extra fetches.
+- 2026-06-11 (implementation-dev): Cache invalidation registers
+  `globalThis.__fleet_lesson_savings_by_project_invalidate__`
+  from `src/server.ts` and is read lazily by `runIngestPass()`
+  (`src/ingest/index.ts`) AND by `attributeHealsToLessons()`
+  (`src/lessons.ts`) per LESSONS 2026-06-05. The new memo cache
+  exposes `_resetLessonSavingsByProjectCacheForTests()` AND
+  `_getLessonSavingsByProjectCacheBuildsForTests()` per the
+  0012 / 0052 convention. Invalidation tuple matches the spec:
+  `(date(now) UTC, MAX(lesson_credit.created_at), COUNT(*) FROM
+  lesson_credit, MAX(run.ended_at), COUNT(*) FROM run WHERE
+  outcome='failure')`.
+- 2026-06-11 (implementation-dev): Quiet-hours integration (AC7)
+  uses a renderer-direct seam exported as `_renderTimeSavedLine
+  ForTests(saved_hours, slug, quietHoursActive)` per LESSONS
+  2026-06-11 — driving the branch via a `quietHours` config
+  through `startServer()` would race parallel test files writing
+  the SAME `fleet-control.config.json`. The boot test asserts
+  the route shape only; the renderer test drives the copy
+  branches deterministically. Defence-in-depth redaction
+  scrubs `project_name` VALUES BEFORE `JSON.stringify` per
+  LESSONS 2026-06-10 (never on the body string).
