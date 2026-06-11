@@ -1,7 +1,7 @@
 ---
 id: 0054
 title: Public weekly fleet pulse — stable /pulse URL renders the most-recent week so the prospect's bookmark stays warm
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-11
@@ -396,3 +396,5 @@ lesson this week"). The schema is the contract — grep before writing.
   read lazily by `runIngestPass` (per LESSONS 2026-06-05).
 - Cross-link footer added to receipts + year HTML pages — additive HTML,
   no JSON-shape break.
+- 2026-06-11 (implementation-dev): shipped via PR #125 (auto-merge,
+  squash). CI green on typecheck + validate.
