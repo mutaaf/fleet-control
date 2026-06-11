@@ -155,5 +155,15 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_lesson_of_the_day_invalidate__?: () => void }).__fleet_lesson_of_the_day_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0056: per-project lesson-savings memo cache. Same
+  // globalThis-slot pattern; composes lesson_credit + run signals
+  // both of which can shift on any ingest tick (a freshly-landed
+  // run.outcome='failure' row moves the average-failed-ship-cost
+  // denominator → per-project saved_usd shifts → home grid cards
+  // re-render with the new ~Nh number on the next tick).
+  try {
+    const hook = (globalThis as { __fleet_lesson_savings_by_project_invalidate__?: () => void }).__fleet_lesson_savings_by_project_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

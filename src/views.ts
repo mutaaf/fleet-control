@@ -4233,6 +4233,229 @@ export function lessonSavingsRollup(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Ticket 0056 — Time saved on the project card.
+//
+// Composes the existing lesson_credit ledger (0042) + run (0052's
+// failed-ship cost data) into a per-project rollup of "hours saved
+// over the trailing N days." Shares the cost arithmetic with
+// lessonSavingsRollup (the failure-cost average) but splits the
+// per-lesson saved_usd across the projects credited on that lesson
+// by their fair-share heal_count.
+//
+// Math (deterministic, no LLM):
+//   - lesson.saved_usd = heal_count_for_lesson * average_failed_ship_cost
+//     (same as lessonSavingsRollup).
+//   - project.saved_usd = sum over lessons L credited to project P of
+//     (heal_count_for_P_on_L / heal_count_for_L) * L.saved_usd.
+//   - project.saved_hours = saved_usd / hourly_rate_usd, rounded to 1dp.
+//   - hourly_rate_usd defaults to cfg.worth_it.hourly_rate_usd ?? 75
+//     (matches the 0048 / 0050 precedent).
+//
+// Producer reconciliation (per LESSONS 2026-06-05 "groomer prose can
+// disagree with the schema; the schema wins"):
+//   - run.outcome failed literal: 'failure' (lowercase) — same as
+//     lessonSavingsRollup; the 0052 implementation reconciled this.
+//   - control_audit.action heal literal: 'heal' (lowercase) — same
+//     reconciliation, inherited transitively (the helper reads
+//     lesson_credit rows, which the attribution pass writes only for
+//     heal-action audits).
+//   - lesson_credit.project_slug: column verified to exist in
+//     src/db.ts:282's SCHEMA. JOIN key.
+//
+// Per LESSONS § "node:sqlite's .all() needs as unknown as T[]":
+// every row narrowing uses the double-cast.
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// SQL strings are plain concatenation; identifiers stay unquoted.
+// Per LESSONS § "julianday() drifts ~10us per timestamp": no
+// sub-millisecond timestamp precision needed; window arithmetic is
+// JS-side via Date.getTime().
+// ────────────────────────────────────────────────────────────────────
+
+/** Default window in days for `lessonSavingsByProject`. The spec is
+ *  30 days ("Time saved this month"). */
+const LESSON_SAVINGS_BY_PROJECT_DEFAULT_WINDOW_DAYS = 30;
+/** Default hourly rate in USD when cfg.worth_it.hourly_rate_usd is
+ *  unset. Matches the 0048 / 0050 precedent. */
+const LESSON_SAVINGS_BY_PROJECT_DEFAULT_HOURLY_RATE_USD = 75;
+
+export interface LessonSavingsByProjectRow {
+  project_slug: string;
+  project_name: string;
+  heal_count: number;
+  saved_usd: number;
+  saved_hours: number;
+  lesson_count: number;
+}
+
+export interface LessonSavingsByProject {
+  window_days: number;
+  generated_at: string;
+  hourly_rate_usd: number;
+  by_project: Record<string, LessonSavingsByProjectRow>;
+}
+
+export interface LessonSavingsByProjectOptions {
+  /** Window size in days; defaults to 30. */
+  windowDays?: number;
+  /** Wall-clock anchor — tests pin it; production passes `new Date()`. */
+  now?: Date;
+  /** Hourly rate for the saved_hours division; defaults to 75. */
+  hourlyRateUsd?: number;
+}
+
+interface LessonByProjectGroupRow {
+  lesson_slug: string;
+  lesson_date: string;
+  project_slug: string;
+  heal_count: number;
+}
+
+interface LessonTotalsRow {
+  lesson_slug: string;
+  lesson_date: string;
+  total_heal_count: number;
+}
+
+interface ProjectNameRow {
+  slug: string;
+  name: string | null;
+}
+
+/** Compose the per-project lesson-savings rollup for the home grid
+ *  (ticket 0056). Joins lesson_credit (0042's attribution ledger)
+ *  against run (the failed-ship cost data) and splits each lesson's
+ *  saved_usd fair-share across the projects credited on that lesson.
+ *  Pure read-side; no writes. */
+export function lessonSavingsByProject(
+  db: DB,
+  opts: LessonSavingsByProjectOptions = {},
+): LessonSavingsByProject {
+  const windowDays = Math.max(
+    1, Math.floor(opts.windowDays ?? LESSON_SAVINGS_BY_PROJECT_DEFAULT_WINDOW_DAYS));
+  const now = opts.now ?? new Date();
+  const cutoffIso = new Date(now.getTime() - windowDays * 24 * 3600_000).toISOString();
+  const nowIso = now.toISOString();
+  const hourlyRateUsd = typeof opts.hourlyRateUsd === "number" && opts.hourlyRateUsd > 0
+    ? opts.hourlyRateUsd
+    : LESSON_SAVINGS_BY_PROJECT_DEFAULT_HOURLY_RATE_USD;
+
+  // Average failed-ship cost over the window — SAME shape as
+  // `lessonSavingsRollup` so the two rollups agree on the per-lesson
+  // saved_usd that we then split per project.
+  const avgRow = db.prepare(
+    "SELECT AVG(COALESCE(cost_usd, cost_usd_computed, 0)) AS avg_cost, "
+    + "       COUNT(*) AS n "
+    + "  FROM run "
+    + " WHERE outcome = 'failure' "
+    + "   AND started_at IS NOT NULL "
+    + "   AND started_at >= ?",
+  ).get(cutoffIso) as unknown as LessonSavingsAvgRow | undefined;
+
+  const n = Number(avgRow?.n ?? 0);
+  const avgRaw = avgRow?.avg_cost == null ? null : Number(avgRow.avg_cost);
+  const average = (n === 0 || avgRaw == null || !Number.isFinite(avgRaw) || avgRaw <= 0)
+    ? LESSON_SAVINGS_FLOOR_USD
+    : avgRaw;
+  const averageRounded = Math.round(average * 100) / 100;
+
+  // Per-(lesson, project) heal_count in the window — the row grain
+  // for the fair-share split.
+  const groupRows = db.prepare(
+    "SELECT lesson_slug, lesson_date, project_slug, "
+    + "       COUNT(DISTINCT heal_audit_id) AS heal_count "
+    + "  FROM lesson_credit "
+    + " WHERE created_at >= ? "
+    + " GROUP BY lesson_slug, lesson_date, project_slug",
+  ).all(cutoffIso) as unknown as LessonByProjectGroupRow[];
+
+  if (groupRows.length === 0) {
+    return {
+      window_days: windowDays,
+      generated_at: nowIso,
+      hourly_rate_usd: hourlyRateUsd,
+      by_project: {},
+    };
+  }
+
+  // Per-lesson total heal_count in the window — the denominator for
+  // the fair-share split.
+  const totalsRows = db.prepare(
+    "SELECT lesson_slug, lesson_date, "
+    + "       COUNT(DISTINCT heal_audit_id) AS total_heal_count "
+    + "  FROM lesson_credit "
+    + " WHERE created_at >= ? "
+    + " GROUP BY lesson_slug, lesson_date",
+  ).all(cutoffIso) as unknown as LessonTotalsRow[];
+
+  const totalByLesson = new Map<string, number>();
+  for (const r of totalsRows) {
+    const key = String(r.lesson_slug) + "|" + String(r.lesson_date);
+    totalByLesson.set(key, Number(r.total_heal_count) || 0);
+  }
+
+  // Aggregate per project: sum the fair-share saved_usd across each
+  // lesson the project is credited on; count distinct lessons.
+  interface Accum {
+    heal_count: number;
+    saved_usd_raw: number;
+    lessons: Set<string>;
+  }
+  const accumByProject = new Map<string, Accum>();
+  for (const r of groupRows) {
+    const projectSlug = String(r.project_slug);
+    const lessonKey = String(r.lesson_slug) + "|" + String(r.lesson_date);
+    const projectHeals = Number(r.heal_count) || 0;
+    const totalHeals = totalByLesson.get(lessonKey) || 0;
+    if (totalHeals <= 0) continue;
+    const lessonSavedUsd = totalHeals * averageRounded;
+    const projectShareUsd = (projectHeals / totalHeals) * lessonSavedUsd;
+    let acc = accumByProject.get(projectSlug);
+    if (!acc) {
+      acc = { heal_count: 0, saved_usd_raw: 0, lessons: new Set<string>() };
+      accumByProject.set(projectSlug, acc);
+    }
+    acc.heal_count += projectHeals;
+    acc.saved_usd_raw += projectShareUsd;
+    acc.lessons.add(lessonKey);
+  }
+
+  // Resolve project_name from the `project` table for every slug
+  // present in the accumulator. A slug that's no longer in the
+  // project table (e.g. a sunset project — its lesson_credit rows
+  // outlived its `project` row) falls back to the slug itself.
+  const projectNameBySlug = new Map<string, string>();
+  if (accumByProject.size > 0) {
+    const rows = db.prepare(
+      "SELECT slug, name FROM project",
+    ).all() as unknown as ProjectNameRow[];
+    for (const r of rows) {
+      projectNameBySlug.set(String(r.slug), String(r.name ?? r.slug));
+    }
+  }
+
+  const by_project: Record<string, LessonSavingsByProjectRow> = {};
+  for (const [slug, acc] of accumByProject) {
+    const savedUsd = Math.round(acc.saved_usd_raw * 100) / 100;
+    const savedHours = Math.round((acc.saved_usd_raw / hourlyRateUsd) * 10) / 10;
+    by_project[slug] = {
+      project_slug: slug,
+      project_name: projectNameBySlug.get(slug) ?? slug,
+      heal_count: acc.heal_count,
+      saved_usd: savedUsd,
+      saved_hours: savedHours,
+      lesson_count: acc.lessons.size,
+    };
+  }
+
+  return {
+    window_days: windowDays,
+    generated_at: nowIso,
+    hourly_rate_usd: hourlyRateUsd,
+    by_project,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Spend-efficiency ranking + laggard diagnosis (ticket 0044).
 //
 // Composes already-shipped tables (pr, cost_rollup_day, run, anomaly,

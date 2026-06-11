@@ -1460,6 +1460,64 @@ document.addEventListener("click", (e) => {
 });
 
 // ────────────────────────────────────────────────────────────────────
+// Ticket 0056: Time saved on the project card.
+//
+// One compact muted-grey line below the spend stat on each project
+// card. The line carries `data-testid="project-card-time-saved-<slug>"`
+// (or `project-card-time-saved-empty-<slug>` when saved_hours === 0).
+// When non-zero it wraps in a `<a href="/lessons?project=<slug>">` so
+// tapping deep-links into the lessons portal filtered to this
+// project. Quiet hours soften the present-tense framing ("this month"
+// → "last 30 days"; "saving you" → "have saved you") so the
+// midnight-glance reads retrospective, not promissory.
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary": every operator-visible string passes through
+// redactSecrets BEFORE composition into HTML.
+//
+// no heals attributed yet — empty cells render with the "fleet is
+// still learning" copy so the operator gets honest signal on day one.
+// ────────────────────────────────────────────────────────────────────
+
+/** Format a saved_hours number into the operator-visible string.
+ *  Rounded to one decimal, prefixed `~` to signal estimate. */
+function formatHoursSaved(saved_hours) {
+  const h = Number(saved_hours);
+  if (!Number.isFinite(h) || h <= 0) return "0h";
+  return "~" + (Math.round(h * 10) / 10).toFixed(1) + "h";
+}
+
+/** Render the time-saved line for one project card. `meta` is the
+ *  `time_saved_this_month` field from /api/fleet's project row, or
+ *  null when the project has no attributed savings (or the field is
+ *  missing entirely from an older payload — graceful ignore per the
+ *  additive-field contract). `quietHoursActive` softens the
+ *  present-tense framing per the 0030 pull-vs-push contract. */
+function renderTimeSavedLine(slug, meta, quietHoursActive) {
+  const safeSlug = esc(redactSecrets(String(slug || "")));
+  const savedHours = meta && Number.isFinite(Number(meta.saved_hours))
+    ? Number(meta.saved_hours)
+    : 0;
+  if (savedHours <= 0) {
+    const empty = quietHoursActive
+      ? "lessons have saved you 0h over the last 30 days — fleet is still learning"
+      : "lessons saving you 0h this month — fleet is still learning";
+    return "<span class=\"project-card-time-saved project-card-time-saved-empty\""
+      + " data-testid=\"project-card-time-saved-empty-" + safeSlug + "\""
+      + " data-stop=\"1\">"
+      + esc(redactSecrets(empty)) + "</span>";
+  }
+  const hoursStr = formatHoursSaved(savedHours);
+  const framing = quietHoursActive ? "over the last 30 days" : "this month";
+  const body = hoursStr + " saved " + framing;
+  return "<a class=\"project-card-time-saved\""
+    + " href=\"/lessons?project=" + safeSlug + "\""
+    + " data-testid=\"project-card-time-saved-" + safeSlug + "\""
+    + " data-stop=\"1\">"
+    + esc(redactSecrets(body)) + "</a>";
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Ticket 0047: PR autopsy card.
 //
 // Inline card on the home page (BELOW the 0040 riskiest-PR badge,
@@ -2440,6 +2498,11 @@ async function home() {
   // carries the canonical flag) so the renderer can suppress the
   // sunset-sticky chip overnight per AC10 + the 0030 pull-vs-push
   // contract.
+  // Ticket 0056: stash the fleet-wide quiet-hours flag so card(p)
+  // can soften the time-saved line's tense ("this month" → "last 30
+  // days") without an extra fetch. Same shape as window._worthItBySlug
+  // — the home page reads the canonical flag off the inbox payload.
+  if (typeof window !== "undefined") window._quietHoursActive = quietHoursActive;
   window._worthItBySlug = {};
   if (worthItData && Array.isArray(worthItData.projects)) {
     for (const wi of worthItData.projects) {
@@ -2730,6 +2793,17 @@ function card(p) {
     ? window._worthItBySlug[p.slug] || null
     : null;
   const worthItLine = renderWorthItVerdict(p.slug, worthItMeta);
+  // Ticket 0056: per-card time-saved line. Reads the additive
+  // `time_saved_this_month` field stamped on each project row by
+  // /api/fleet (and falls through to null when the field is missing
+  // on an older payload — graceful ignore per the additive contract).
+  // The home-page quiet-hours flag is stashed on
+  // window._quietHoursActive by home() so card() can read it without
+  // an extra fetch — same shape as window._worthItBySlug.
+  const quietHoursActiveForCard = !!(typeof window !== "undefined" && window._quietHoursActive);
+  const timeSavedLine = renderTimeSavedLine(
+    p.slug, p.time_saved_this_month || null, quietHoursActiveForCard,
+  );
   return `<a class="card" href="#/p/${p.slug}">
     <div class="card-head">${renderHealthDot(p.health, p.slug)}<span class="pname">${esc(p.name)}</span>
       <span class="state"><span class="dot ${cls}"></span>${label}${pausedCostPill(p)}${anomalyPill(p)}</span></div>
@@ -2741,6 +2815,7 @@ function card(p) {
       <span>${forecastSpan(p.forecast)}</span>
       <span class="dim">${p.runs} runs</span>
     </div>
+    ${timeSavedLine}
     ${renderBurndownSparkline(p)}
     ${ulBanner}${akBanner}${banner}
     ${worthItLine}</a>`;
