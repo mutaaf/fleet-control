@@ -1,7 +1,7 @@
 ---
 id: 0055
 title: Lesson of the day — one cross-fleet lesson rotates onto the home card each morning so the operator gets a daily intellectual reward
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-11
@@ -369,4 +369,29 @@ shape before composing the rotation helper.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-11 [ship/0055] Picked up the ticket. Surveyed surfaces:
+  `src/lessons.ts` exposes `loadCrossLessons()` returning
+  `CrossLessonsLoadResult { projects, total, source_present, oversized? }`
+  with `LessonEntry { date, title, body, kind }`. `src/views.ts`
+  exposes `lessonSavingsRollup(db, opts)` returning `{ window_days,
+  generated_at, average_failed_ship_cost_usd, lesson_savings: [{
+  lesson_slug, lesson_date, lesson_title, heal_count, saved_usd,
+  first_credited_at, last_credited_at, projects_helped }] }`.
+  `src/server.ts` already wires the savings + lessons cache via
+  `getLessonsCached(path)` (memo on mtime). PRODUCER-VS-SPEC: the
+  ticket prose names the parsed shape `{ lesson_slug, lesson_date,
+  ... }` but the parser actually emits `{ date, title, body, kind }`
+  with the project slug coming from `ProjectLessons.slug` — we
+  reconcile by deriving `lesson_slug = project.slug` and
+  `lesson_date = entry.date` at the rotation join.
+- 2026-06-11 [ship/0055] Implementation plan: (1) export
+  `lessonOfTheDay(db, opts?)` from `src/lessons.ts` — reads the cross-
+  lessons file via `loadCrossLessons(defaultLessonsPath())`, joins
+  with `lessonSavingsRollup` (lazy import from `./views.ts` to avoid
+  a cycle), and selects the (day mod ranked-list) entry. (2) Wire
+  `GET /api/fleet/lesson-of-the-day` in `src/server.ts` with the
+  cache-keyed memo and the globalThis invalidation slot. (3) Render
+  the home card in `web/app.js` between the glance card and the
+  inbox. (4) CSS in `web/style.css` reusing existing card structure.
+  (5) sw.js already covers `/api/*` via network-first — no change
+  needed there.
