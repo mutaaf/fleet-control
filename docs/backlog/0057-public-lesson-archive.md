@@ -1,7 +1,7 @@
 ---
 id: 0057
 title: Public lesson archive — anonymised /lessons-public surface where a stranger Googling a node:sqlite error lands and downloads fleet-control
-status: groomed
+status: in-progress
 priority: P2
 area: portal
 created: 2026-06-11
@@ -466,4 +466,18 @@ structural HTML or the lesson title.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-12 (implementation-dev): branch `feat/0057-public-lesson-archive`
+  off origin/main, status flipped to `in-progress`. README index row
+  reconciled from P1 → P2 to match this file's frontmatter (the validator
+  checks status drift; priority drift is doc-only but reconciled in the
+  same PR so the index doesn't lie). Plan: extend `src/lessons.ts` with
+  `lessonsPublicArchive(opts)` + slug derivation + anonymiser; mount
+  three new public routes in `src/server.ts` (`GET /lessons-public`,
+  `GET /lessons-public/<slug>`, `GET /api/lessons-public`) BEFORE the
+  `/api/` auth gate so they share the `/pulse` no-auth posture; expose
+  `_resetLessonsPublicArchiveCacheForTests` +
+  `_getLessonsPublicArchiveCacheBuildsForTests` +
+  `_renderLessonsPublicForTests` seams per the 2026-06-11 lessons; new
+  CSS group in `web/style.css` (centred max-width 80ch) reusing existing
+  variables; one footer line on the authenticated `/lessons` SPA route
+  for AC9 cross-link. NO new schema. NO new runtime dep.

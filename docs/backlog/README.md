@@ -23,7 +23,7 @@ proposes new ones, `review` grades them.
 | 0055 | Lesson of the day - one cross-fleet lesson rotates onto the home card each morning so the operator gets a daily intellectual reward | P1 | shipped | portal |
 | 0056 | Time saved this month - each project card surfaces ~Nh saved from cross-fleet lessons so the moat becomes visible on the home grid | P1 | shipped | observability |
 | 0053 | Project graveyard - paused / sunset projects get a memorial page tallying lifetime ROI and what they taught the fleet | P1 | shipped | portal |
-| 0057 | Public lesson archive - anonymised /lessons-public surface where a stranger Googling a node:sqlite error lands and downloads fleet-control | P2 | groomed | portal |
+| 0057 | Public lesson archive - anonymised /lessons-public surface where a stranger Googling a node:sqlite error lands and downloads fleet-control | P2 | in-progress | portal |
 | 0052 | Lesson-pays-for-itself ledger - each cross-fleet lesson grows a $$ saved tally from the heal-credit attributions | P1 | shipped | observability |
 | 0051 | Pre-install ROI calculator - public /calculator page projects fleet-control's value before any install | P1 | shipped | portal |
 | 0050 | Fleet year-in-review - one shareable annual page only the local SQLite can author | P1 | shipped | portal |
