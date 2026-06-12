@@ -1,7 +1,7 @@
 ---
 id: 0053
 title: Project graveyard — paused / sunset projects get a memorial page tallying lifetime ROI and what they taught the fleet
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-10
