@@ -413,6 +413,18 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         // eng-toggle — ticket 0020).
         out = resumeShipPlist(db, slug);
         db.prepare("DELETE FROM project_pause WHERE project_id=?").run(p.id);
+        // Ticket 0053: the graveyard memo cache lives in src/server.ts;
+        // its invalidation chokepoint includes the pause/unpause flip
+        // (per the ticket's engineering notes). Late-bind via the
+        // globalThis slot registered by src/server.ts at module load
+        // (per LESSONS 2026-06-05 "break ingest-to-server cache-
+        // invalidation cycles via a globalThis slot"). The hook is a
+        // no-op when the server module hasn't loaded.
+        try {
+          const hook = (globalThis as { __fleet_graveyard_invalidate__?: () => void })
+            .__fleet_graveyard_invalidate__;
+          if (typeof hook === "function") hook();
+        } catch { /* cache hook is best-effort; never block the resume */ }
         message = `Resumed ${slug}.`;
         break;
       }

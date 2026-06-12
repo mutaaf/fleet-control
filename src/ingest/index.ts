@@ -165,5 +165,15 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_lesson_savings_by_project_invalidate__?: () => void }).__fleet_lesson_savings_by_project_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0053: project graveyard memo cache. Same globalThis-slot
+  // pattern; the rollup composes project_pause + pr +
+  // cost_rollup_day + lesson_credit. A freshly-merged PR shifts the
+  // (MAX(fetched_at), COUNT(*)) tuple, so clearing the cache on
+  // every ingest commit lets the next render rebuild with the
+  // fresh PR data without waiting out the 30-min TTL.
+  try {
+    const hook = (globalThis as { __fleet_graveyard_invalidate__?: () => void }).__fleet_graveyard_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

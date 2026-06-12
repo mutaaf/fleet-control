@@ -189,6 +189,18 @@ export function projectView(db: DB, cfg: FleetConfig, slug: string) {
   try { ingestProjectPRs(db, p.id, repo); } catch { /* keep serving */ }
   const usage = usageLimitState(db, p.id);
   const autoKill = lastAutoKill(db, p.slug);
+  // Ticket 0053: graveyard cross-link banner. ADDITIVE optional fields
+  // — older SPA clients gracefully ignore them. `paused_at` is the
+  // producer's `triggered_at` value (the schema has no `paused_at`
+  // column); `pause_reason` is the classified label per
+  // src/views.ts § projectGraveyard.
+  interface ProjectPauseProbeRow { reason: string; triggered_at: string; }
+  const probe = db.prepare(
+    "SELECT reason, triggered_at FROM project_pause WHERE project_id = ?",
+  ).get(p.id) as unknown as ProjectPauseProbeRow | undefined;
+  const pausedAt = probe?.triggered_at ?? null;
+  const pauseReason = probe ? classifyPauseReason(probe.reason) : null;
+  const pauseReasonRaw = probe?.reason ?? null;
   return {
     slug: p.slug, name: p.name, repo,
     selfCancelDays: selfCancelDays(p.self_cancel), engEnabled: !!p.eng_enabled,
@@ -196,6 +208,9 @@ export function projectView(db: DB, cfg: FleetConfig, slug: string) {
     jobs, recent, costByPhase: byPhase, prs: projectPRs(db, p.id),
     usageLimit: usage, autoKill,
     cadence, pace: paceLabel(cadence),
+    paused_at: pausedAt,
+    pause_reason: pauseReason,
+    pause_reason_raw: pauseReasonRaw,
   };
 }
 
@@ -4452,6 +4467,244 @@ export function lessonSavingsByProject(
     generated_at: nowIso,
     hourly_rate_usd: hourlyRateUsd,
     by_project,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Project graveyard (ticket 0053).
+//
+// Composes already-shipped tables (project, project_pause, pr,
+// cost_rollup_day, lesson_credit) into a per-paused-project rollup of
+// lifetime merged PRs, lifetime spend, lifetime ROI, and the count of
+// cross-fleet lessons that project's heals attributed.
+//
+// Producer reconciliation (per LESSONS 2026-06-05 schema-wins):
+//   - project_pause.reason: the producer at src/budget_guard.ts:187
+//     writes the literal 'cost_cap' (lowercase). The schema doc
+//     reserves 'manual' for future use; v1 never writes it. The
+//     classification map honours that literal and accepts spec-named
+//     'budget'/'budget_cap' as forward-compat synonyms.
+//   - project_pause schema (src/db.ts:189): PK is project_id, NOT
+//     (project_slug, ...) as the spec hedged. No 'active' column —
+//     a row's mere presence means paused. No 'paused_at' column —
+//     the producer's spelling is 'triggered_at'.
+//   - pr.state = 'MERGED' uppercase (matches src/ingest/prs.ts:152).
+//   - lesson_credit.project_slug + created_at (src/db.ts:282).
+//
+// Per LESSONS no-sqlite-cast: every row narrowing uses the double
+// cast (as unknown as RowT[]).
+// Per LESSONS no-backticks: SQL strings are plain string concat;
+// identifiers stay unquoted.
+// Per LESSONS julianday-drift: no sub-millisecond timestamp diffs
+// needed; lifetime arithmetic is whole-row counts.
+// ────────────────────────────────────────────────────────────────────
+
+const GRAVEYARD_DEFAULT_HOURLY_RATE_USD = 75;
+const GRAVEYARD_DEFAULT_HOURS_PER_PR = 1;
+
+export type GraveyardPauseReason =
+  | "budget_autopause"
+  | "sunset_verdict"
+  | "manual";
+
+export interface GraveyardSummary {
+  paused_count: number;
+  lifetime_merged_prs: number;
+  lifetime_spend_usd: number;
+  lessons_authored: number;
+}
+
+export interface GraveyardProjectRow {
+  project_slug: string;
+  project_name: string;
+  paused_at: string;
+  pause_reason: GraveyardPauseReason;
+  pause_reason_raw: string;
+  lifetime_merged_prs: number;
+  lifetime_spend_usd: number;
+  lifetime_cost_per_pr_usd: number | null;
+  lifetime_roi_multiplier: number | null;
+  lessons_authored: number;
+  first_run_at: string | null;
+  last_run_at: string | null;
+}
+
+export interface ProjectGraveyard {
+  generated_at: string;
+  summary: GraveyardSummary;
+  projects: GraveyardProjectRow[];
+}
+
+export interface ProjectGraveyardOptions {
+  /** Wall-clock anchor — tests pin it; production passes new Date(). */
+  now?: Date;
+  /** Hourly rate for the ROI denominator; defaults to 75 per the
+   *  0048 / 0050 precedent. */
+  hourlyRateUsd?: number;
+  /** Hours per merged PR for the human-equivalent multiplication;
+   *  defaults to 1. */
+  hoursPerPr?: number;
+}
+
+interface GraveyardPauseRow {
+  project_id: number;
+  project_slug: string;
+  project_name: string | null;
+  reason: string;
+  triggered_at: string;
+}
+
+interface GraveyardLifetimeCountRow { c: number | null; }
+interface GraveyardLifetimeSumRow { s: number | null; }
+interface GraveyardRunBoundsRow { first_at: string | null; last_at: string | null; }
+interface GraveyardLessonCountRow { c: number | null; }
+interface GraveyardDistinctLessonRow { lesson_slug: string; lesson_date: string; }
+
+/** Classify the producer's raw `project_pause.reason` value into the
+ *  displayed label per AC2. Producer reality (cost_cap) is the
+ *  contract; spec-named synonyms (budget / budget_cap / sunset /
+ *  sunset_candidate) are forward-compat arms for any future writer.
+ *  Anything else, including null/undefined, defaults to the manual
+ *  label. */
+function classifyPauseReason(raw: string | null | undefined): GraveyardPauseReason {
+  const r = String(raw ?? "").trim().toLowerCase();
+  if (r === "cost_cap" || r === "budget" || r === "budget_cap") {
+    return "budget_autopause";
+  }
+  if (r === "sunset" || r === "sunset_candidate") {
+    return "sunset_verdict";
+  }
+  return "manual";
+}
+
+/** Compose the project-graveyard rollup. Pure read-side; no writes.
+ *  Returns the documented shape; the route handler caches + scrubs
+ *  the result. */
+export function projectGraveyard(
+  db: DB,
+  opts: ProjectGraveyardOptions = {},
+): ProjectGraveyard {
+  const now = opts.now ?? new Date();
+  const hourlyRateUsd = typeof opts.hourlyRateUsd === "number" && opts.hourlyRateUsd > 0
+    ? opts.hourlyRateUsd
+    : GRAVEYARD_DEFAULT_HOURLY_RATE_USD;
+  const hoursPerPr = typeof opts.hoursPerPr === "number" && opts.hoursPerPr > 0
+    ? opts.hoursPerPr
+    : GRAVEYARD_DEFAULT_HOURS_PER_PR;
+
+  // One row per paused project. Join project to surface slug+name in
+  // the same read.
+  const pauseRows = db.prepare(
+    "SELECT pp.project_id AS project_id, "
+    + "       p.slug       AS project_slug, "
+    + "       p.name       AS project_name, "
+    + "       pp.reason    AS reason, "
+    + "       pp.triggered_at AS triggered_at "
+    + "  FROM project_pause pp "
+    + "  JOIN project p ON p.id = pp.project_id "
+    + " ORDER BY pp.triggered_at DESC",
+  ).all() as unknown as GraveyardPauseRow[];
+
+  // Per-row lifetime aggregation. We bind the (project_id,
+  // triggered_at) pair per row; the pause count is small so N small
+  // reads are cheaper than one big GROUP BY (and stay correct under
+  // sparse data).
+  const mergedStmt = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE project_id = ? "
+    + "   AND state = 'MERGED' "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND fetched_at <= ?",
+  );
+  const spendStmt = db.prepare(
+    "SELECT SUM(COALESCE(cost_usd, 0)) AS s "
+    + "  FROM cost_rollup_day "
+    + " WHERE project_id = ? "
+    + "   AND day <= ?",
+  );
+  const runBoundsStmt = db.prepare(
+    "SELECT MIN(started_at) AS first_at, MAX(started_at) AS last_at "
+    + "  FROM run WHERE project_id = ? AND started_at IS NOT NULL "
+    + "   AND started_at <= ?",
+  );
+  const lessonStmt = db.prepare(
+    "SELECT COUNT(DISTINCT lesson_slug || '|' || lesson_date) AS c "
+    + "  FROM lesson_credit "
+    + " WHERE project_slug = ? "
+    + "   AND created_at <= ?",
+  );
+
+  const projects: GraveyardProjectRow[] = [];
+  let lifetimeMergedTotal = 0;
+  let lifetimeSpendTotal = 0;
+  const lessonsAuthored = new Set<string>();
+
+  // For the summary's "lessons_authored" count we want DISTINCT lessons
+  // across the WHOLE graveyard — so we collect every (slug, date) tuple
+  // per project and union them.
+  const distinctLessonsStmt = db.prepare(
+    "SELECT DISTINCT lesson_slug, lesson_date "
+    + "  FROM lesson_credit "
+    + " WHERE project_slug = ? "
+    + "   AND created_at <= ?",
+  );
+
+  for (const row of pauseRows) {
+    const pausedAt = String(row.triggered_at);
+    const dayCutoff = pausedAt.slice(0, 10); // cost_rollup_day.day is yyyy-mm-dd
+
+    const mergedRow = mergedStmt.get(row.project_id, pausedAt) as unknown as GraveyardLifetimeCountRow | undefined;
+    const merged = Number(mergedRow?.c ?? 0) || 0;
+
+    const spendRow = spendStmt.get(row.project_id, dayCutoff) as unknown as GraveyardLifetimeSumRow | undefined;
+    const spend = Number(spendRow?.s ?? 0) || 0;
+
+    const boundsRow = runBoundsStmt.get(row.project_id, pausedAt) as unknown as GraveyardRunBoundsRow | undefined;
+    const firstRunAt = boundsRow?.first_at ?? null;
+    const lastRunAt = boundsRow?.last_at ?? null;
+
+    const lessonRow = lessonStmt.get(row.project_slug, pausedAt) as unknown as GraveyardLessonCountRow | undefined;
+    const lessonsForThisProject = Number(lessonRow?.c ?? 0) || 0;
+
+    // For the summary, union distinct lessons across all projects so a
+    // lesson credited to two paused projects only counts once.
+    const distinctRows = distinctLessonsStmt.all(row.project_slug, pausedAt) as unknown as GraveyardDistinctLessonRow[];
+    for (const lr of distinctRows) {
+      lessonsAuthored.add(String(lr.lesson_slug) + "|" + String(lr.lesson_date));
+    }
+
+    const costPerPr = merged > 0 ? Math.round((spend / merged) * 100) / 100 : null;
+    const humanEquivalent = merged * hoursPerPr * hourlyRateUsd;
+    const roi = spend > 0 ? Math.round((humanEquivalent / spend) * 100) / 100 : null;
+
+    projects.push({
+      project_slug: String(row.project_slug),
+      project_name: String(row.project_name ?? row.project_slug),
+      paused_at: pausedAt,
+      pause_reason: classifyPauseReason(row.reason),
+      pause_reason_raw: String(row.reason ?? ""),
+      lifetime_merged_prs: merged,
+      lifetime_spend_usd: Math.round(spend * 100) / 100,
+      lifetime_cost_per_pr_usd: costPerPr,
+      lifetime_roi_multiplier: roi,
+      lessons_authored: lessonsForThisProject,
+      first_run_at: firstRunAt,
+      last_run_at: lastRunAt,
+    });
+
+    lifetimeMergedTotal += merged;
+    lifetimeSpendTotal += spend;
+  }
+
+  return {
+    generated_at: now.toISOString(),
+    summary: {
+      paused_count: projects.length,
+      lifetime_merged_prs: lifetimeMergedTotal,
+      lifetime_spend_usd: Math.round(lifetimeSpendTotal * 100) / 100,
+      lessons_authored: lessonsAuthored.size,
+    },
+    projects,
   };
 }
 
