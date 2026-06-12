@@ -4423,6 +4423,7 @@ async function lessons(params) {
     </div>
     ${draftHtml}
     ${renderLessonsPage(data)}
+    <footer class="lessons-public-cross-link"><a data-testid="lessons-public-cross-link" href="/lessons-public">this archive is also available publicly at /lessons-public — anyone with the link can read the anonymised lessons</a></footer>
   </div>`;
   foot.textContent = "";
   const container = app.querySelector('[data-testid="cross-lessons"]');

@@ -715,3 +715,34 @@ window. Same trap will bite any future ticket that adds a helper
 adjacent to one with a character-window source grep
 (views.ts has several: lessonSavingsRollup, lessonCreditRollup,
 fleetWeeklyPulse, etc.).
+
+## 2026-06-12 — greedy `[^>]+id=` regex over a `<h2 id="..." data-testid="...">` captures the wrong attribute
+
+Symptom: while shipping ticket 0057 (public lesson archive) the AC4
+permalink test pulled a slug out of the rendered index HTML via
+`body.match(/<h2[^>]+id=["']([a-z0-9-]+)["']/)`, then hit
+`GET /lessons-public/<slug>` and got an unexpected 404 against a
+server that DEFINITELY had the lesson in its archive. Cause: the
+rendered tag was `<h2 id="redactsecrets-on-..." data-testid=
+"lesson-public-redactsecrets-on-...">` — and the greedy `[^>]+`
+inside the regex slurped right through the `id="..."` attribute
+all the way to `data-testid=` (which ends with `testid=`, which
+contains the literal `id=`), capturing `lesson-public-<slug>`
+instead of the plain `<slug>`. The lookup against the archive's
+`lesson_slug` field then 404'd because no row carries the
+`lesson-public-` prefix. Fix: anchor the parse on the testid
+itself (`/data-testid=["']lesson-public-([a-z0-9-]+)["']/`) — the
+suffix on the testid IS the slug by construction, and the testid
+attribute is unambiguous (no other attribute matches it). General
+rule for this repo: when a test wants to scrape an attribute out
+of an HTML element via regex, NEVER use `[^>]+attr=` with a
+greedy quantifier when ANOTHER attribute on the same tag ends in
+the literal `attr=` substring (`data-testid` collides with any
+greedy `id=` regex; `aria-labelledby` collides with `by=`; etc.).
+Anchor on the most-distinctive attribute name, OR use a non-
+greedy quantifier `[^>]*?` followed by a word-boundary before the
+`attr=` token. The renderer was correct; the test's regex was the
+bug. Same trap will bite any future test that scrapes a slug /
+id / name out of a rendered HTML element that ALSO carries a
+testid suffixed with that same value (a common pattern in this
+codebase: `<a id="<slug>" data-testid="<prefix>-<slug>">`).
