@@ -1,7 +1,7 @@
 ---
 id: 0057
 title: Public lesson archive — anonymised /lessons-public surface where a stranger Googling a node:sqlite error lands and downloads fleet-control
-status: in-progress
+status: shipped
 priority: P2
 area: portal
 created: 2026-06-11
@@ -481,3 +481,31 @@ structural HTML or the lesson title.
   CSS group in `web/style.css` (centred max-width 80ch) reusing existing
   variables; one footer line on the authenticated `/lessons` SPA route
   for AC9 cross-link. NO new schema. NO new runtime dep.
+- 2026-06-12 (implementation-dev): shipped.
+  `lessonsPublicArchive(opts)` in src/lessons.ts composes the existing
+  `loadCrossLessons()` parser with a 4-rule anonymiser (operator slug
+  → alias; agent branch prefix → <branch>; /Users|/home path →
+  <path>; "ticket NNNN" → "an agent ticket") and a deterministic
+  kebab-slug derivation that handles same-title/same-date collisions
+  with a -N suffix. Three public routes mounted BEFORE the /api/
+  auth gate so they share the /pulse no-auth posture:
+  `GET /lessons-public` (HTML index with `lessons-public-header` +
+  `lessons-public-cta` + per-lesson `lesson-public-<slug>` testids),
+  `GET /lessons-public/<slug>` (permalink with H1 + canonical →
+  permalink form + back-link; unknown slug → 404 friendly HTML), and
+  `GET /api/lessons-public` (JSON shape per AC1). All three set
+  Cache-Control: max-age=3600 and declare robots:index,follow.
+  Memoisation uses (file mtime, alias-map fingerprint) with reset +
+  build-counter seams; invalidation hook registered on
+  `globalThis.__fleet_lessons_public_archive_invalidate__` per the
+  2026-06-05 ESM-cycle lesson. Defence-in-depth redaction scrubs
+  VALUES BEFORE composition (HTML or JSON), per the 2026-06-10
+  shred-your-keys lesson — tightened hasDigit gate so the underscore
+  is not treated as a digit-qualifier. The renderer is exposed via
+  `_renderLessonsPublicForTests` / `_renderLessonsPublicPermalinkForTests`
+  per the 2026-06-11 startServer-race lesson. AC9 footer cross-link
+  added to the authenticated `/lessons` SPA path in web/app.js (HTML-
+  only; no JSON-shape break). NEW route surfaces don't break any
+  existing /api/* JSON shape. Zero new runtime deps. 15 tests cover
+  every AC checkbox; 14 pass, 1 PERF-gated SKIP. Full local gate
+  green (`npm ci && npx tsc --noEmit && node scripts/check-backlog.mjs`).

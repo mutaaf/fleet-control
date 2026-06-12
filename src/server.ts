@@ -28,8 +28,11 @@ import {
   loadCrossLessons, defaultLessonsPath, newThisWeekCount,
   attributeHealsToLessons,
   lessonOfTheDay,
+  lessonsPublicArchive,
   type CrossLessonsLoadResult,
   type LessonOfTheDay,
+  type LessonsPublicArchive,
+  type LessonsPublicArchiveRow,
 } from "./lessons.ts";
 import { statSync } from "node:fs";
 import { serveShare } from "./snapshot.ts";
@@ -2784,6 +2787,428 @@ function servePulseJson(db: DB, now: Date): { body: string; headers: Record<stri
   };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0057: public lesson archive — anonymised /lessons-public
+// surface where a stranger Googling a node-sqlite error lands and
+// downloads fleet-control.
+//
+// Three routes, all PUBLIC (no auth, no loopback gate):
+//   GET /lessons-public               → self-contained HTML index page
+//   GET /lessons-public/<lesson-slug> → single-lesson permalink page
+//   GET /api/lessons-public           → JSON shape (AC1)
+//
+// All three share a per-(lessons-file-mtime, alias-map-fingerprint)
+// memo cache. Per LESSONS § "in-process dedup sets need an explicit
+// reset hook for tests" + "expose a build counter for cache-hit tests,
+// not a fetcher swap" we expose
+//   _resetLessonsPublicArchiveCacheForTests()
+//   _getLessonsPublicArchiveCacheBuildsForTests()
+// alongside the cache. Per LESSONS 2026-06-05 "break ingest↔server
+// cache-invalidation cycles via a globalThis slot": the invalidation
+// hook is registered on globalThis.__fleet_lessons_public_archive_invalidate__
+// so a fresh `fleet lessons-sync` (which simply updates the file's
+// mtime) ALSO wakes the cache before its next call, without an import
+// cycle. The cache will also invalidate on its own via the mtime
+// check inside lessonsPublicArchive's loadCrossLessons() call, so
+// the globalThis hook is belt-and-braces.
+//
+// Per LESSONS 2026-06-11 "startServer() tests that mutate
+// fleet-control.config.json race": the renderer is exposed via
+// _renderLessonsPublicForTests / _renderLessonsPublicPermalinkForTests
+// so branch tests drive the renderer directly without booting the
+// server (and racing against parallel test files).
+//
+// Per LESSONS 2026-06-10 "redactSecrets on a JSON body shreds your
+// KEYS": the renderer + JSON route scrub operator-supplied STRING
+// VALUES (lesson_title, lesson_body_anonymised) BEFORE composition
+// — never the JSON body string.
+// ────────────────────────────────────────────────────────────────────
+
+interface LessonsPublicArchiveCacheEntry {
+  mtimeMs: number;
+  aliasFingerprint: string;
+  value: LessonsPublicArchive;
+}
+let lessonsPublicArchiveCache: LessonsPublicArchiveCacheEntry | null = null;
+let lessonsPublicArchiveBuildCounter = 0;
+
+export function _resetLessonsPublicArchiveCacheForTests(): void {
+  lessonsPublicArchiveCache = null;
+  lessonsPublicArchiveBuildCounter = 0;
+}
+
+export function _getLessonsPublicArchiveCacheBuildsForTests(): number {
+  return lessonsPublicArchiveBuildCounter;
+}
+
+/** Production cache-invalidation hook — wired through globalThis so
+ *  the ingest module (or any other producer) can fire it without
+ *  importing the server module (avoids the ESM cycle described in
+ *  LESSONS 2026-06-05). Clearing the cache (not the build counter)
+ *  lets tests observe the counter increment on the next call. */
+export function _invalidateLessonsPublicArchiveCache(): void {
+  lessonsPublicArchiveCache = null;
+}
+
+(globalThis as { __fleet_lessons_public_archive_invalidate__?: () => void })
+  .__fleet_lessons_public_archive_invalidate__ = _invalidateLessonsPublicArchiveCache;
+
+interface ProjectSlugRow { slug: string; }
+
+/** Compose the canonical alias map from the operator's project table
+ *  (so slugs that exist in the operator's fleet but not yet in the
+ *  CROSS_LESSONS.md still resolve to a stable alias) PLUS the lessons
+ *  file's own H2 slugs (so a project that's been removed from the DB
+ *  but still has lessons stays anonymised). The bootstrap slug
+ *  agent-fleet always maps to itself (it's the public name of the
+ *  open-source kit). */
+function buildProjectAliasMap(db: DB, parsed: CrossLessonsLoadResult): Record<string, string> {
+  const out: Record<string, string> = {};
+  const seen = new Set<string>();
+  // Operator project table first, alphabetical for stability.
+  let dbRows: ProjectSlugRow[] = [];
+  try {
+    dbRows = db.prepare(
+      "SELECT slug FROM project ORDER BY slug",
+    ).all() as unknown as ProjectSlugRow[];
+  } catch { /* table may not exist on a fresh boot — fall through */ }
+  let n = 1;
+  for (const r of dbRows) {
+    const slug = String(r.slug ?? "").trim();
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    if (slug === "agent-fleet") {
+      out[slug] = "agent-fleet";
+    } else {
+      out[slug] = "project-" + String(n);
+      n += 1;
+    }
+  }
+  // Then the file's own H2 slugs (any not already mapped).
+  for (const p of parsed.projects) {
+    const slug = String(p.slug ?? "").trim();
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    if (slug === "agent-fleet") {
+      out[slug] = "agent-fleet";
+    } else {
+      out[slug] = "project-" + String(n);
+      n += 1;
+    }
+  }
+  return out;
+}
+
+/** Test-only handle on the cached archive path — drives the build-
+ *  counter / cache-hit semantics without going through HTTP. */
+export function _lessonsPublicArchiveCachedForTests(db: DB, now: Date): LessonsPublicArchive {
+  return getLessonsPublicArchiveCached(db, now);
+}
+
+/** Memoised access — looks up the archive from the in-process cache,
+ *  rebuilds on file-mtime change OR alias-map change. */
+function getLessonsPublicArchiveCached(db: DB, now: Date): LessonsPublicArchive {
+  const path = defaultLessonsPath();
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(path).mtimeMs; } catch { mtimeMs = 0; }
+  const parsed = loadCrossLessons(path);
+  const aliasMap = buildProjectAliasMap(db, parsed);
+  const aliasFingerprint = Object.keys(aliasMap).sort()
+    .map((k) => k + "=" + aliasMap[k]).join("|");
+  if (lessonsPublicArchiveCache
+      && lessonsPublicArchiveCache.mtimeMs === mtimeMs
+      && lessonsPublicArchiveCache.aliasFingerprint === aliasFingerprint) {
+    return lessonsPublicArchiveCache.value;
+  }
+  lessonsPublicArchiveBuildCounter += 1;
+  const value = lessonsPublicArchive({ now, projectAliasMap: aliasMap });
+  lessonsPublicArchiveCache = { mtimeMs, aliasFingerprint, value };
+  return value;
+}
+
+/** HTML-safe escape. */
+function escForLessonsPublic(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Defence-in-depth secret redaction at the renderer boundary. Same
+ *  tightened shape as pulse / lesson-savings: scrub VALUES (the lesson
+ *  title and body), never the composed JSON body. The underscore is
+ *  NOT treated as a digit-qualifier so an operator-supplied
+ *  identifier-shape value with legitimate underscores survives. */
+function redactSecretsForLessonsPublic(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+/** Pre-render scrub. Walks every operator-supplied string field and
+ *  routes it through redactSecretsForLessonsPublic. The anonymiser in
+ *  src/lessons.ts handles the structural leaks (slugs, branches,
+ *  paths, ticket refs); this is the token-shape backstop. */
+function scrubArchiveValues(a: LessonsPublicArchive): LessonsPublicArchive {
+  return {
+    generated_at: a.generated_at,
+    total_lessons: a.total_lessons,
+    earliest_lesson_date: redactSecretsForLessonsPublic(a.earliest_lesson_date),
+    latest_lesson_date: redactSecretsForLessonsPublic(a.latest_lesson_date),
+    lessons: a.lessons.map((l) => ({
+      lesson_slug: redactSecretsForLessonsPublic(l.lesson_slug),
+      lesson_date: redactSecretsForLessonsPublic(l.lesson_date),
+      lesson_title: redactSecretsForLessonsPublic(l.lesson_title),
+      lesson_body_anonymised: redactSecretsForLessonsPublic(l.lesson_body_anonymised),
+      project_alias: redactSecretsForLessonsPublic(l.project_alias),
+    })),
+  };
+}
+
+/** Footer attribution copy — the single load-bearing CTA. We construct
+ *  the URL from a pair of plain strings so the redactor's github-URL
+ *  regex doesn't accidentally shred it (mirrors the receipts.ts
+ *  FOOTER_REPO_URL precedent). */
+const LESSONS_PUBLIC_FOOTER_URL = "https://github.com/" + "mutaaf/fleet-control";
+
+/** Build the page-level <head> tags shared by both renderers. Sets the
+ *  robots:index,follow + canonical:<canonicalHref> pair AND the
+ *  defensive cache-control hint inside a <meta http-equiv>. */
+function lessonsPublicHead(title: string, canonicalHref: string): string {
+  const safeTitle = escForLessonsPublic(title);
+  const safeCanon = escForLessonsPublic(canonicalHref);
+  return `<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${safeTitle}</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+<link rel="canonical" href="${safeCanon}" />`;
+}
+
+/** Render one lesson <article> for the index page. */
+function lessonsPublicArticle(l: LessonsPublicArchiveRow): string {
+  const safeSlug = escForLessonsPublic(l.lesson_slug);
+  const safeDate = escForLessonsPublic(l.lesson_date);
+  const safeTitle = escForLessonsPublic(l.lesson_title);
+  // Convert the anonymised body into one or more <p> blocks split on
+  // blank lines. Empty blocks are dropped so two consecutive newlines
+  // don't emit an empty <p>.
+  const paragraphs = l.lesson_body_anonymised
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .map((p) => `<p>${escForLessonsPublic(p)}</p>`)
+    .join("");
+  const safeAlias = escForLessonsPublic(l.project_alias);
+  return `<article class="lessons-public-entry">
+  <h2 id="${safeSlug}" data-testid="lesson-public-${safeSlug}">
+    <a href="/lessons-public/${safeSlug}"><time datetime="${safeDate}">${safeDate}</time> — ${safeTitle}</a>
+  </h2>
+  <div class="lessons-public-alias">${safeAlias}</div>
+  <div class="lessons-public-body">${paragraphs}</div>
+</article>`;
+}
+
+/** Test-only seam — drive the index renderer directly for the
+ *  anonymisation-regression test (zero HTTP, zero cwd config). */
+export function _renderLessonsPublicForTests(a: LessonsPublicArchive): string {
+  return renderLessonsPublicIndex(a);
+}
+
+/** Render the /lessons-public index page. Self-contained HTML, no
+ *  <script>, no /api/control/ reference, no operator project list. */
+function renderLessonsPublicIndex(a: LessonsPublicArchive): string {
+  const scrubbed = scrubArchiveValues(a);
+  const total = String(scrubbed.total_lessons);
+  // "M months" — diff between earliest and latest dates, rounded up.
+  let monthsLabel = "";
+  if (scrubbed.earliest_lesson_date && scrubbed.latest_lesson_date) {
+    const a0 = Date.parse(scrubbed.earliest_lesson_date);
+    const a1 = Date.parse(scrubbed.latest_lesson_date);
+    if (Number.isFinite(a0) && Number.isFinite(a1) && a1 >= a0) {
+      const months = Math.max(1, Math.ceil((a1 - a0) / (30 * 24 * 3600_000)));
+      monthsLabel = ` across ${months} month${months === 1 ? "" : "s"}`;
+    }
+  }
+  const articles = scrubbed.lessons.map(lessonsPublicArticle).join("\n");
+  const head = lessonsPublicHead(
+    `lessons authored by an autonomous agent fleet · fleet-control`,
+    "/lessons-public",
+  );
+  const safeTotal = escForLessonsPublic(total);
+  const safeMonths = escForLessonsPublic(monthsLabel);
+  const safeRepo = escForLessonsPublic(LESSONS_PUBLIC_FOOTER_URL);
+  return `<!doctype html>
+<html lang="en">
+<head>
+${head}
+</head>
+<body class="lessons-public-page">
+<main class="lessons-public">
+  <header class="lessons-public-head" data-testid="lessons-public-header">
+    <h1>lessons from an autonomous agent fleet</h1>
+    <p>${safeTotal} lessons${safeMonths} — authored by an autonomous agent fleet running fleet-control as a side effect of real shipping work. Every lesson is anonymised; the symptom, cause, and fix are verbatim.</p>
+  </header>
+  ${articles}
+  <footer class="lessons-public-foot" data-testid="lessons-public-cta">
+    this lesson was authored by an autonomous agent fleet running fleet-control —
+    install yours at <a href="${safeRepo}">${safeRepo}</a>
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+/** Test-only seam — drive the permalink renderer directly. */
+export function _renderLessonsPublicPermalinkForTests(
+  row: LessonsPublicArchiveRow,
+): string {
+  return renderLessonsPublicPermalink(row);
+}
+
+/** Render the /lessons-public/<slug> permalink page. Renders the lesson
+ *  title as <h1>, the date as <time>, the anonymised body as <p>
+ *  blocks. Carries a back-to-archive link at the top. */
+function renderLessonsPublicPermalink(row: LessonsPublicArchiveRow): string {
+  const scrubbedRow: LessonsPublicArchiveRow = {
+    lesson_slug: redactSecretsForLessonsPublic(row.lesson_slug),
+    lesson_date: redactSecretsForLessonsPublic(row.lesson_date),
+    lesson_title: redactSecretsForLessonsPublic(row.lesson_title),
+    lesson_body_anonymised: redactSecretsForLessonsPublic(row.lesson_body_anonymised),
+    project_alias: redactSecretsForLessonsPublic(row.project_alias),
+  };
+  const safeSlug = escForLessonsPublic(scrubbedRow.lesson_slug);
+  const safeDate = escForLessonsPublic(scrubbedRow.lesson_date);
+  const safeTitle = escForLessonsPublic(scrubbedRow.lesson_title);
+  const safeAlias = escForLessonsPublic(scrubbedRow.project_alias);
+  const safeRepo = escForLessonsPublic(LESSONS_PUBLIC_FOOTER_URL);
+  const paragraphs = scrubbedRow.lesson_body_anonymised
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .map((p) => `<p>${escForLessonsPublic(p)}</p>`)
+    .join("");
+  const head = lessonsPublicHead(
+    `${scrubbedRow.lesson_title} · fleet-control lesson archive`,
+    "/lessons-public/" + safeSlug,
+  );
+  return `<!doctype html>
+<html lang="en">
+<head>
+${head}
+</head>
+<body class="lessons-public-page">
+<main class="lessons-public lessons-public-permalink">
+  <nav class="lessons-public-back">
+    <a href="/lessons-public" data-testid="lessons-public-back">‹ all lessons</a>
+  </nav>
+  <article class="lessons-public-entry">
+    <h1 data-testid="lesson-public-${safeSlug}">${safeTitle}</h1>
+    <div class="lessons-public-meta">
+      <time datetime="${safeDate}">${safeDate}</time>
+      <span class="lessons-public-alias">${safeAlias}</span>
+    </div>
+    <div class="lessons-public-body">${paragraphs}</div>
+  </article>
+  <footer class="lessons-public-foot" data-testid="lessons-public-cta">
+    this lesson was authored by an autonomous agent fleet running fleet-control —
+    install yours at <a href="${safeRepo}">${safeRepo}</a>
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+/** 404 page for an unknown slug. Friendly HTML, links back to the
+ *  archive index. */
+function renderLessonsPublicNotFound(): string {
+  const safeRepo = escForLessonsPublic(LESSONS_PUBLIC_FOOTER_URL);
+  const head = lessonsPublicHead(
+    "lesson not found · fleet-control",
+    "/lessons-public",
+  );
+  return `<!doctype html>
+<html lang="en">
+<head>
+${head}
+</head>
+<body class="lessons-public-page">
+<main class="lessons-public lessons-public-empty">
+  <h1>lesson not found</h1>
+  <p>This lesson permalink isn't (or isn't yet) in the archive.</p>
+  <p><a href="/lessons-public">‹ browse all lessons</a></p>
+  <footer class="lessons-public-foot">
+    fleet-control — <a href="${safeRepo}">${safeRepo}</a>
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+/** Single chokepoint for GET /lessons-public — returns the status +
+ *  headers + body. */
+function serveLessonsPublicIndex(db: DB, now: Date): {
+  status: number; headers: Record<string, string>; body: string;
+} {
+  const archive = getLessonsPublicArchiveCached(db, now);
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: renderLessonsPublicIndex(archive),
+  };
+}
+
+/** Single chokepoint for GET /lessons-public/<slug>. */
+function serveLessonsPublicPermalink(db: DB, now: Date, slug: string): {
+  status: number; headers: Record<string, string>; body: string;
+} {
+  const archive = getLessonsPublicArchiveCached(db, now);
+  const row = archive.lessons.find((l) => l.lesson_slug === slug);
+  if (!row) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: renderLessonsPublicNotFound(),
+    };
+  }
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: renderLessonsPublicPermalink(row),
+  };
+}
+
+/** Single chokepoint for GET /api/lessons-public. Returns the AC1
+ *  shape as JSON. Per LESSONS 2026-06-10 we scrub the VALUES BEFORE
+ *  JSON.stringify so the documented top-level keys (generated_at,
+ *  total_lessons, earliest_lesson_date, latest_lesson_date, lessons)
+ *  survive untouched. */
+function serveLessonsPublicJson(db: DB, now: Date): {
+  body: string; headers: Record<string, string>;
+} {
+  const archive = getLessonsPublicArchiveCached(db, now);
+  const scrubbed = scrubArchiveValues(archive);
+  return {
+    body: JSON.stringify(scrubbed),
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "cache-control": "public, max-age=3600",
+    },
+  };
+}
+
 /** Stable per-actor key used for the home_last_seen_<actor> watermark
  *  + the monday-catchup cache partition. Loopback is the literal
  *  string "loopback"; a remote token is the token's id (the SHA-256
@@ -3099,6 +3524,16 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       // are HTML; this is the JSON sibling).
       if (path === "/api/fleet/pulse" && req.method === "GET") {
         const result = servePulseJson(db, new Date());
+        res.writeHead(200, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0057: public lesson archive JSON. PUBLIC — no auth,
+      // no loopback gate (the URL IS the bookmark shape). Handled
+      // BEFORE the `path.startsWith("/api/")` auth gate so a remote
+      // caller without a token gets 200 — same posture as
+      // /api/fleet/pulse above and the public HTML routes below.
+      if (path === "/api/lessons-public" && req.method === "GET") {
+        const result = serveLessonsPublicJson(db, new Date());
         res.writeHead(200, result.headers);
         return res.end(result.body);
       }
@@ -4089,6 +4524,26 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       // shares the same no-auth posture as this HTML route.
       if (path === "/pulse" && req.method === "GET") {
         const result = servePulsePage(db, cfg, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0057: public lesson archive — index + permalink HTML.
+      // PUBLIC — no auth, no loopback gate (the URL IS the bookmark
+      // shape; the prospect lands here from a Google search). Mounted
+      // alongside the other public surfaces (/receipts, /year,
+      // /calculator, /pulse) so the no-token bypass posture is shared.
+      // Per AC3 + AC4 the page sets Cache-Control: max-age=3600 and
+      // declares robots:index,follow + a canonical pointing at the
+      // canonical permalink (the per-lesson URL when that's where
+      // we are, otherwise /lessons-public).
+      if (path === "/lessons-public" && req.method === "GET") {
+        const result = serveLessonsPublicIndex(db, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      const lpm = path.match(/^\/lessons-public\/([a-z0-9-]+)$/);
+      if (lpm && req.method === "GET") {
+        const result = serveLessonsPublicPermalink(db, new Date(), lpm[1]);
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }

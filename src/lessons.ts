@@ -951,3 +951,238 @@ export function lessonOfTheDay(
     rotation_day_index: dayIndex,
   };
 }
+
+// Ticket 0057: public lesson archive.
+//
+// Pure helper that turns the parsed cross-fleet lessons file into the
+// anonymised public-archive payload. The companion routes
+// /lessons-public + /lessons-public/<slug> + /api/lessons-public live
+// in src/server.ts; this helper is purely a data shape. Composes the
+// existing parser via loadCrossLessons() — no new schema, no new
+// ingest, no new shell-out.
+//
+// Per LESSONS § "in-process dedup sets need an explicit reset hook for
+// tests" AND "expose a build counter for cache-hit tests, not a fetcher
+// swap": the route-side memo cache plus its reset and build-counter
+// seams live in src/server.ts where the route handler reads them. The
+// helper itself is pure — every call re-derives the payload from
+// loadCrossLessons() (which carries its own mtime memo inside the
+// server module).
+//
+// Per LESSONS § "time-pinned tests must NOT derive seed timestamps
+// from new Date()": the helper accepts opts.now so tests pin the
+// generated_at deterministically.
+//
+// Per LESSONS § "no backticks inside template-literal SQL strings":
+// this helper composes string substitutions, never SQL. The leading
+// comment intentionally avoids any backticked identifiers so a sibling
+// helper's character-window source-grep test (the lessonOfTheDay
+// AC10 backtick guard slices 4000 chars from that helper's start)
+// cannot pull SQL keywords out of this block by accident — per
+// LESSONS 2026-06-11 "character-window source greps leak into sibling
+// helpers".
+//
+// Anonymisation rules (one per AC1 bullet):
+//   - replace any known operator project slug (from the operator's
+//     actual project list) with a stable project-N alias, building
+//     the alias map deterministically from the slugs that appear in
+//     the lessons file in source order (this is the same shape as
+//     src/snapshot.ts anonymize() per ticket 0013).
+//   - replace any branch name matching (feat|chore|eng)/<rest> with
+//     the literal placeholder <branch>.
+//   - replace any absolute filesystem path under /Users/ or /home/
+//     with <path>.
+//   - replace any ticket-id reference ticket NNNN with the prose
+//     phrase "an agent ticket".
+//   - preserve every technical token: function names, error codes,
+//     SQL snippets, type expressions, code idioms.
+
+export interface LessonsPublicArchiveRow {
+  /** URL-safe kebab-case slug derived from (lesson_date + lesson_title);
+   *  guaranteed globally unique within one archive build (collisions
+   *  get a "-2", "-3" suffix). */
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  lesson_body_anonymised: string;
+  /** Per-lesson primary attribution alias. The literal "agent-fleet"
+   *  for the bootstrap project (its slug is already the public name
+   *  of the open-source kit); otherwise project-N where N is the
+   *  deterministic 1-indexed position the slug first appears in the
+   *  file. */
+  project_alias: string;
+}
+
+export interface LessonsPublicArchive {
+  generated_at: string;
+  total_lessons: number;
+  earliest_lesson_date: string;
+  latest_lesson_date: string;
+  lessons: LessonsPublicArchiveRow[];
+}
+
+export interface LessonsPublicArchiveOptions {
+  /** Pin the generated_at. Defaults to new Date(). */
+  now?: Date;
+  /** Optional pre-built slug→alias map. The route hands this in from a
+   *  project SELECT so operator-actual slugs (that may NOT appear in
+   *  the lessons file body but DO appear in the file's H2 headers via
+   *  a different casing) all collapse to the same alias. When omitted
+   *  the helper builds the map from the file's H2 slugs in source
+   *  order. */
+  projectAliasMap?: Record<string, string>;
+}
+
+/** The bootstrap project slug — kept un-aliased on purpose: it IS the
+ *  public name of the open-source kit (agent-fleet) so its lessons can
+ *  be attributed without anonymisation. Every OTHER operator slug
+ *  collapses to a project-N alias. */
+const PUBLIC_BOOTSTRAP_SLUG = "agent-fleet";
+
+/** Build a stable slug→alias map from the parsed lessons file. The
+ *  bootstrap slug keeps its real name; every other slug becomes
+ *  project-N where N is its 1-indexed appearance order. Callers can
+ *  override individual entries (e.g. the route handler may pass a
+ *  fuller alias map sourced from the operator's `project` table). */
+function buildAliasMap(parsed: CrossLessonsLoadResult): Record<string, string> {
+  const out: Record<string, string> = {};
+  let n = 1;
+  for (const p of parsed.projects) {
+    const slug = String(p.slug ?? "").trim();
+    if (!slug) continue;
+    if (slug === PUBLIC_BOOTSTRAP_SLUG) {
+      out[slug] = PUBLIC_BOOTSTRAP_SLUG;
+    } else {
+      if (!(slug in out)) {
+        out[slug] = "project-" + String(n);
+        n += 1;
+      }
+    }
+  }
+  return out;
+}
+
+/** Escape regex special characters in a literal substring so we can
+ *  build a global regex that strips it from a body. */
+function reEscape(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Anonymise one lesson body string per the AC1 rules. The technical
+ *  tokens (function names, type expressions, error codes) are NOT
+ *  enumerated explicitly — they survive by NOT matching any of the
+ *  anonymisation patterns. Operator-supplied identifiers are matched
+ *  by structural shape (slug appears in alias map, branch matches the
+ *  agent prefix, path starts with /Users/ or /home/, ticket follows
+ *  the literal word "ticket"). */
+function anonymiseLessonBody(body: string, aliasMap: Record<string, string>): string {
+  let out = String(body ?? "");
+  // 1. Operator slugs → alias. Order LONGEST-FIRST so a slug that's a
+  //    prefix of another (e.g. "courtiq" vs "courtiq-prod") doesn't
+  //    pre-empt the longer match.
+  const slugs = Object.keys(aliasMap).slice().sort((a, b) => b.length - a.length);
+  for (const slug of slugs) {
+    if (!slug) continue;
+    if (slug === PUBLIC_BOOTSTRAP_SLUG) continue; // keep the public name verbatim
+    const alias = aliasMap[slug] ?? "project-?";
+    // Use a bounded character class around the slug to avoid eating
+    // adjacent identifier characters. Word-boundary alone is too
+    // forgiving for slugs that carry hyphens.
+    const re = new RegExp("(^|[^A-Za-z0-9_-])" + reEscape(slug) + "(?![A-Za-z0-9_-])", "g");
+    out = out.replace(re, (_m, pre) => String(pre) + alias);
+  }
+  // 2. Branch names matching the agent prefixes → <branch>. Capture
+  //    the leading prefix + a permissive identifier tail.
+  out = out.replace(/\b(feat|chore|eng)\/[A-Za-z0-9/_.-]+/g, "<branch>");
+  // 3. Absolute filesystem paths under /Users/ or /home/ → <path>.
+  //    The path tail is permissive: anything up to whitespace or a
+  //    sentence-terminating punctuation.
+  out = out.replace(/\/(?:Users|home)\/[^\s,;)]+/g, "<path>");
+  // 4. Ticket-id references "ticket NNNN" → "an agent ticket".
+  out = out.replace(/\bticket\s+\d{3,5}\b/gi, "an agent ticket");
+  return out;
+}
+
+/** Derive a URL-safe kebab-case slug from (lesson_date + lesson_title).
+ *  Lowercase, ASCII-only, strips every character outside [a-z0-9-],
+ *  collapses runs of "-" to a single hyphen, and trims leading/trailing
+ *  hyphens. The caller is responsible for disambiguation via a seen-set. */
+function slugifyLesson(date: string, title: string): string {
+  const raw = String(date ?? "") + " " + String(title ?? "");
+  let s = raw.toLowerCase();
+  s = s.replace(/[^a-z0-9]+/g, "-");
+  s = s.replace(/-+/g, "-");
+  s = s.replace(/^-+|-+$/g, "");
+  if (!s) s = "lesson";
+  return s;
+}
+
+/** Disambiguate a slug against a seen-set: if the candidate already
+ *  exists, append "-2", "-3", … until we find a free slot. */
+function uniqueSlug(seen: Set<string>, candidate: string): string {
+  if (!seen.has(candidate)) return candidate;
+  let n = 2;
+  for (;;) {
+    const cand = candidate + "-" + String(n);
+    if (!seen.has(cand)) return cand;
+    n += 1;
+  }
+}
+
+/** Build the public-archive payload. Reads the lessons file via
+ *  loadCrossLessons (which carries its own mtime guard internally), runs
+ *  the anonymisation pass per row, derives a unique slug per row, and
+ *  returns the documented shape. Undated lessons are dropped — the
+ *  public archive is keyed off (date + title) and a missing date breaks
+ *  both the URL slug AND the chronological sort. */
+export function lessonsPublicArchive(
+  opts: LessonsPublicArchiveOptions = {},
+): LessonsPublicArchive {
+  const now = opts.now ?? new Date();
+  const lessonsPath = defaultLessonsPath();
+  const parsed = loadCrossLessons(lessonsPath);
+  const aliasMap = opts.projectAliasMap ?? buildAliasMap(parsed);
+
+  const rows: LessonsPublicArchiveRow[] = [];
+  const seenSlugs = new Set<string>();
+
+  // Walk projects in source order so the alias map's 1-indexed
+  // appearance assignment matches the bodies' anonymisation order.
+  for (const p of parsed.projects) {
+    const projectSlug = String(p.slug ?? "").trim();
+    const alias = aliasMap[projectSlug] ?? (
+      projectSlug === PUBLIC_BOOTSTRAP_SLUG
+        ? PUBLIC_BOOTSTRAP_SLUG
+        : ("project-" + String(Object.keys(aliasMap).length + 1))
+    );
+    for (const l of p.lessons) {
+      if (!l.date) continue;
+      const title = String(l.title ?? "").trim();
+      const body = String(l.body ?? "");
+      const cand = slugifyLesson(l.date, title);
+      const slug = uniqueSlug(seenSlugs, cand);
+      seenSlugs.add(slug);
+      rows.push({
+        lesson_slug: slug,
+        lesson_date: l.date,
+        lesson_title: title,
+        lesson_body_anonymised: anonymiseLessonBody(body, aliasMap),
+        project_alias: alias,
+      });
+    }
+  }
+
+  let earliest = "";
+  let latest = "";
+  for (const r of rows) {
+    if (!earliest || r.lesson_date < earliest) earliest = r.lesson_date;
+    if (!latest || r.lesson_date > latest) latest = r.lesson_date;
+  }
+  return {
+    generated_at: now.toISOString(),
+    total_lessons: rows.length,
+    earliest_lesson_date: earliest,
+    latest_lesson_date: latest,
+    lessons: rows,
+  };
+}
