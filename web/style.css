@@ -1982,3 +1982,53 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .lesson-of-the-day-saved { grid-column: 2 / 3; grid-row: 2 / 4;
     align-self: center; justify-self: end; }
 }
+
+/* Ticket 0053: project graveyard. One long single-column ledger of
+ * paused / sunset projects, designed for a Sunday-evening "what did I
+ * sunset" review. Subdued palette — the page is a memory aid, not a
+ * dashboard. The desktop layout (>=900px) puts each row on a single
+ * monospaced line; mobile (<=600px) stacks the slug, paused-at, and
+ * action button vertically per the AC7 contract. */
+.graveyard { font-family: var(--sans); padding: 0 0 40px; }
+.graveyard-summary { padding: 18px 0 16px; border-bottom: 1px solid var(--line);
+  margin-bottom: 14px; }
+.graveyard-headline { font-size: 22px; font-weight: 600;
+  letter-spacing: -.01em; margin: 0 0 6px; }
+.graveyard-summary-row { font-family: var(--mono);
+  font-size: 12.5px; color: var(--dim); }
+.graveyard-summary-row span { color: var(--ink); font-weight: 500; }
+.graveyard-list { list-style: none; padding: 0; margin: 0; }
+.graveyard-row { display: grid; grid-template-columns: 1fr;
+  gap: 4px 14px; padding: 14px 0; border-bottom: 1px solid var(--line);
+  font-family: var(--mono); font-size: 12.5px; color: var(--dim); }
+.graveyard-row .graveyard-row-slug { font-family: var(--sans);
+  font-size: 15px; font-weight: 600; color: var(--ink); }
+.graveyard-row [data-testid$="-merged-prs"],
+.graveyard-row [data-testid$="-spend"],
+.graveyard-row [data-testid$="-roi"] { color: var(--ink); }
+.graveyard-revive { display: inline-block; margin-top: 6px;
+  padding: 6px 12px; border: 1px solid var(--line); border-radius: var(--r);
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  min-height: var(--tap-min); line-height: 28px; }
+.graveyard-revive:hover { border-color: var(--accent); }
+
+/* Desktop: single inline row. */
+@media (min-width: 900px) {
+  .graveyard-row { grid-template-columns: 1.6fr 1fr 1fr 1fr 1fr 1fr auto;
+    align-items: baseline; }
+}
+
+/* Mobile: stack vertically per AC7. No horizontal scroll. */
+@media (max-width: 600px) {
+  .graveyard-row { grid-template-columns: 1fr; padding: 14px 4px; }
+  .graveyard-revive { width: 100%; text-align: center; }
+}
+
+/* Ticket 0053: project-page cross-link banner. Informational only —
+ * a single line above the action group that names the pause reason +
+ * date and links to the graveyard. Subdued; not a modal. */
+.project-paused-banner { margin: 12px 0; padding: 8px 12px;
+  border-radius: var(--r); font-family: var(--mono); font-size: 12.5px;
+  background: rgba(141,141,131,.08);
+  border: 1px solid var(--paused); color: var(--dim); }
+.project-paused-banner a { color: var(--accent); text-decoration: underline; }

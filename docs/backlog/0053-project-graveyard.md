@@ -1,12 +1,33 @@
 ---
 id: 0053
 title: Project graveyard — paused / sunset projects get a memorial page tallying lifetime ROI and what they taught the fleet
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-10
 owner: gtm-innovation
 ---
+
+## Implementation log
+
+- 2026-06-11 implementation-dev: branched feat/0053-project-graveyard.
+  Producer reconciliation per LESSONS 2026-06-05:
+  * `project_pause.reason` actually written by `src/budget_guard.ts:187`
+    is the literal `'cost_cap'` (lowercase, snake-case). The schema
+    docstring (`src/db.ts:185`) reserves `'manual'` for future use but
+    v1 never writes it. Spec named `'budget'`/`'budget_cap'`/`'sunset'`/
+    `'sunset_candidate'` — none of these literals exist on disk today.
+    Classification map: `'cost_cap'`/`'budget'`/`'budget_cap'` →
+    `"budget_autopause"`; `'sunset'`/`'sunset_candidate'` →
+    `"sunset_verdict"`; anything else (incl. null) → `"manual"`. The
+    `'budget'`/`'sunset'` arms are forward-compat for a future writer.
+  * `project_pause` schema (`src/db.ts:189-195`): PK is `project_id`
+    (not `(project_slug, ...)` as the spec hedged). No `active` column
+    — a row's mere presence means paused (matches the 0054 pulse
+    reconciliation at `src/views.ts:6576`). Cache invalidation tuple
+    uses `(MAX(triggered_at), COUNT(*))` since there's no `paused_at`
+    column either; `triggered_at` is the producer's spelling.
+  * `pr.state = 'MERGED'` uppercase (matches `src/ingest/prs.ts:152`).
 
 ## User story
 

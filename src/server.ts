@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -702,6 +702,246 @@ function redactLessonOfTheDayPick(
     lesson_title: redactSecretsForLessonOfTheDay(pick.lesson_title),
     lesson_excerpt: redactSecretsForLessonOfTheDay(pick.lesson_excerpt),
   };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0053 — Project graveyard cache + renderer-direct seam.
+//
+// 30-minute TTL (matches the route's Cache-Control: max-age=1800).
+// Cache key is the empty string (the graveyard is fleet-wide); the
+// invalidation tuple uses (MAX(triggered_at), COUNT(*) FROM
+// project_pause, MAX(fetched_at), COUNT(*) FROM pr WHERE state =
+// 'MERGED') so a fresh pause OR a fresh merged PR row busts the
+// cache. Per LESSONS 2026-06-07 the `pr` table has no surrogate id;
+// (MAX(fetched_at), COUNT(*)) is the canonical "fresh row landed"
+// proxy. project_pause's PK is project_id, so we use the same
+// (MAX(triggered_at), COUNT(*)) pair.
+//
+// Per LESSONS in-process dedup sets need a reset hook we expose
+// _resetGraveyardCacheForTests. Per LESSONS expose a build counter
+// for cache-hit tests we also expose
+// _getGraveyardCacheBuildsForTests; it ticks on every cache MISS so
+// route tests assert hit/miss semantics without stubbing SQL.
+// Production code never reads either.
+//
+// Per LESSONS 2026-06-05 break ingest-to-server cycles via a
+// globalThis slot: the invalidation function is registered on
+// globalThis.__fleet_graveyard_invalidate__ from this module at load
+// time and read lazily off the slot by src/ingest/index.ts AND
+// src/control.ts (the pause/unpause flip is the producer-side
+// trigger that ALSO needs to bust the cache, per the ticket's
+// engineering notes).
+// ────────────────────────────────────────────────────────────────────
+
+const GRAVEYARD_TTL_MS = 1_800_000; // 30 minutes — matches Cache-Control.
+interface GraveyardCacheEntry {
+  tuple: string;
+  value: ProjectGraveyard;
+  expires_at: number;
+}
+const graveyardCache = new Map<string, GraveyardCacheEntry>();
+let graveyardBuildCounter = 0;
+
+export function _resetGraveyardCacheForTests(): void {
+  graveyardCache.clear();
+  graveyardBuildCounter = 0;
+}
+
+export function _getGraveyardCacheBuildsForTests(): number {
+  return graveyardBuildCounter;
+}
+
+interface GraveyardPauseTupleRow { mx: string | null; c: number | null; }
+interface GraveyardPrTupleRow { mx: string | null; c: number | null; }
+
+function graveyardInvalidationTuple(db: DB): string {
+  const pause = db.prepare(
+    "SELECT MAX(triggered_at) AS mx, COUNT(*) AS c FROM project_pause",
+  ).get() as unknown as GraveyardPauseTupleRow | undefined;
+  // Per LESSONS 2026-06-07, NEVER MAX(pr.id) — the pr table has no
+  // surrogate id. (MAX(fetched_at), COUNT(*)) is the canonical
+  // composite-PK proxy for fresh row landed.
+  const pr = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr WHERE state = 'MERGED'",
+  ).get() as unknown as GraveyardPrTupleRow | undefined;
+  const pmx = pause?.mx ?? "";
+  const pc = Number(pause?.c ?? 0);
+  const prmx = pr?.mx ?? "";
+  const prc = Number(pr?.c ?? 0);
+  return "p=" + pmx + "|pc=" + pc + "|pr=" + prmx + "|prc=" + prc;
+}
+
+/** Scrub token-shaped substrings from operator-visible STRING VALUES
+ *  on the graveyard payload BEFORE the rollup is JSON-encoded. Per
+ *  LESSONS 2026-06-10 "redactSecrets on a JSON body shreds your KEYS":
+ *  we scrub the values (project_name, pause_reason_raw, etc.), NEVER
+ *  the body string. project_name originates from operator-supplied
+ *  repo metadata; pause_reason_raw is producer-written and effectively
+ *  closed-set, but we scrub it for defence-in-depth at the renderer
+ *  boundary. Numeric + structural fields stay byte-identical. */
+function redactSecretsForGraveyard(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+function redactGraveyard(value: ProjectGraveyard): ProjectGraveyard {
+  return {
+    ...value,
+    projects: value.projects.map((r) => ({
+      ...r,
+      project_slug: redactSecretsForGraveyard(r.project_slug),
+      project_name: redactSecretsForGraveyard(r.project_name),
+      pause_reason_raw: redactSecretsForGraveyard(r.pause_reason_raw),
+    })),
+  };
+}
+
+/** Look up a fresh graveyard rollup from the memo cache; rebuild on
+ *  miss. The build counter ticks on every miss so route tests can
+ *  assert hit/miss semantics without stubbing SQL. */
+function getGraveyardCached(db: DB, now: Date): ProjectGraveyard {
+  const tuple = graveyardInvalidationTuple(db);
+  const key = "v1";
+  const hit = graveyardCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  graveyardBuildCounter += 1;
+  const inner = projectGraveyard(db, { now });
+  const value = redactGraveyard(inner);
+  graveyardCache.set(key, { tuple, value, expires_at: Date.now() + GRAVEYARD_TTL_MS });
+  return value;
+}
+
+/** Cache-invalidation hook fired from runIngestPass (after the ingest
+ *  pass COMMITs) AND from src/control.ts (pause / unpause flip).
+ *  Registered on the globalThis slot per LESSONS 2026-06-05. */
+export function _invalidateGraveyardCacheAfterIngest(): void {
+  graveyardCache.clear();
+}
+
+(globalThis as { __fleet_graveyard_invalidate__?: () => void })
+  .__fleet_graveyard_invalidate__ = _invalidateGraveyardCacheAfterIngest;
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0053 — Renderer-direct seam for the graveyard page.
+//
+// Per LESSONS 2026-06-11 "startServer() tests that mutate fleet-
+// control.config.json race against parallel test files": cfg-dependent
+// branches (quiet hours, per-project overrides) MUST be driven via a
+// renderer-direct seam, never via a non-default config plant. The seam
+// takes a payload + a quietHoursActive boolean and returns the exact
+// HTML the SPA's render path would emit. The boot-path test in
+// graveyard.test.ts asserts route wiring; this seam asserts the
+// quiet/loud branch.
+// ────────────────────────────────────────────────────────────────────
+
+function escForGraveyard(v: unknown): string {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function humanPauseReason(label: string): string {
+  if (label === "budget_autopause") return "budget autopause";
+  if (label === "sunset_verdict") return "sunset verdict";
+  return "manual pause";
+}
+
+function formatGraveyardDate(iso: string): string {
+  if (!iso) return "";
+  return iso.slice(0, 10);
+}
+
+function formatGraveyardUsd(n: number): string {
+  return "$" + (Math.round(n * 100) / 100).toFixed(2);
+}
+
+function formatGraveyardRoi(n: number | null): string {
+  if (n == null || !Number.isFinite(n)) return "n/a";
+  return n.toFixed(1) + "x";
+}
+
+function renderGraveyardRow(
+  r: GraveyardProjectRow, quietHoursActive: boolean,
+): string {
+  const slug = escForGraveyard(r.project_slug);
+  const name = escForGraveyard(r.project_name);
+  const pausedAt = escForGraveyard(formatGraveyardDate(r.paused_at));
+  const reason = escForGraveyard(humanPauseReason(r.pause_reason));
+  const merged = String(r.lifetime_merged_prs);
+  const spend = escForGraveyard(formatGraveyardUsd(r.lifetime_spend_usd));
+  const roi = escForGraveyard(formatGraveyardRoi(r.lifetime_roi_multiplier));
+  const reviveBtn = quietHoursActive
+    ? ""
+    : '<a class="graveyard-revive" href="#/p/' + slug + '"'
+      + ' data-testid="graveyard-row-' + slug + '-revive">consider reviving</a>';
+  return '<li class="graveyard-row" data-testid="graveyard-row-' + slug + '">'
+    + '<span class="graveyard-row-slug">' + name + '</span>'
+    + '<span data-testid="graveyard-row-' + slug + '-paused-at">' + pausedAt + '</span>'
+    + '<span data-testid="graveyard-row-' + slug + '-reason">' + reason + '</span>'
+    + '<span data-testid="graveyard-row-' + slug + '-merged-prs">' + merged + '</span>'
+    + '<span data-testid="graveyard-row-' + slug + '-spend">' + spend + '</span>'
+    + '<span data-testid="graveyard-row-' + slug + '-roi">' + roi + '</span>'
+    + reviveBtn
+    + '</li>';
+}
+
+/** Renderer-direct seam exported for tests. Production callers go
+ *  through the SPA hash route in web/app.js; this function returns
+ *  the same HTML shape so the cfg-dependent branch (quietHoursActive)
+ *  can be unit-tested without booting startServer(). */
+export function _renderGraveyardPageForTests(
+  payload: ProjectGraveyard,
+  opts: { quietHoursActive: boolean },
+): string {
+  const quiet = !!opts.quietHoursActive;
+  if (payload.summary.paused_count === 0) {
+    return '<section class="graveyard" data-testid="graveyard">'
+      + '<p data-testid="graveyard-empty">the fleet is fully active &mdash; no sunset history to remember yet.</p>'
+      + '</section>';
+  }
+  const verb = quiet ? "resting" : "paused";
+  const headline = String(payload.summary.paused_count) + " projects " + verb;
+  const pausedCount = String(payload.summary.paused_count);
+  const mergedPrs = String(payload.summary.lifetime_merged_prs);
+  const spend = escForGraveyard(formatGraveyardUsd(payload.summary.lifetime_spend_usd));
+  const lessons = String(payload.summary.lessons_authored);
+  const rows = payload.projects.map((r) => renderGraveyardRow(r, quiet)).join("");
+  return '<section class="graveyard" data-testid="graveyard">'
+    + '<header class="graveyard-summary" data-testid="graveyard-summary">'
+    + '<h1 class="graveyard-headline">' + escForGraveyard(headline) + '</h1>'
+    + '<span data-testid="graveyard-summary-paused-count">' + pausedCount + '</span>'
+    + '<span data-testid="graveyard-summary-merged-prs">' + mergedPrs + '</span>'
+    + '<span data-testid="graveyard-summary-spend">' + spend + '</span>'
+    + '<span data-testid="graveyard-summary-lessons">' + lessons + '</span>'
+    + '</header>'
+    + '<ul class="graveyard-list">' + rows + '</ul>'
+    + '</section>';
+}
+
+/** Renderer-direct seam for the project-page paused banner. Returns
+ *  the inline banner HTML when the project IS paused; the empty
+ *  string when it's not. The href always points at the graveyard
+ *  hash route per AC9. */
+export function _renderProjectPausedBannerForTests(
+  info: { paused_reason: string; paused_at: string } | null,
+): string {
+  if (!info) return "";
+  const reason = escForGraveyard(humanPauseReason(info.paused_reason));
+  const at = escForGraveyard(formatGraveyardDate(info.paused_at));
+  return '<div class="project-paused-banner" data-testid="project-paused-banner">'
+    + 'Paused via ' + reason + ' on ' + at + ' &mdash; '
+    + '<a href="#/graveyard">see graveyard for the full record</a>'
+    + '</div>';
 }
 
 /** Clamp the ?window=<days> query param for the savings route.
@@ -3472,6 +3712,28 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=3600",
+          });
+          return res.end(body);
+        }
+        // Ticket 0053: project graveyard. Returns the documented
+        // rollup of paused projects' lifetime ROI, with the cross-
+        // fleet lessons their failures attributed counted per row.
+        // Composes existing project / project_pause / pr /
+        // cost_rollup_day / lesson_credit tables — no new schema.
+        // Cache-Control: max-age=1800 (30 min) — paused-project
+        // state moves slowly. Per LESSONS § "defence-in-depth secret
+        // redaction at the renderer boundary" the response routes
+        // through redactSecretsForGraveyard before res.end. Per
+        // LESSONS 2026-06-10 we scrub the VALUES, not the JSON body,
+        // so structural fields (paused_count, lifetime_merged_prs)
+        // survive untouched.
+        if (path === "/api/fleet/graveyard") {
+          const value = getGraveyardCached(db, new Date());
+          const body = JSON.stringify(value);
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=1800",
           });
           return res.end(body);
         }

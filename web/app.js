@@ -2882,12 +2882,18 @@ async function project(slug, params) {
     ? `<div class="banner bad">Hit Claude usage limit on ${PHASE[p.usageLimit.phase] || p.usageLimit.phase} · ${p.usageLimit.until ? "back in service " + until(p.usageLimit.until) : "until the next reset"}. Subsequent runs will keep failing until then — no need to act.</div>` : "";
   const akBanner = p.autoKill && (Date.now() - new Date(p.autoKill.ts).getTime() < 60 * 60_000)
     ? `<div class="banner">Auto-healed ${PHASE[p.autoKill.phase] || p.autoKill.phase} ${ago(p.autoKill.ts)} (was hung ${p.autoKill.mins}m) so the next scheduled run could fire.</div>` : "";
+  // Ticket 0053: paused-project cross-link to the graveyard. Informational
+  // only — does not block any existing project-page content. The href
+  // always points at the graveyard hash route per the AC9 spec.
+  const pauseBanner = p.paused_at
+    ? `<div class="project-paused-banner" data-testid="project-paused-banner">Paused via ${esc(graveyardHumanReason(p.pause_reason))} on ${esc(String(p.paused_at).slice(0,10))} — <a href="#/graveyard">see graveyard for the full record</a></div>`
+    : "";
   app.innerHTML = `<a class="back" href="#/">‹ all projects</a>
     <div class="card-head" style="margin-bottom:6px"><span class="pname">${esc(p.name)}</span>
       <span class="state"><span class="dot ${cls}"></span>${label}</span></div>
     <div class="metarow"><span class="dim mono">${esc(p.repo)}</span>
       ${p.selfCancelDays != null ? `<span>${p.selfCancelDays < 0 ? "stopped" : "keeps running " + p.selfCancelDays + "d"}</span>` : ""}</div>
-    ${ulBanner}${akBanner}${nowBanner(nowEv)}
+    ${pauseBanner}${ulBanner}${akBanner}${nowBanner(nowEv)}
     <div id="live-now" class="live-now hidden"></div>
     <div class="actions">
       ${p.selfCancelDays != null && p.selfCancelDays <= 7 ? `<button class="btn primary" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>` : `<button class="btn" data-act="keep-running" data-slug="${p.slug}" data-days="30">Keep it running (+30 days)</button>`}
@@ -4430,6 +4436,94 @@ async function lessons(params) {
   }
 }
 
+// ---- Ticket 0053: project graveyard ------------------------------------
+//
+// One long single-column list of paused / sunset projects with their
+// lifetime ROI. Composes the /api/fleet/graveyard memo'd payload (30-min
+// route cache; server-side cache invalidation runs on every ingest tick
+// AND on pause/unpause flips via the globalThis slot).
+//
+// Per LESSONS § "defence-in-depth secret redaction at the renderer
+// boundary" every operator-visible string passes through redactSecrets.
+// The server already scrubs project_name + project_slug + pause_reason_raw,
+// but the SPA carries its own backstop for the moment a future cached
+// payload survives a server-side scrub regression.
+
+function graveyardHumanReason(label) {
+  if (label === "budget_autopause") return "budget autopause";
+  if (label === "sunset_verdict") return "sunset verdict";
+  return "manual pause";
+}
+
+function graveyardRow(r, quietHoursActive) {
+  const slug = esc(redactSecrets(String(r.project_slug || "")));
+  const name = esc(redactSecrets(String(r.project_name || r.project_slug || "")));
+  const pausedAt = esc(String(r.paused_at || "").slice(0, 10));
+  const reason = esc(graveyardHumanReason(r.pause_reason));
+  const merged = esc(String(r.lifetime_merged_prs ?? 0));
+  const spend = esc(usd(r.lifetime_spend_usd));
+  const roiNum = r.lifetime_roi_multiplier;
+  const roi = esc((roiNum == null || !Number.isFinite(roiNum)) ? "n/a" : roiNum.toFixed(1) + "x");
+  const reviveBtn = quietHoursActive
+    ? ""
+    : `<a class="graveyard-revive" href="#/p/${slug}" data-testid="graveyard-row-${slug}-revive">consider reviving</a>`;
+  return `<li class="graveyard-row" data-testid="graveyard-row-${slug}">
+    <span class="graveyard-row-slug">${name}</span>
+    <span data-testid="graveyard-row-${slug}-paused-at">${pausedAt}</span>
+    <span data-testid="graveyard-row-${slug}-reason">${reason}</span>
+    <span data-testid="graveyard-row-${slug}-merged-prs">${merged}</span>
+    <span data-testid="graveyard-row-${slug}-spend">${spend}</span>
+    <span data-testid="graveyard-row-${slug}-roi">${roi}</span>
+    ${reviveBtn}
+  </li>`;
+}
+
+async function graveyard() {
+  // The route is public-read; loopback skips auth automatically.
+  const payload = await get("/api/fleet/graveyard");
+  // Quiet-hours signal: the cross-fleet glance payload carries the
+  // `quiet_hours_active` boolean. Read it once on render — a midnight
+  // viewer doesn't get pushed into an impulsive revive.
+  let quietHoursActive = false;
+  try {
+    const glance = await get("/api/fleet/glance");
+    quietHoursActive = !!(glance && glance.quiet_hours_active);
+  } catch { /* glance is best-effort — default to NOT quiet */ }
+
+  summary.innerHTML = `<a href="#/" class="dim">‹ home</a>`;
+
+  if (!payload || !payload.summary || payload.summary.paused_count === 0) {
+    app.innerHTML = `<section class="graveyard" data-testid="graveyard">
+      <a class="back" href="#/">‹ home</a>
+      <p data-testid="graveyard-empty">the fleet is fully active — no sunset history to remember yet.</p>
+    </section>`;
+    foot.textContent = "";
+    return;
+  }
+
+  const verb = quietHoursActive ? "resting" : "paused";
+  const pausedCount = String(payload.summary.paused_count);
+  const mergedPrs = String(payload.summary.lifetime_merged_prs);
+  const spend = esc(usd(payload.summary.lifetime_spend_usd));
+  const lessons = String(payload.summary.lessons_authored);
+  const headline = `${pausedCount} projects ${verb}`;
+  const rows = payload.projects.map((r) => graveyardRow(r, quietHoursActive)).join("");
+  app.innerHTML = `<section class="graveyard" data-testid="graveyard">
+    <a class="back" href="#/">‹ home</a>
+    <header class="graveyard-summary" data-testid="graveyard-summary">
+      <h1 class="graveyard-headline">${esc(headline)}</h1>
+      <div class="graveyard-summary-row">
+        <span data-testid="graveyard-summary-paused-count">${esc(pausedCount)}</span> projects ·
+        <span data-testid="graveyard-summary-merged-prs">${esc(mergedPrs)}</span> lifetime merged PRs ·
+        <span data-testid="graveyard-summary-spend">${spend}</span> lifetime spend ·
+        <span data-testid="graveyard-summary-lessons">${esc(lessons)}</span> lessons authored
+      </div>
+    </header>
+    <ul class="graveyard-list">${rows}</ul>
+  </section>`;
+  foot.textContent = "";
+}
+
 async function route() {
   stop();
   const h = location.hash || "#/";
@@ -4483,6 +4577,13 @@ async function route() {
       // home view's 5s refresh picks up new numbers via the summary
       // line.
       await costPerPr();
+    } else if (path === "graveyard" || path.startsWith("graveyard")) {
+      // Ticket 0053: project graveyard. One-shot render — the page
+      // composes a 30-min memo'd rollup of paused projects; the home
+      // grid's 5s refresh is irrelevant here (paused projects don't
+      // move minute-to-minute). The page is self-contained; no
+      // polling timer.
+      await graveyard();
     } else if (path.startsWith("year/")) {
       // Ticket 0050: fleet year-in-review. The page is a SELF-CONTAINED
       // server-rendered HTML document (like /receipts/<slug>/<month>);
