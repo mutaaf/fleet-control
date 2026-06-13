@@ -1,7 +1,7 @@
 ---
 id: 0058
 title: Public failure-mode landing pages - anonymised /failures/<signature> SEO surface authored from real cross-project correlations the fleet caught
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-13
@@ -449,4 +449,18 @@ already uses `pr.state = 'open'` - mirror that casing.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13: scoping commit — branch `feat/0058-public-failure-mode-landing-pages`
+  off origin/main; ticket flipped groomed → in-progress; index row updated.
+  Plan: TDD one test() per AC in `tests/failure-modes.test.ts`, then add
+  `fleetFailureModes()` next to `riskiestOpenPr` / `stuckPrTaxonomy` in
+  src/views.ts (PLAIN PROSE comment per LESSONS 2026-06-11), three public
+  HTML/JSON routes in src/server.ts (mounted BEFORE the
+  `path.startsWith("/api/")` auth gate, mirroring `/api/lessons-public`),
+  exposed renderer-direct seams `_renderFailureModesPageForTests` /
+  `_renderFailurePermalinkForTests`, cache reset + builds counter, globalThis
+  invalidation slot `__fleet_failure_modes_invalidate__`. PRODUCER-VS-SPEC:
+  `pr.state = 'open'` lowercase (confirmed in src/correlate.ts:111 + src/views.ts:3217),
+  `correlation_signature` column on `anomaly` is lowercase (confirmed in
+  src/db.ts:340 ALTER TABLE), no surrogate `id` on `pr` so cache tuple uses
+  `(MAX(fetched_at), COUNT(*))`. Tests anchor every seed timestamp to the
+  pinned NOW. Anonymisation reuses 0057's anonymiser via a shared helper.
