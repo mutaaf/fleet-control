@@ -1,7 +1,7 @@
 ---
 id: 0060
 title: Embeddable HTML pulse widget - paste-one-line snippet that drops a live fleet pulse into any personal blog or README so every reader becomes a fleet-control prospect
-status: groomed
+status: in-progress
 priority: P2
 area: portal
 created: 2026-06-13
@@ -440,4 +440,22 @@ tuple uses `(MAX(pr.fetched_at), COUNT(*))` over `pr`, mirroring 0040 /
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13: Picked up the ticket. Branch
+  `feat/0060-embeddable-fleet-pulse-widget`. Plan:
+  - Add the embed renderer as `src/embed.ts` (new module so it neither
+    creates a views.ts<->X cycle nor reaches into server.ts) with the
+    `_renderEmbedPulseHtmlForTests` / `_renderEmbedPulseSvgForTests`
+    seams.
+  - Mount `GET /embed/pulse.html` + `GET /embed/pulse.svg` in
+    `src/server.ts` BEFORE the `path.startsWith("/api/")` auth gate so
+    they share the public posture of `/pulse`.
+  - Memo the embed payload behind a `(MAX(pr.fetched_at), COUNT(*),
+    MAX(run.started_at), COUNT(*))` tuple per LESSONS 2026-06-07 (no
+    surrogate `id` on `pr`).
+  - Register `globalThis.__fleet_embed_pulse_invalidate__` per
+    LESSONS 2026-06-05.
+  - Add optional `embedOrigins: string[]` to `src/config.ts`.
+  - Add a new authed `GET /share` HTML page that surfaces the three
+    copy-pastable snippets (iframe / img / markdown). The existing
+    `GET /share/<token>` snapshot route stays untouched.
+  - One `tests/embed-pulse.test.ts` with one `test(...)` per AC.

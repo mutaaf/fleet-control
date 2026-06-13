@@ -42,6 +42,11 @@ import {
 } from "./receipts.ts";
 import { renderBadge, projectBadge, parseMetric } from "./badge.ts";
 import {
+  renderEmbedPulseHtml, renderEmbedPulseSvg,
+  composeEmbedFrameHeaders, renderSharePage as renderEmbedSharePage,
+} from "./embed.ts";
+import { discoverLanUrl } from "./lan.ts";
+import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
   type Scope, type TokenRecord,
 } from "./auth.ts";
@@ -2971,6 +2976,146 @@ function servePulseJson(db: DB, now: Date): { body: string; headers: Record<stri
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Ticket 0060: embeddable fleet-pulse widget.
+//
+// Two PUBLIC routes (no auth, no loopback gate):
+//   GET /embed/pulse.html → self-contained 300x180 HTML iframe content
+//   GET /embed/pulse.svg  → hand-rolled 300x180 SVG image fallback
+//
+// Both routes share a per-tuple memo cache. The cache invalidation
+// tuple is (MAX(pr.fetched_at), COUNT(*) over pr in week,
+// MAX(run.started_at), COUNT(*) over run in week) — never MAX(id),
+// per LESSONS 2026-06-07. Per LESSONS section reset hook + build
+// counter we expose _resetEmbedPulseCacheForTests and
+// _getEmbedPulseCacheBuildsForTests. Per LESSONS 2026-06-05 we
+// register the ingest invalidation function on
+// globalThis.__fleet_embed_pulse_invalidate__.
+const EMBED_PULSE_TTL_MS = 300_000; // 5 minutes — embed updates faster than /pulse's 1h.
+interface EmbedPulseCacheEntry {
+  tuple: string;
+  value: FleetWeeklyPulse;
+  expires_at: number;
+}
+const embedPulseCache = new Map<string, EmbedPulseCacheEntry>();
+let embedPulseBuildCounter = 0;
+
+export function _resetEmbedPulseCacheForTests(): void {
+  embedPulseCache.clear();
+  embedPulseBuildCounter = 0;
+}
+
+export function _getEmbedPulseCacheBuildsForTests(): number {
+  return embedPulseBuildCounter;
+}
+
+interface EmbedPulsePrTupleRow { mx: string | null; c: number | null; }
+interface EmbedPulseRunTupleRow { mx: string | null; c: number | null; }
+
+function embedPulseInvalidationTuple(db: DB, weekStartIso: string, weekEndIso: string): string {
+  // PR signal scoped to the week: (MAX(fetched_at), COUNT(*)) over rows
+  // whose date(fetched_at) falls in the inclusive window. Per LESSONS
+  // 2026-06-07 the pr table carries NO surrogate id column — proxy
+  // "fresh row landed" via the pair.
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr "
+    + " WHERE date(fetched_at) >= ? "
+    + "   AND date(fetched_at) <= ?",
+  ).get(weekStartIso, weekEndIso) as unknown as EmbedPulsePrTupleRow | undefined;
+  // Run signal scoped to the week: (MAX(started_at), COUNT(*)) so a
+  // freshly-landed run row (which moves cost_rollup_day via the ingest
+  // recompute step) also busts the cache.
+  const runRow = db.prepare(
+    "SELECT MAX(started_at) AS mx, COUNT(*) AS c FROM run "
+    + " WHERE date(started_at) >= ? "
+    + "   AND date(started_at) <= ?",
+  ).get(weekStartIso, weekEndIso) as unknown as EmbedPulseRunTupleRow | undefined;
+  const prMx = prRow?.mx ?? "";
+  const prC = Number(prRow?.c ?? 0);
+  const runMx = runRow?.mx ?? "";
+  const runC = Number(runRow?.c ?? 0);
+  return `${weekStartIso}|${prMx}|${prC}|${runMx}|${runC}`;
+}
+
+/** Production cache-invalidation hook — called from the runIngestPass
+ *  post-COMMIT tail via the globalThis slot per LESSONS 2026-06-05. */
+export function _invalidateEmbedPulseCacheAfterIngest(): void {
+  embedPulseCache.clear();
+}
+
+(globalThis as { __fleet_embed_pulse_invalidate__?: () => void })
+  .__fleet_embed_pulse_invalidate__ = _invalidateEmbedPulseCacheAfterIngest;
+
+/** Look up a fresh embed pulse from the memo cache; rebuild on miss.
+ *  The cache key is the week_start_iso so the entry naturally rolls
+ *  over at the Monday boundary. */
+function getEmbedPulseCached(db: DB, now: Date): FleetWeeklyPulse {
+  const value0 = fleetWeeklyPulse(db, { now });
+  const key = value0.week_start_iso;
+  const tuple = embedPulseInvalidationTuple(db, value0.week_start_iso, value0.week_end_iso);
+  const hit = embedPulseCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  embedPulseBuildCounter += 1;
+  embedPulseCache.set(key, {
+    tuple, value: value0, expires_at: Date.now() + EMBED_PULSE_TTL_MS,
+  });
+  return value0;
+}
+
+/** Test-only handle on the cached embed-pulse path so the cache-hit
+ *  test can observe the build counter without going through HTTP. */
+export function _embedPulseCachedForTests(db: DB, now: Date): FleetWeeklyPulse {
+  return getEmbedPulseCached(db, now);
+}
+
+/** Single chokepoint for GET /embed/pulse.html. */
+function serveEmbedPulseHtml(
+  db: DB, cfg: FleetConfig, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = getEmbedPulseCached(db, now);
+  const body = renderEmbedPulseHtml(payload);
+  const frame = composeEmbedFrameHeaders({ embedOrigins: cfg.embedOrigins });
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=300",
+      "x-frame-options": frame.xFrameOptions,
+      "content-security-policy": frame.contentSecurityPolicy,
+    },
+    body,
+  };
+}
+
+/** Single chokepoint for GET /embed/pulse.svg. */
+function serveEmbedPulseSvg(
+  db: DB, cfg: FleetConfig, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = getEmbedPulseCached(db, now);
+  const body = renderEmbedPulseSvg(payload);
+  const frame = composeEmbedFrameHeaders({ embedOrigins: cfg.embedOrigins });
+  return {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=300",
+      "x-frame-options": frame.xFrameOptions,
+      "content-security-policy": frame.contentSecurityPolicy,
+    },
+    body,
+  };
+}
+
+/** Compose the operator's host URL for the /share snippet section.
+ *  Falls back to loopback when no LAN interface is reachable. */
+function embedHostForSnippets(cfg: FleetConfig): string {
+  const port = cfg.port ?? 7070;
+  const host = cfg.host ?? "127.0.0.1";
+  const lan = discoverLanUrl(host, port);
+  if (lan) return lan;
+  return `http://127.0.0.1:${port}`;
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Ticket 0057: public lesson archive — anonymised /lessons-public
 // surface where a stranger Googling a node-sqlite error lands and
 // downloads fleet-control.
@@ -4094,6 +4239,24 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         res.writeHead(200, result.headers);
         return res.end(result.body);
       }
+      // Ticket 0060: embeddable fleet-pulse widget. Two PUBLIC routes
+      // mounted BEFORE the path.startsWith("/api/") auth gate so they
+      // share the no-token bypass posture of /pulse + /api/fleet/pulse.
+      // The HTML route powers the operator's iframe paste-line; the
+      // SVG route powers the GitHub-README img fallback (GitHub strips
+      // iframes). Cache-Control: max-age=300 — embed updates faster
+      // than /pulse's 1h because the embedded surface is "live" across
+      // page-reload boundaries on the embedder's side.
+      if (path === "/embed/pulse.html" && req.method === "GET") {
+        const result = serveEmbedPulseHtml(db, cfg, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      if (path === "/embed/pulse.svg" && req.method === "GET") {
+        const result = serveEmbedPulseSvg(db, cfg, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
       // Ticket 0057: public lesson archive JSON. PUBLIC — no auth,
       // no loopback gate (the URL IS the bookmark shape). Handled
       // BEFORE the `path.startsWith("/api/")` auth gate so a remote
@@ -5057,6 +5220,26 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         const result = serveShare(db, shm[1]);
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
+      }
+      // Ticket 0060: authenticated /share page — surfaces three copy-
+      // pastable embed snippets (iframe / img / markdown) so the
+      // operator can drop a live fleet pulse into a personal blog or
+      // README. Read scope, loopback bypasses; the snippets compose
+      // the operator's LAN/loopback host so a remote caller without a
+      // token must NOT see them.
+      if (path === "/share" && req.method === "GET") {
+        const sauth = requireAuth(db, req, "read", url);
+        if (!sauth.ok) {
+          res.writeHead(sauth.status, { "content-type": "text/plain" });
+          return res.end(sauth.message);
+        }
+        const host = embedHostForSnippets(cfg);
+        const body = renderEmbedSharePage(host);
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        });
+        return res.end(body);
       }
       // Ticket 0041: public monthly fleet receipts.
       // GET /receipts/<slug>/<YYYY-MM> renders a self-contained

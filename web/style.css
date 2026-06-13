@@ -2186,3 +2186,26 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .biggest-surprise-cta { grid-column: 1 / 3; justify-self: start; }
 }
 
+
+/* Ticket 0060: /share embed snippets section. */
+.share-embed-main { max-width: 720px; margin: 0 auto; padding: 28px 20px 60px;
+  font-family: var(--mono); color: var(--ink); }
+.share-embed-headline { font-family: var(--sans); font-weight: 600;
+  font-size: 22px; margin: 0 0 12px; color: var(--ink); }
+.share-embed-intro { font-family: var(--mono); font-size: 13px; color: var(--dim);
+  margin: 0 0 24px; line-height: 1.5; }
+.share-embed-intro a { color: var(--accent); text-decoration: none; }
+.share-embed-section { background: var(--panel); border: 1px solid var(--line);
+  padding: 14px 16px; border-radius: var(--r); margin: 0 0 16px; }
+.share-embed-section h2 { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); margin: 0 0 8px; font-weight: 600;
+  text-transform: lowercase; }
+.share-embed-snippet { font-family: var(--mono); font-size: 12px;
+  background: var(--bg); color: var(--ink); padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 4px; margin: 0 0 10px;
+  white-space: pre-wrap; word-break: break-all; min-height: 44px; }
+.share-embed-copy { font-family: var(--mono); font-size: 12px;
+  background: var(--accent); color: var(--bg); border: none;
+  padding: 8px 14px; border-radius: 4px; cursor: pointer; min-height: 44px;
+  font-weight: 600; }
+.share-embed-copy:hover { opacity: 0.85; }
