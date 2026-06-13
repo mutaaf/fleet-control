@@ -1,7 +1,7 @@
 ---
 id: 0059
 title: Biggest surprise this week - one Tuesday-morning card surfaces the single thing the operator would have missed so the daily glance becomes a habit ritual
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-13
@@ -422,4 +422,27 @@ COUNT(*) over pr in window)`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13: implementation-dev started on branch
+  feat/0059-biggest-surprise-this-week. Plan:
+  (1) write the failing test suite tests/biggest-surprise.test.ts
+      covering every AC checkbox;
+  (2) add `fleetBiggestSurprise(db, opts)` to src/views.ts next to
+      fleetWeeklyPulse, composing pr + project + inbox_dismissal
+      tables — no schema migration;
+  (3) extend `InboxKind` and `dismissInboxItem` to accept the new
+      `biggest_surprise` kind (the inbox_dismissal table column is
+      TEXT NOT NULL with no CHECK so the storage layer needs no
+      change — just the type and the validator);
+  (4) wire GET /api/fleet/biggest-surprise (auth required, value-side
+      redactor) and a `_resetBiggestSurpriseCacheForTests` /
+      `_getBiggestSurpriseCacheBuildsForTests` cache seam;
+  (5) expose `_renderBiggestSurpriseForTests(payload, opts)` so the
+      Monday-hide + empty-state + mobile-breakpoint branches drive
+      via a renderer-direct seam (per LESSONS 2026-06-11) instead of
+      mutating fleet-control.config.json in cwd;
+  (6) add the home-page card to web/app.js below renderLessonOfTheDay
+      and one CSS selector group in web/style.css; both reuse the
+      existing accent/dim/bg/mono tokens. PRODUCER-VS-SPEC: the
+      pr.state literal is 'MERGED' (uppercase) per src/ingest/prs.ts
+      and the existing costPerMergedPr / spendEfficiencyRanking
+      callers.
