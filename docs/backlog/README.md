@@ -19,7 +19,7 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
-| 0058 | Public failure-mode landing pages - anonymised /failures/<signature> SEO surface authored from real cross-project correlations the fleet caught | P1 | groomed | portal |
+| 0058 | Public failure-mode landing pages - anonymised /failures/<signature> SEO surface authored from real cross-project correlations the fleet caught | P1 | in-progress | portal |
 | 0059 | Biggest surprise this week - one Tuesday-morning card surfaces the single thing the operator would have missed so the daily glance becomes a habit ritual | P1 | groomed | observability |
 | 0060 | Embeddable HTML pulse widget - paste-one-line snippet that drops a live fleet pulse into any personal blog or README so every reader becomes a fleet-control prospect | P2 | groomed | portal |
 | 0054 | Public weekly fleet pulse - stable /pulse URL renders the most-recent week so the prospect's bookmark stays warm | P1 | shipped | portal |

@@ -175,5 +175,14 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_graveyard_invalidate__?: () => void }).__fleet_graveyard_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0058: public failure-mode landing pages memo cache. Same
+  // globalThis-slot pattern. The cache key tuple is (MAX(pr.fetched_at),
+  // COUNT(*) over pr in window) so any fresh pr row landing during an
+  // ingest tick should bust the cache and let the next /failures or
+  // /api/failures request rebuild without waiting out the 1-hour TTL.
+  try {
+    const hook = (globalThis as { __fleet_failure_modes_invalidate__?: () => void }).__fleet_failure_modes_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

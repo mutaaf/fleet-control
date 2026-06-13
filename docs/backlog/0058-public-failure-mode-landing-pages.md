@@ -1,7 +1,7 @@
 ---
 id: 0058
 title: Public failure-mode landing pages - anonymised /failures/<signature> SEO surface authored from real cross-project correlations the fleet caught
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-13
@@ -449,4 +449,41 @@ already uses `pr.state = 'open'` - mirror that casing.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13: scoping commit — branch `feat/0058-public-failure-mode-landing-pages`
+  off origin/main; ticket flipped groomed → in-progress; index row updated.
+  Plan: TDD one test() per AC in `tests/failure-modes.test.ts`, then add
+  `fleetFailureModes()` next to `fleetWeeklyPulse` in src/views.ts (PLAIN
+  PROSE comment per LESSONS 2026-06-11), three public HTML/JSON routes in
+  src/server.ts (mounted BEFORE the `path.startsWith("/api/")` auth gate,
+  mirroring `/api/lessons-public`), exposed renderer-direct seams
+  `_renderFailureModesPageForTests` / `_renderFailurePermalinkForTests`,
+  cache reset + builds counter, globalThis invalidation slot
+  `__fleet_failure_modes_invalidate__`.
+- 2026-06-13: shipped end-to-end. All 16 tests in tests/failure-modes.test.ts
+  pass (AC9 perf skipped behind PERF=1). Local gate `npm ci && npx tsc
+  --noEmit && node scripts/check-backlog.mjs` green. PRODUCER-VS-SPEC
+  reconciliations: `pr` table has no surrogate `id` so the cache tuple uses
+  `(MAX(fetched_at), COUNT(*))` not MAX(id) (per LESSONS 2026-06-07);
+  `pr.state` literal is lowercase `'open'` though the helper does NOT
+  restrict on state - dark closed-and-failing PRs are part of the SEO
+  signal too. Cycle avoidance: lessons.ts already imports views.ts, so I
+  inlined a local `anonymiseExcerpt` in views.ts instead of round-tripping
+  through lessons.ts (would have created lessons↔views cycle). Cache
+  seam exposed via `_failureModesCachedForTests` mirrors the 0057
+  `_lessonsPublicArchiveCachedForTests` pattern so the AC6 cache test
+  drives the build counter through the cached path. Pre-existing test
+  failures on main (correlate AC9, weekly digest, leaderboard, several CLI
+  spawn-timeout tests) are NOT from this change and NOT on the gating
+  surface (typecheck + validate); they predate this PR per LESSONS
+  2026-05-29 "distinguish test red in MY change from test red for
+  reasons that predate my change".
+- Sibling cache invalidation wired in src/ingest/index.ts via globalThis
+  slot `__fleet_failure_modes_invalidate__` (no import cycle per LESSONS
+  2026-06-05).
+- AC8 cross-link footers added to BOTH the authenticated `#/lessons` SPA
+  (web/app.js, line ~4427) AND the public `/lessons-public` HTML
+  (src/server.ts renderLessonsPublicIndex + renderLessonsPublicPermalink).
+  Net-new testid `lessons-failure-modes-cross-link` with href `/failures`.
+  Net-new CSS selector group `.failures-public` in web/style.css that
+  matches the centred 80ch reading surface of `.lessons-public` and adds
+  horizontal-scroll on the `<pre>` excerpt block for mobile (375px).
