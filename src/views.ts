@@ -6,7 +6,7 @@ import { openAlerts } from "./alerts.ts";
 import { daemonStatus } from "./daemon.ts";
 import { ingestProjectPRs, projectPRs } from "./ingest/prs.ts";
 import { anomaliesForRun, recentAnomalies } from "./anomaly.ts";
-import { activeCorrelations } from "./correlate.ts";
+import { activeCorrelations, failureSignature } from "./correlate.ts";
 import { activeDrifts } from "./drift.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { isoWeekKey } from "./digest.ts";
@@ -7021,5 +7021,249 @@ export function fleetWeeklyPulse(
     top_project,
     freshest_lesson,
     paused_count,
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0058 - Public failure-mode landing pages.
+//
+// Pure helper that groups recent failing PR rows by the stable signature
+// produced by failureSignature in src/correlate.ts. The helper is consumed
+// by three public routes in src/server.ts (GET /failures, GET
+// /failures/<signature>, GET /api/failures) - all unauthenticated public
+// SEO surfaces (zero-competition acquisition funnel per the ticket's
+// growth lens).
+//
+// PRODUCER-VS-SPEC NOTE (per the schema-wins lesson): the pr table
+// stores state as the lowercase string open (per src/ingest/prs.ts) and
+// first_fail_check + first_fail_excerpt are nullable TEXT columns added
+// via ALTER TABLE in src/db.ts. The cache invalidation tuple uses
+// MAX(fetched_at) plus COUNT star because the pr table has no surrogate
+// id column - composite primary key on project_id + number.
+//
+// LESSONS notes for the comment block, expressed as plain prose so the
+// 0052 and 0040 character-window source greps do NOT capture across the
+// helper boundary - no backticks around any sibling helper identifier
+// in this block. The sibling helpers in this region are
+// riskiestOpenPr, stuckPrTaxonomy, prAutopsies, fleetWeeklyPulse, and
+// lessonSavingsRollup; their tests slice 4000 chars forward from each
+// helper name and grep for SQL keywords inside backtick template
+// literals. Keeping this block backtick-free is the simplest way to
+// avoid leaking SELECT or FROM tokens into a sibling's slice window.
+// ────────────────────────────────────────────────────────────────────
+
+export interface FleetFailureModeRow {
+  /** Stable signature key from correlate.ts (TS2304, git-push-403, ...). */
+  signature: string;
+  /** Fixed english phrase per signature, hardcoded below. */
+  title: string;
+  /** First (oldest) excerpt seen for this group, clipped to 200 chars,
+   *  and run through the same anonymisation pass as the 0057 lesson
+   *  archive (slugs become project-N, /Users/ paths become path
+   *  placeholder, agent branch names become branch placeholder). */
+  sample_excerpt_anonymised: string;
+  /** COUNT(DISTINCT project.slug) per group within the window. */
+  project_count: number;
+  /** Total PR rows in the group within the window. */
+  pr_count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  /** Slug of a matching public-archive lesson (substring match on title
+   *  OR body), or null when no lesson references this signature. */
+  matched_lesson_slug: string | null;
+}
+
+export interface FleetFailureModes {
+  generated_at: string;
+  window_days: number;
+  total_signatures: number;
+  /** COUNT(DISTINCT project.slug) across every group in the window. */
+  total_projects_affected: number;
+  signatures: FleetFailureModeRow[];
+}
+
+export interface FleetFailureModesOptions {
+  now?: Date;
+  /** Defaults to 90 per the ticket. */
+  windowDays?: number;
+  /** Optional override for the operator slug to alias mapping. When
+   *  omitted the helper builds the map from the project table. */
+  projectAliasMap?: Record<string, string>;
+  /** Optional list of lessons to scan for substring matches when
+   *  populating matched_lesson_slug. The route handler hands this in
+   *  from the existing public-archive helper (0057). When omitted the
+   *  helper returns null for every matched_lesson_slug. */
+  lessonsArchiveRows?: Array<{
+    lesson_slug: string; lesson_title: string; lesson_body_anonymised: string;
+  }>;
+}
+
+/** Hardcoded english phrase per signature. Per the ticket's
+ *  closed-set posture, any unknown signature falls back to the
+ *  signature itself - which is fine because failureSignature only ever
+ *  returns one of the listed keys (or null). For dynamic TypeScript
+ *  codes (TS\d{4}) we render the code itself inside the title. */
+function titleForSignature(signature: string): string {
+  if (signature === "git-push-403") return "git push: permission denied";
+  if (signature === "gh-missing") return "gh CLI not found on PATH";
+  if (signature === "node-missing") return "node binary not found on PATH";
+  if (signature === "npm-eacces") return "npm install EACCES";
+  if (/^TS\d{4}$/.test(signature)) return "TypeScript " + signature + " - cannot find name";
+  return signature;
+}
+
+// Local anonymiser - mirrors the 0057 anonymiseLessonBody pass without
+// importing lessons.ts (which already imports views.ts). Same rules:
+// operator slug to alias-N, agent branch prefix to a branch placeholder,
+// absolute Users/home path to a path placeholder, "ticket NNNN" to
+// "an agent ticket". Technical tokens (TS2304, file extensions, code
+// idioms) are NOT enumerated explicitly - they survive by NOT matching
+// any of these patterns.
+function reEscapeFailureMode(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function anonymiseExcerpt(body: string, aliasMap: Record<string, string>): string {
+  let out = String(body ?? "");
+  const slugs = Object.keys(aliasMap).slice().sort((a, b) => b.length - a.length);
+  for (const slug of slugs) {
+    if (!slug) continue;
+    if (slug === "agent-fleet") continue;
+    const alias = aliasMap[slug] ?? "project-?";
+    const re = new RegExp("(^|[^A-Za-z0-9_-])" + reEscapeFailureMode(slug) + "(?![A-Za-z0-9_-])", "g");
+    out = out.replace(re, (_m, pre) => String(pre) + alias);
+  }
+  out = out.replace(/\b(feat|chore|eng)\/[A-Za-z0-9/_.-]+/g, "<branch>");
+  out = out.replace(/\/(?:Users|home)\/[^\s,;)]+/g, "<path>");
+  out = out.replace(/\bticket\s+\d{3,5}\b/gi, "an agent ticket");
+  return out;
+}
+
+interface FailureModePrRow {
+  slug: string;
+  fetched_at: string;
+  first_fail_check: string | null;
+  first_fail_excerpt: string | null;
+}
+
+interface ProjectSlugForFailures { slug: string; }
+
+/** Build the operator alias map from the project table when the
+ *  caller did not supply one. The bootstrap slug agent-fleet maps to
+ *  itself (it is the public name of the open source kit); every other
+ *  slug becomes project-N in deterministic alphabetical order. */
+function buildAliasMapForFailures(db: DB): Record<string, string> {
+  const out: Record<string, string> = {};
+  let rows: ProjectSlugForFailures[] = [];
+  try {
+    rows = db.prepare("SELECT slug FROM project ORDER BY slug").all() as unknown as ProjectSlugForFailures[];
+  } catch { /* project table may be missing on a fresh boot */ }
+  let n = 1;
+  for (const r of rows) {
+    const slug = String(r.slug ?? "").trim();
+    if (!slug) continue;
+    if (slug === "agent-fleet") { out[slug] = "agent-fleet"; continue; }
+    if (!(slug in out)) { out[slug] = "project-" + String(n); n += 1; }
+  }
+  return out;
+}
+
+/** Group every pr row in the trailing N-day window by the signature
+ *  produced by failureSignature(). Returns the documented shape; the
+ *  caller decides whether to surface it as JSON or HTML. The matched
+ *  lesson lookup is a first-match-wins substring scan over the
+ *  supplied lessons archive rows; when no rows are supplied the
+ *  matched_lesson_slug is always null. */
+export function fleetFailureModes(
+  db: DB, opts: FleetFailureModesOptions = {},
+): FleetFailureModes {
+  const now = opts.now ?? new Date();
+  const windowDays = Math.max(1, Math.floor(opts.windowDays ?? 90));
+  const cutoffIso = new Date(now.getTime() - windowDays * 86_400_000).toISOString();
+  const aliasMap = opts.projectAliasMap ?? buildAliasMapForFailures(db);
+
+  // Read every pr row in the window with a non-null excerpt. Per the
+  // ticket's spec we do NOT restrict to state = open: the historical
+  // signal lives on closed-and-failing PRs too, which is exactly the
+  // dark code the public surface is supposed to expose. The window cut
+  // happens on fetched_at (the merged-at proxy + the freshness anchor
+  // every other helper in this file uses).
+  const rows = db.prepare(
+    "SELECT p.slug AS slug, pr.fetched_at AS fetched_at, "
+    + "       pr.first_fail_check AS first_fail_check, "
+    + "       pr.first_fail_excerpt AS first_fail_excerpt "
+    + "  FROM pr "
+    + "  JOIN project p ON p.id = pr.project_id "
+    + " WHERE pr.first_fail_excerpt IS NOT NULL "
+    + "   AND pr.fetched_at >= ? "
+    + " ORDER BY pr.fetched_at ASC",
+  ).all(cutoffIso) as unknown as FailureModePrRow[];
+
+  interface Group {
+    slugs: Set<string>;
+    pr_count: number;
+    first_seen_at: string;
+    last_seen_at: string;
+    sample_raw_excerpt: string;
+  }
+  const groups = new Map<string, Group>();
+  for (const r of rows) {
+    const sig = failureSignature(r.first_fail_check, r.first_fail_excerpt);
+    if (!sig) continue;
+    const slug = String(r.slug ?? "");
+    const excerpt = String(r.first_fail_excerpt ?? "").slice(0, 200);
+    const g = groups.get(sig);
+    if (!g) {
+      groups.set(sig, {
+        slugs: new Set<string>([slug]),
+        pr_count: 1,
+        first_seen_at: r.fetched_at,
+        last_seen_at: r.fetched_at,
+        sample_raw_excerpt: excerpt,
+      });
+      continue;
+    }
+    g.slugs.add(slug);
+    g.pr_count += 1;
+    if (r.fetched_at < g.first_seen_at) g.first_seen_at = r.fetched_at;
+    if (r.fetched_at > g.last_seen_at) g.last_seen_at = r.fetched_at;
+  }
+
+  const allSlugs = new Set<string>();
+  const signatures: FleetFailureModeRow[] = [];
+  for (const [signature, g] of groups) {
+    for (const s of g.slugs) allSlugs.add(s);
+    const sample = anonymiseExcerpt(g.sample_raw_excerpt, aliasMap).slice(0, 200);
+    let matchedSlug: string | null = null;
+    if (opts.lessonsArchiveRows) {
+      for (const lesson of opts.lessonsArchiveRows) {
+        if (lesson.lesson_title.includes(signature) || lesson.lesson_body_anonymised.includes(signature)) {
+          matchedSlug = lesson.lesson_slug;
+          break;
+        }
+      }
+    }
+    signatures.push({
+      signature,
+      title: titleForSignature(signature),
+      sample_excerpt_anonymised: sample,
+      project_count: g.slugs.size,
+      pr_count: g.pr_count,
+      first_seen_at: g.first_seen_at,
+      last_seen_at: g.last_seen_at,
+      matched_lesson_slug: matchedSlug,
+    });
+  }
+  // Deterministic ordering by signature ascending so the JSON output
+  // is stable across reorderings (matches the activeCorrelations
+  // convention).
+  signatures.sort((a, b) => a.signature.localeCompare(b.signature));
+
+  return {
+    generated_at: now.toISOString(),
+    window_days: windowDays,
+    total_signatures: signatures.length,
+    total_projects_affected: allSlugs.size,
+    signatures,
   };
 }

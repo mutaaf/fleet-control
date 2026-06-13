@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -3059,6 +3059,7 @@ ${head}
     this lesson was authored by an autonomous agent fleet running fleet-control —
     install yours at <a href="${safeRepo}">${safeRepo}</a>
   </footer>
+  <footer class="lessons-public-foot"><a data-testid="lessons-failure-modes-cross-link" href="/failures">see the failure modes the fleet has caught at /failures</a></footer>
 </main>
 </body>
 </html>`;
@@ -3119,6 +3120,7 @@ ${head}
     this lesson was authored by an autonomous agent fleet running fleet-control —
     install yours at <a href="${safeRepo}">${safeRepo}</a>
   </footer>
+  <footer class="lessons-public-foot"><a data-testid="lessons-failure-modes-cross-link" href="/failures">see the failure modes the fleet has caught at /failures</a></footer>
 </main>
 </body>
 </html>`;
@@ -3199,6 +3201,388 @@ function serveLessonsPublicJson(db: DB, now: Date): {
 } {
   const archive = getLessonsPublicArchiveCached(db, now);
   const scrubbed = scrubArchiveValues(archive);
+  return {
+    body: JSON.stringify(scrubbed),
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "cache-control": "public, max-age=3600",
+    },
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0058 - Public failure-mode landing pages.
+//
+// Three public routes (no auth, no loopback gate):
+//   GET /failures              - HTML index of every signature in window
+//   GET /failures/<signature>  - HTML permalink for one signature
+//   GET /api/failures          - JSON shape of the AC1 payload
+//
+// Cache key tuple: (MAX(pr.fetched_at), COUNT(*) over pr in window,
+// alias-map fingerprint, mtime of the lessons file used to populate
+// matched_lesson_slug). Per LESSONS the pr table has no surrogate id
+// column so the tuple uses MAX(fetched_at) + COUNT star, never MAX(id).
+// Per LESSONS the cache exposes a reset hook + a builds counter for
+// tests. Per LESSONS the producer-side invalidation hook is registered
+// on globalThis so ingest can wake the cache without an import cycle.
+// ────────────────────────────────────────────────────────────────────
+
+interface FailureModesCacheEntry {
+  prMaxFetchedAt: string;
+  prCount: number;
+  aliasFingerprint: string;
+  lessonsMtimeMs: number;
+  value: FleetFailureModes;
+}
+let failureModesCache: FailureModesCacheEntry | null = null;
+let failureModesBuildCounter = 0;
+
+export function _resetFailureModesCacheForTests(): void {
+  failureModesCache = null;
+  failureModesBuildCounter = 0;
+}
+
+export function _getFailureModesCacheBuildsForTests(): number {
+  return failureModesBuildCounter;
+}
+
+/** Test-only handle on the cached path — drives the build-counter /
+ *  cache-hit semantics without going through HTTP. Mirrors the
+ *  _lessonsPublicArchiveCachedForTests seam from ticket 0057. */
+export function _failureModesCachedForTests(db: DB, now: Date): FleetFailureModes {
+  return getFailureModesCached(db, now);
+}
+
+/** Production cache-invalidation hook. Registered on globalThis so
+ *  ingest (or any other producer) can fire it without importing the
+ *  server module (avoids the ESM cycle described in LESSONS). Clearing
+ *  the cache lets tests observe the counter increment on the next
+ *  call. */
+export function _invalidateFailureModesCache(): void {
+  failureModesCache = null;
+}
+
+(globalThis as { __fleet_failure_modes_invalidate__?: () => void })
+  .__fleet_failure_modes_invalidate__ = _invalidateFailureModesCache;
+
+interface FailureModesPrWindowRow { max_fetched_at: string | null; n: number | null; }
+interface FailureModesProjectSlugRow { slug: string; }
+
+function failureModesAliasMap(db: DB): Record<string, string> {
+  const out: Record<string, string> = {};
+  let rows: FailureModesProjectSlugRow[] = [];
+  try {
+    rows = db.prepare("SELECT slug FROM project ORDER BY slug").all() as unknown as FailureModesProjectSlugRow[];
+  } catch { /* fresh boot - project table may not exist yet */ }
+  let n = 1;
+  for (const r of rows) {
+    const slug = String(r.slug ?? "").trim();
+    if (!slug) continue;
+    if (slug === "agent-fleet") { out[slug] = "agent-fleet"; continue; }
+    if (!(slug in out)) { out[slug] = "project-" + String(n); n += 1; }
+  }
+  return out;
+}
+
+function getFailureModesCached(db: DB, now: Date): FleetFailureModes {
+  const windowDays = 90;
+  const cutoffIso = new Date(now.getTime() - windowDays * 86_400_000).toISOString();
+  const prWindow = db.prepare(
+    "SELECT MAX(pr.fetched_at) AS max_fetched_at, COUNT(*) AS n "
+    + "  FROM pr "
+    + " WHERE pr.first_fail_excerpt IS NOT NULL "
+    + "   AND pr.fetched_at >= ?",
+  ).get(cutoffIso) as unknown as FailureModesPrWindowRow | undefined;
+  const prMaxFetchedAt = String(prWindow?.max_fetched_at ?? "");
+  const prCount = Number(prWindow?.n ?? 0);
+  const aliasMap = failureModesAliasMap(db);
+  const aliasFingerprint = Object.keys(aliasMap).sort()
+    .map((k) => k + "=" + aliasMap[k]).join("|");
+  const lessonsPath = defaultLessonsPath();
+  let lessonsMtimeMs = 0;
+  try { lessonsMtimeMs = statSync(lessonsPath).mtimeMs; } catch { lessonsMtimeMs = 0; }
+  if (failureModesCache
+      && failureModesCache.prMaxFetchedAt === prMaxFetchedAt
+      && failureModesCache.prCount === prCount
+      && failureModesCache.aliasFingerprint === aliasFingerprint
+      && failureModesCache.lessonsMtimeMs === lessonsMtimeMs) {
+    return failureModesCache.value;
+  }
+  failureModesBuildCounter += 1;
+  // Pull the lessons archive rows so the helper can populate
+  // matched_lesson_slug. We use the existing public-archive cache (which
+  // already shares mtime invalidation) so the failure-modes cache and
+  // the lessons-public cache stay in lockstep.
+  const archive = getLessonsPublicArchiveCached(db, now);
+  const value = fleetFailureModes(db, {
+    now,
+    windowDays,
+    projectAliasMap: aliasMap,
+    lessonsArchiveRows: archive.lessons.map((l) => ({
+      lesson_slug: l.lesson_slug,
+      lesson_title: l.lesson_title,
+      lesson_body_anonymised: l.lesson_body_anonymised,
+    })),
+  });
+  failureModesCache = { prMaxFetchedAt, prCount, aliasFingerprint, lessonsMtimeMs, value };
+  return value;
+}
+
+/** Defence-in-depth secret redaction at the renderer boundary. Mirrors
+ *  the tightened shape used for the public lesson archive: scrub the
+ *  VALUES (title + excerpt) so the JSON keys survive intact when the
+ *  same shape is serialised. */
+function redactSecretsForFailureModes(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+function scrubFailureModesValues(v: FleetFailureModes): FleetFailureModes {
+  return {
+    generated_at: v.generated_at,
+    window_days: v.window_days,
+    total_signatures: v.total_signatures,
+    total_projects_affected: v.total_projects_affected,
+    signatures: v.signatures.map((r) => ({
+      signature: r.signature,
+      title: redactSecretsForFailureModes(r.title),
+      sample_excerpt_anonymised: redactSecretsForFailureModes(r.sample_excerpt_anonymised),
+      project_count: r.project_count,
+      pr_count: r.pr_count,
+      first_seen_at: r.first_seen_at,
+      last_seen_at: r.last_seen_at,
+      matched_lesson_slug: r.matched_lesson_slug,
+    })),
+  };
+}
+
+const FAILURE_MODES_FOOTER_URL = "https://github.com/" + "mutaaf/fleet-control";
+
+function escForFailureModes(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+function failureModesHead(title: string, canonicalHref: string): string {
+  const safeTitle = escForFailureModes(title);
+  const safeCanon = escForFailureModes(canonicalHref);
+  return `<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${safeTitle}</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+<link rel="canonical" href="${safeCanon}" />`;
+}
+
+function failureModesArticle(row: FleetFailureModeRow): string {
+  const safeSig = escForFailureModes(row.signature);
+  const safeTitle = escForFailureModes(row.title);
+  const safeExcerpt = escForFailureModes(row.sample_excerpt_anonymised);
+  const safeFirst = escForFailureModes(row.first_seen_at);
+  const safeLast = escForFailureModes(row.last_seen_at);
+  const safeProjects = escForFailureModes(String(row.project_count));
+  const safePrs = escForFailureModes(String(row.pr_count));
+  return `<article class="failures-public-entry">
+  <h2 id="${safeSig}" data-testid="failure-public-${safeSig}">
+    <a href="/failures/${safeSig}"><code>${safeSig}</code> &mdash; ${safeTitle}</a>
+  </h2>
+  <dl class="failures-public-meta">
+    <dt>projects affected</dt><dd>${safeProjects}</dd>
+    <dt>PRs seen</dt><dd>${safePrs}</dd>
+    <dt>first seen</dt><dd><time datetime="${safeFirst}">${safeFirst}</time></dd>
+    <dt>last seen</dt><dd><time datetime="${safeLast}">${safeLast}</time></dd>
+  </dl>
+  <pre class="failures-public-excerpt">${safeExcerpt}</pre>
+</article>`;
+}
+
+export interface RenderFailureModesPageOptions {
+  /** Reserved for future mobile-branch coverage. Today the page is
+   *  responsive via CSS media queries; the seam is here so renderer-
+   *  direct tests can future-proof the mobile branch without booting
+   *  the server. */
+  viewportWidth?: number;
+}
+
+export function _renderFailureModesPageForTests(
+  payload: FleetFailureModes,
+  _opts: RenderFailureModesPageOptions = {},
+): string {
+  return renderFailureModesPage(payload);
+}
+
+function renderFailureModesPage(payload: FleetFailureModes): string {
+  const scrubbed = scrubFailureModesValues(payload);
+  const head = failureModesHead(
+    "failure modes caught by an autonomous agent fleet · fleet-control",
+    "/failures",
+  );
+  const safeRepo = escForFailureModes(FAILURE_MODES_FOOTER_URL);
+  const safeWindow = escForFailureModes(String(scrubbed.window_days));
+  const safeTotalSigs = escForFailureModes(String(scrubbed.total_signatures));
+  const safeTotalProjects = escForFailureModes(String(scrubbed.total_projects_affected));
+  let articles = "";
+  if (scrubbed.signatures.length === 0) {
+    articles = `<p class="failures-public-empty">The fleet has not caught any cross-project failures in the last ${safeWindow} days.</p>`;
+  } else {
+    articles = scrubbed.signatures.map(failureModesArticle).join("\n");
+  }
+  return `<!doctype html>
+<html lang="en">
+<head>
+${head}
+</head>
+<body class="failures-public-page">
+<main class="failures-public">
+  <header class="failures-public-head" data-testid="failures-public-header">
+    <h1>failure modes the fleet has caught</h1>
+    <p>${safeTotalSigs} signature${scrubbed.total_signatures === 1 ? "" : "s"} across ${safeTotalProjects} project${scrubbed.total_projects_affected === 1 ? "" : "s"} in the last ${safeWindow} days &mdash; every excerpt is anonymised but the technical error text is verbatim.</p>
+  </header>
+  ${articles}
+  <footer class="failures-public-foot" data-testid="failures-public-cta">
+    these failure modes were caught by an autonomous agent fleet running fleet-control &mdash;
+    install yours at <a href="${safeRepo}">${safeRepo}</a>
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+export function _renderFailurePermalinkForTests(row: FleetFailureModeRow): string {
+  return renderFailurePermalink(row);
+}
+
+function renderFailurePermalink(row: FleetFailureModeRow): string {
+  const scrubbedRow: FleetFailureModeRow = {
+    signature: row.signature,
+    title: redactSecretsForFailureModes(row.title),
+    sample_excerpt_anonymised: redactSecretsForFailureModes(row.sample_excerpt_anonymised),
+    project_count: row.project_count,
+    pr_count: row.pr_count,
+    first_seen_at: row.first_seen_at,
+    last_seen_at: row.last_seen_at,
+    matched_lesson_slug: row.matched_lesson_slug,
+  };
+  const safeSig = escForFailureModes(scrubbedRow.signature);
+  const safeTitle = escForFailureModes(scrubbedRow.title);
+  const safeExcerpt = escForFailureModes(scrubbedRow.sample_excerpt_anonymised);
+  const safeFirst = escForFailureModes(scrubbedRow.first_seen_at);
+  const safeLast = escForFailureModes(scrubbedRow.last_seen_at);
+  const safeProjects = escForFailureModes(String(scrubbedRow.project_count));
+  const safePrs = escForFailureModes(String(scrubbedRow.pr_count));
+  const safeRepo = escForFailureModes(FAILURE_MODES_FOOTER_URL);
+  const head = failureModesHead(
+    `${scrubbedRow.title} (${scrubbedRow.signature}) · fleet-control failure modes`,
+    "/failures/" + safeSig,
+  );
+  const lessonLink = scrubbedRow.matched_lesson_slug
+    ? `<p class="failures-public-matched-lesson">see the matching lesson at <a href="/lessons-public/${escForFailureModes(scrubbedRow.matched_lesson_slug)}">/lessons-public/${escForFailureModes(scrubbedRow.matched_lesson_slug)}</a></p>`
+    : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+${head}
+</head>
+<body class="failures-public-page">
+<main class="failures-public failures-public-permalink">
+  <nav class="failures-public-back">
+    <a href="/failures" data-testid="failures-public-back">‹ all failure modes</a>
+  </nav>
+  <article class="failures-public-entry">
+    <h1 data-testid="failure-public-${safeSig}">${safeTitle} <code>${safeSig}</code></h1>
+    <dl class="failures-public-meta">
+      <dt>projects affected</dt><dd>${safeProjects}</dd>
+      <dt>PRs seen</dt><dd>${safePrs}</dd>
+      <dt>first seen</dt><dd><time datetime="${safeFirst}">${safeFirst}</time></dd>
+      <dt>last seen</dt><dd><time datetime="${safeLast}">${safeLast}</time></dd>
+    </dl>
+    <pre class="failures-public-excerpt">${safeExcerpt}</pre>
+    ${lessonLink}
+  </article>
+  <footer class="failures-public-foot" data-testid="failures-public-cta">
+    this failure mode was caught by an autonomous agent fleet running fleet-control &mdash;
+    install yours at <a href="${safeRepo}">${safeRepo}</a>
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+function renderFailureModesNotFound(signature: string): string {
+  const safeSig = escForFailureModes(signature);
+  const safeRepo = escForFailureModes(FAILURE_MODES_FOOTER_URL);
+  const head = failureModesHead(
+    "failure mode not found · fleet-control",
+    "/failures",
+  );
+  return `<!doctype html>
+<html lang="en">
+<head>
+${head}
+</head>
+<body class="failures-public-page">
+<main class="failures-public failures-public-empty">
+  <h1>failure mode <code>${safeSig}</code> not found</h1>
+  <p>The fleet has not caught this signature in the last 90 days, or it isn't in the closed signature catalog yet.</p>
+  <p><a href="/failures" data-testid="failures-public-back">‹ browse all failure modes</a></p>
+  <footer class="failures-public-foot">
+    fleet-control &mdash; <a href="${safeRepo}">${safeRepo}</a>
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+function serveFailureModesIndex(db: DB, now: Date): {
+  status: number; headers: Record<string, string>; body: string;
+} {
+  const v = getFailureModesCached(db, now);
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: renderFailureModesPage(v),
+  };
+}
+
+function serveFailureModesPermalink(db: DB, now: Date, signature: string): {
+  status: number; headers: Record<string, string>; body: string;
+} {
+  const v = getFailureModesCached(db, now);
+  const row = v.signatures.find((r) => r.signature === signature);
+  if (!row) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: renderFailureModesNotFound(signature),
+    };
+  }
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: renderFailurePermalink(row),
+  };
+}
+
+function serveFailureModesJson(db: DB, now: Date): {
+  body: string; headers: Record<string, string>;
+} {
+  const v = getFailureModesCached(db, now);
+  const scrubbed = scrubFailureModesValues(v);
   return {
     body: JSON.stringify(scrubbed),
     headers: {
@@ -3534,6 +3918,16 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       // /api/fleet/pulse above and the public HTML routes below.
       if (path === "/api/lessons-public" && req.method === "GET") {
         const result = serveLessonsPublicJson(db, new Date());
+        res.writeHead(200, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0058: public failure-mode JSON. PUBLIC — no auth, no
+      // loopback gate. Mounted BEFORE the path.startsWith("/api/") auth
+      // gate alongside /api/lessons-public and /api/fleet/pulse so a
+      // remote caller without a token gets 200. Same posture as the
+      // /failures HTML route below.
+      if (path === "/api/failures" && req.method === "GET") {
+        const result = serveFailureModesJson(db, new Date());
         res.writeHead(200, result.headers);
         return res.end(result.body);
       }
@@ -4544,6 +4938,33 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       const lpm = path.match(/^\/lessons-public\/([a-z0-9-]+)$/);
       if (lpm && req.method === "GET") {
         const result = serveLessonsPublicPermalink(db, new Date(), lpm[1]);
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0058: public failure-mode landing pages — index +
+      // permalink HTML. PUBLIC — no auth, no loopback gate (the URL IS
+      // the SEO surface; the prospect lands here from a Google search
+      // for a specific error string). Mounted alongside the other
+      // public surfaces (/receipts, /year, /calculator, /pulse,
+      // /lessons-public) so the no-token bypass posture is shared.
+      // Per the AC the page sets Cache-Control: max-age=3600 and
+      // declares robots:index,follow + a canonical pointing at the
+      // permalink form (so the index page doesn't compete with the
+      // permalink page for ranking).
+      if (path === "/failures" && req.method === "GET") {
+        const result = serveFailureModesIndex(db, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // The permalink shape: /failures/<signature>. The signature is
+      // matched against the closed set produced by failureSignature in
+      // src/correlate.ts (TS#### or one of git-push-403, gh-missing,
+      // node-missing, npm-eacces). The route regex accepts the full
+      // [A-Za-z0-9-]+ shape and lets the handler 404 on an unknown
+      // signature so an arbitrary URL doesn't leak the catalog.
+      const fmm = path.match(/^\/failures\/([A-Za-z0-9-]+)$/);
+      if (fmm && req.method === "GET") {
+        const result = serveFailureModesPermalink(db, new Date(), fmm[1]);
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }
