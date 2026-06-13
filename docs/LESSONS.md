@@ -746,3 +746,42 @@ bug. Same trap will bite any future test that scrapes a slug /
 id / name out of a rendered HTML element that ALSO carries a
 testid suffixed with that same value (a common pattern in this
 codebase: `<a id="<slug>" data-testid="<prefix>-<slug>">`).
+
+## 2026-06-13 — function-import cycles aren't always cache-invalidation; sometimes the cheapest fix is a 6-line inline copy of the helper
+
+Symptom: while shipping ticket 0058 (public failure-mode landing pages)
+I wanted the new `fleetFailureModes()` helper in `src/views.ts` to
+share the 0057 anonymisation pass (`anonymiseLessonBody` in
+`src/lessons.ts`) so operator slugs / `/Users/` paths / agent branches
+collapse to the same placeholders across both public surfaces. The
+natural move was to export `anonymiseLessonBody` from `src/lessons.ts`
+and add `import { anonymiseLessonBody } from "./lessons.ts"` to
+`src/views.ts`. The typecheck passed. The first test run failed at
+module load: `src/lessons.ts` already does `import { lessonSavingsRollup
+} from "./views.ts"` (added in ticket 0055), so my new edge created a
+two-way function-import cycle. Node's ESM cycle detector doesn't crash
+on it but evaluation order is runtime-undefined — one side may see
+`undefined` for the imported symbol depending on which module the
+entrypoint loads first. Cause: the 2026-06-05 globalThis-slot lesson
+covers ONE specific shape of cycle (a server-side cache that an
+ingest-side producer must invalidate); it does NOT cover a vanilla
+two-module function dependency where neither side owns a runtime
+cache. Reaching for the globalThis-slot pattern here would be silly —
+the function is pure, no state, no producer/consumer asymmetry. Fix:
+inline the helper as a private `anonymiseExcerpt` inside `views.ts`
+(6 lines + one local `reEscape`). The two copies will drift the day
+someone adds a fifth anonymisation rule; that's still cheaper than the
+audit cost of a function-import cycle that bites at the next
+`import { somethingElse } from "./views.ts"` inside `lessons.ts`.
+General rule for this repo: BEFORE adding a `from "./views.ts"` import
+to ANY module that `views.ts` already imports (today: `lessons.ts`,
+`config.ts`, `correlate.ts`, `quiet_hours.ts`, `inbox.ts`, `digest.ts`,
+`live.ts`, `alerts.ts`, `daemon.ts`, `drift.ts`, `anomaly.ts`,
+`ingest/prs.ts`), grep for the OTHER direction with
+`grep -n "from \"\\./views" src/<other>.ts`. If both sides need a
+helper that's stateless and short, prefer a private inline copy in
+each side OR hoist the helper to a tiny third module (e.g.
+`src/anonymise.ts`) that neither side already imports. The globalThis-
+slot pattern stays in its lane: it's the right answer ONLY when one
+side owns a cache the other side's COMMIT must invalidate. A pure
+function dependency is not that shape.
