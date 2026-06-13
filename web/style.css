@@ -2132,3 +2132,57 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
   .failures-public-excerpt { font-size: 11px; }
 }
 
+/* Ticket 0059: biggest surprise this week home-page card. Reuses the
+ * same card structural surface as the 0033 yesterday-glance / 0055
+ * lesson-of-the-day siblings. Default (narrow viewport) stacks the
+ * metric beneath the sentence; the >=600px media block restores the
+ * inline / right-aligned shape so the desktop view shows both at a
+ * glance. No new CSS variables — accent/dim/bg/mono tokens only. */
+.biggest-surprise-card { display: block; padding: 14px 16px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  text-decoration: none; color: inherit;
+  margin: 0 0 14px; background: transparent; }
+.biggest-surprise-head { display: flex; align-items: center;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.biggest-surprise-eyebrow { font-family: var(--mono, ui-monospace);
+  font-size: 11px; text-transform: uppercase; color: var(--accent);
+  letter-spacing: 0.06em; }
+.biggest-surprise-sentence { font-weight: 600; font-size: 15px;
+  line-height: 1.35; margin-bottom: 8px; }
+.biggest-surprise-metric { font-family: var(--mono, ui-monospace);
+  font-size: 12px; color: var(--dim); }
+.biggest-surprise-metric-label { color: var(--dim); }
+.biggest-surprise-metric-baseline { color: var(--dim); }
+.biggest-surprise-metric-this-week { color: var(--accent); }
+.biggest-surprise-cta { display: inline-block; margin-top: 10px;
+  font-family: var(--mono, ui-monospace); font-size: 12px;
+  padding: 8px 12px; border: 1px solid var(--accent); border-radius: 6px;
+  color: var(--accent); text-decoration: none; min-height: 44px;
+  line-height: 28px; }
+.biggest-surprise-cta:hover { background: rgba(255,255,255,0.02); }
+.biggest-surprise-dismiss { margin-left: auto; min-width: 44px;
+  min-height: 44px; background: transparent; border: 0;
+  color: var(--dim); font-size: 20px; cursor: pointer;
+  line-height: 1; padding: 0 10px; }
+.biggest-surprise-dismiss:hover { color: var(--accent); }
+
+/* Narrow viewport (<600px): metric stacks vertically beneath the
+ * sentence. Per AC11 the stacked shape is the 375px baseline. */
+@media (max-width: 599px) {
+  .biggest-surprise-card { display: block; }
+  .biggest-surprise-metric { display: block; margin-top: 4px; }
+}
+
+/* Wide viewport (>=600px): metric right-aligns inline beneath the
+ * head. Per AC11 the inline shape is the >=600px tile. */
+@media (min-width: 600px) {
+  .biggest-surprise-card { display: grid;
+    grid-template-columns: 1fr auto; column-gap: 16px;
+    align-items: start; }
+  .biggest-surprise-head { grid-column: 1 / 3; }
+  .biggest-surprise-sentence { grid-column: 1 / 2; }
+  .biggest-surprise-metric { grid-column: 2 / 3; grid-row: 2;
+    justify-self: end; align-self: center; }
+  .biggest-surprise-cta { grid-column: 1 / 3; justify-self: start; }
+}
+

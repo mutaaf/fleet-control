@@ -446,3 +446,41 @@ COUNT(*) over pr in window)`.
       pr.state literal is 'MERGED' (uppercase) per src/ingest/prs.ts
       and the existing costPerMergedPr / spendEfficiencyRanking
       callers.
+- 2026-06-13: shipped. 17/17 new tests green; local gate (npm ci +
+  tsc --noEmit + scripts/check-backlog.mjs) clean. Full suite delta
+  vs main: 28 pre-existing failures unchanged (all are graveyard
+  tests pinned to time anchors or background-process tests that flake
+  per LESSONS 2026-05-29; none are gating checks). Implementation
+  notes:
+  * The 8-week warming-up threshold (AC10) means the AC2/AC5/AC6
+    fixtures had to seed >=8 weeks of pr data even though the
+    individual candidates only inspect the trailing 4 / 5 / 90-day
+    windows. The pr-data-count check is a counter for COUNT(DISTINCT
+    strftime('%Y-%W', date(fetched_at))) across MERGED is_agent rows,
+    so a fixture with 1 PR/week × 8 weeks satisfies the gate.
+  * The /api/fleet/biggest-surprise route uses real `now` (not a
+    pinned anchor) so the AC8 round-trip test asserts the dismiss
+    contract through the actual week-start emitted by the route. The
+    test reads inbox_dismissal directly to confirm the row landed
+    AND re-fetches to confirm the route surfaces dismissed=true after
+    busting the in-process memo.
+  * Per LESSONS 2026-06-11 (renderer-direct seam for branch tests)
+    the AC9 Monday-hide and AC11 mobile-breakpoint branches drive via
+    `_renderBiggestSurpriseForTests(payload, {today, ...})` instead
+    of mutating fleet-control.config.json in cwd. The boot-path AC8
+    only writes the empty-roots config (no non-default fields), so
+    it doesn't race against parallel test files that also mutate
+    quietHours etc.
+  * Per LESSONS 2026-06-10 (redactSecrets shreds JSON keys) the
+    redactor scrubs the four operator-supplied STRING VALUES
+    (sentence, metric_label, metric_baseline, metric_this_week)
+    BEFORE JSON.stringify; structural fields like
+    `candidate_project_slug` survive intact.
+  * Per LESSONS 2026-06-07 (the pr table has no surrogate id) the
+    cache invalidation tuple uses (MAX(fetched_at), COUNT(*) FROM pr)
+    plus (MAX(day), COUNT(*) FROM cost_rollup_day) so a fresh PR row
+    OR a fresh rollup row both bust the cache.
+  * Per LESSONS 2026-06-13 (function-import cycles ≠ cache-
+    invalidation) the helper avoids any new src/views.ts import edges
+    — `parseGhPrUrl` is a private inline helper, not a re-use of
+    correlate.ts or any module that already imports views.ts.

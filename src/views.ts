@@ -7267,3 +7267,579 @@ export function fleetFailureModes(
     signatures,
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0059 - Biggest surprise this week.
+//
+// One Tuesday-morning card answering "what would I have BET against
+// this week and lost?" - five deterministic candidates evaluated in a
+// fixed priority order. The first to fire wins. When none fires the
+// card renders an honest "nothing surprising" sentence so the empty
+// state never fabricates upbeat news (matches the cross-fleet courtiq
+// share-flow-authenticity family from CROSS_LESSONS).
+//
+// Candidates (priority order, FIRST match wins):
+//   1. silent-project       - trailing 4w avg >= 3 PRs/week AND this
+//                             week's merged count is 0.
+//   2. first-time-check     - a pr.first_fail_check value in this
+//                             week absent from the trailing 8 weeks.
+//   3. spend-doubled        - this week's cost-per-PR >= 2x the
+//                             trailing 8w MEDIAN AND abs delta
+//                             >= $1.00.
+//   4. heal-streak-broken   - last 5 consecutive merged PRs (by
+//                             fetched_at DESC) all had
+//                             heal_attempts=0, AND a this-week merge
+//                             has heal_attempts >= 1.
+//   5. new-author-red       - an author with >= 5 merged PRs in the
+//                             trailing 90d AND zero first_fail_check
+//                             across those 90d rows landed a this-
+//                             week PR with first_fail_check set.
+//
+// Window: Monday 00:00 UTC through Sunday 23:59:59 UTC of the week
+// containing now (the IN-PROGRESS week - we surface what's surprising
+// right now, not the most-recent complete week).
+//
+// PRODUCER-VS-SPEC reconciliation per LESSONS 2026-06-05 "groomer
+// prose can disagree with the schema; the schema wins":
+//   - pr.state = MERGED uppercase per src/ingest/prs.ts:152 plus the
+//     existing costPerMergedPr and spendEfficiencyRanking callers.
+//   - pr.heal_attempts is INTEGER DEFAULT 0 per src/db.ts:352.
+//   - pr.first_fail_check is TEXT nullable per src/db.ts:339.
+//   - pr.author is TEXT nullable (the GitHub login).
+//   - cost-per-PR derivation mirrors costPerMergedPr: SUM of
+//     cost_rollup_day.cost_usd over the date window divided by the
+//     COUNT of MERGED is_agent PRs over the same date window.
+//
+// Per LESSONS section nodesqlite all-method narrowing every row uses
+// the as-unknown-as RowT double cast.
+// Per LESSONS 2026-06-11 character-window source greps leak into
+// sibling helpers, this comment block uses PLAIN PROSE (no backticks)
+// for any sibling helper identifier - the prior siblings in this
+// region include fleetWeeklyPulse, fleetFailureModes, riskiestOpenPr,
+// stuckPrTaxonomy, costPerMergedPr, and spendEfficiencyRanking.
+// ────────────────────────────────────────────────────────────────────
+
+export type FleetBiggestSurpriseKind =
+  | "silent_project"
+  | "first_time_check"
+  | "spend_doubled"
+  | "heal_streak_broken"
+  | "new_author_red"
+  | "none";
+
+export interface FleetBiggestSurprise {
+  generated_at: string;
+  week_start_iso: string;
+  week_end_iso: string;
+  kind: FleetBiggestSurpriseKind;
+  sentence: string;
+  metric_label: string;
+  metric_baseline: string;
+  metric_this_week: string;
+  deep_link: string | null;
+  candidate_project_slug: string | null;
+}
+
+export interface FleetBiggestSurpriseOptions {
+  /** Wall-clock anchor. Tests pin this; production passes new Date. */
+  now?: Date;
+  /** Future ROI multiplier (parity with fleetWeeklyPulse); the v1
+   *  helper does not use this but the parameter is part of the public
+   *  surface so the route does not have to special-case it. */
+  hourlyRateUsd?: number;
+  /** Trailing baseline window. Defaults to 8 per the AC. Tests may
+   *  override to shrink the fixture footprint. */
+  baselineWeeks?: number;
+}
+
+interface BsPrRow {
+  project_id: number;
+  number: number;
+  state: string | null;
+  author: string | null;
+  url: string | null;
+  fetched_at: string | null;
+  heal_attempts: number | null;
+  first_fail_check: string | null;
+}
+
+interface BsProjectRow {
+  id: number;
+  slug: string;
+  name: string | null;
+}
+
+interface BsRollupRow {
+  project_id: number;
+  day: string;
+  cost_usd: number | null;
+}
+
+/** Return the in-progress Monday-Sunday UTC window for `now`.
+ *  Monday is isoDay=1, Sunday is isoDay=7 (JS getUTCDay shifts to
+ *  Monday-based via the (+6)%7+1 trick used in pulseWeekBoundary). */
+function bsWeekBoundary(now: Date): { startIso: string; endIso: string } {
+  const today = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+  ));
+  const isoDay = (today.getUTCDay() + 6) % 7 + 1; // Mon=1..Sun=7
+  const monday = new Date(today);
+  monday.setUTCDate(monday.getUTCDate() - (isoDay - 1));
+  const sunday = new Date(monday);
+  sunday.setUTCDate(sunday.getUTCDate() + 6);
+  return {
+    startIso: monday.toISOString().slice(0, 10),
+    endIso: sunday.toISOString().slice(0, 10),
+  };
+}
+
+/** Parse a GitHub PR URL into (owner, repo, number). Returns null
+ *  on any malformed shape - the deep_link surface stays null so the
+ *  SPA renders the sentence without a click target. */
+function parseGhPrUrl(url: string | null): { owner: string; repo: string; number: number } | null {
+  if (!url) return null;
+  const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (!m) return null;
+  return { owner: m[1], repo: m[2], number: Number(m[3]) };
+}
+
+/** Render the deep_link for a PR row. /prs/<owner>/<repo>/<number>
+ *  matches the existing pr-detail route shape. */
+function prDeepLink(url: string | null): string | null {
+  const p = parseGhPrUrl(url);
+  if (!p) return null;
+  return "/prs/" + p.owner + "/" + p.repo + "/" + p.number;
+}
+
+/** Median of a non-empty numeric array. Returns null on empty. */
+function median(xs: number[]): number | null {
+  if (xs.length === 0) return null;
+  const sorted = xs.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** Compose the biggest-surprise card. Pure read-side; no writes. */
+export function fleetBiggestSurprise(
+  db: DB,
+  opts: FleetBiggestSurpriseOptions = {},
+): FleetBiggestSurprise {
+  const now = opts.now ?? new Date();
+  const baselineWeeks = Math.max(1, Math.floor(opts.baselineWeeks ?? 8));
+  const { startIso, endIso } = bsWeekBoundary(now);
+  const generatedAt = now.toISOString();
+
+  // ── Window dates ────────────────────────────────────────────────
+  // This week: [startIso, endIso] inclusive on both ends (Mon-Sun).
+  // The prior baseline: 8 complete weeks ending the Sunday BEFORE
+  // startIso. baselineStartIso is `baselineWeeks * 7` days before
+  // startIso; baselineEndIso is the day before startIso.
+  const startDate = new Date(startIso + "T00:00:00.000Z");
+  const baselineEndDate = new Date(startDate);
+  baselineEndDate.setUTCDate(baselineEndDate.getUTCDate() - 1);
+  const baselineStartDate = new Date(startDate);
+  baselineStartDate.setUTCDate(
+    baselineStartDate.getUTCDate() - baselineWeeks * 7,
+  );
+  const baselineStartIso = baselineStartDate.toISOString().slice(0, 10);
+  const baselineEndIso = baselineEndDate.toISOString().slice(0, 10);
+  // 90-day window for the new-author-red candidate.
+  const ninetyDaysAgo = new Date(startDate);
+  ninetyDaysAgo.setUTCDate(ninetyDaysAgo.getUTCDate() - 90);
+  const ninetyDaysAgoIso = ninetyDaysAgo.toISOString().slice(0, 10);
+
+  // ── Default empty payload ──────────────────────────────────────
+  const NONE: FleetBiggestSurprise = {
+    generated_at: generatedAt,
+    week_start_iso: startIso,
+    week_end_iso: endIso,
+    kind: "none",
+    sentence: "Nothing surprising this week - the fleet did what it always does.",
+    metric_label: "",
+    metric_baseline: "",
+    metric_this_week: "",
+    deep_link: null,
+    candidate_project_slug: null,
+  };
+
+  // ── AC10 honest empty state when there are < baselineWeeks weeks
+  //    of pr data. We check by counting distinct ISO weeks present
+  //    in pr.fetched_at across is_agent + MERGED rows.
+  const totalWeeksRow = db.prepare(
+    "SELECT COUNT(DISTINCT strftime('%Y-%W', date(fetched_at))) AS c "
+    + "  FROM pr "
+    + " WHERE state = 'MERGED' AND is_agent = 1 "
+    + "   AND fetched_at IS NOT NULL",
+  ).get() as unknown as { c: number | null } | undefined;
+  const totalWeeks = Number(totalWeeksRow?.c ?? 0);
+  if (totalWeeks < baselineWeeks) {
+    return {
+      ...NONE,
+      sentence: "Your fleet is still warming up - surprises will surface here as the agents accumulate a baseline.",
+    };
+  }
+
+  // ── Pull merged is_agent PR rows across the window of interest:
+  //    baseline span PLUS this week. One SELECT covers every
+  //    candidate's data needs; per-candidate filters happen in JS
+  //    so the SQL stays boring.
+  const prRows = db.prepare(
+    "SELECT pr.project_id AS project_id, pr.number AS number, "
+    + "       pr.state AS state, pr.author AS author, "
+    + "       pr.url AS url, pr.fetched_at AS fetched_at, "
+    + "       COALESCE(pr.heal_attempts, 0) AS heal_attempts, "
+    + "       pr.first_fail_check AS first_fail_check "
+    + "  FROM pr "
+    + " WHERE pr.is_agent = 1 "
+    + "   AND pr.fetched_at IS NOT NULL "
+    + "   AND date(pr.fetched_at) >= ? AND date(pr.fetched_at) <= ?",
+  ).all(baselineStartIso, endIso) as unknown as BsPrRow[];
+
+  const projectRows = db.prepare(
+    "SELECT id, slug, name FROM project ORDER BY slug",
+  ).all() as unknown as BsProjectRow[];
+  const projectById = new Map<number, BsProjectRow>();
+  for (const p of projectRows) projectById.set(p.id, p);
+
+  // ── Helper: which ISO week (Mon-Sun) does a fetched_at fall in?
+  //    Reduce to the Monday-date string of that week. Pure JS; the
+  //    SQL date() function returns yyyy-mm-dd which we re-parse here.
+  function mondayOf(dateStr: string): string {
+    const d = new Date(dateStr + "T00:00:00.000Z");
+    const isoDay = (d.getUTCDay() + 6) % 7 + 1;
+    d.setUTCDate(d.getUTCDate() - (isoDay - 1));
+    return d.toISOString().slice(0, 10);
+  }
+
+  // Per-project merged-count maps keyed by Monday-of-week.
+  // counts[pid] = Map<weekMondayIso, count>
+  const countsByProject = new Map<number, Map<string, number>>();
+  // All merged rows this week, by project, for the heal-streak walk.
+  const mergedRowsByProject = new Map<number, BsPrRow[]>();
+  // All merged rows in baseline + this week, by project (for the
+  // streak walk we need the prior 5 + this week's first).
+  const allMergedByProject = new Map<number, BsPrRow[]>();
+  // first_fail_check sets: baseline-only + this-week.
+  const baselineFailChecks = new Set<string>();
+  const thisWeekFailRows: BsPrRow[] = [];
+  // 90-day-author tracking.
+  const ninetyDayAuthorCounts = new Map<string, number>();
+  const ninetyDayAuthorRedCount = new Map<string, number>();
+  const thisWeekAuthorRedRows: BsPrRow[] = [];
+
+  for (const r of prRows) {
+    if (!r.fetched_at) continue;
+    const isMerged = r.state === "MERGED";
+    if (!isMerged) continue;
+    const day = r.fetched_at.slice(0, 10);
+    const week = mondayOf(day);
+    const inThisWeek = day >= startIso && day <= endIso;
+    // Per-project weekly counts (baseline + this week).
+    let m = countsByProject.get(r.project_id);
+    if (!m) { m = new Map(); countsByProject.set(r.project_id, m); }
+    m.set(week, (m.get(week) ?? 0) + 1);
+
+    // Merged-by-project (sorted later by fetched_at DESC for streak).
+    let allBucket = allMergedByProject.get(r.project_id);
+    if (!allBucket) { allBucket = []; allMergedByProject.set(r.project_id, allBucket); }
+    allBucket.push(r);
+
+    if (inThisWeek) {
+      let twBucket = mergedRowsByProject.get(r.project_id);
+      if (!twBucket) { twBucket = []; mergedRowsByProject.set(r.project_id, twBucket); }
+      twBucket.push(r);
+    }
+
+    // first_fail_check buckets.
+    if (r.first_fail_check) {
+      if (inThisWeek) {
+        thisWeekFailRows.push(r);
+      } else {
+        baselineFailChecks.add(r.first_fail_check);
+      }
+    }
+
+    // 90-day author windows. Trailing 90d = day >= ninetyDaysAgoIso
+    // AND day < startIso (prior); this-week = inThisWeek.
+    if (r.author) {
+      if (day >= ninetyDaysAgoIso && day < startIso) {
+        ninetyDayAuthorCounts.set(
+          r.author, (ninetyDayAuthorCounts.get(r.author) ?? 0) + 1,
+        );
+        if (r.first_fail_check) {
+          ninetyDayAuthorRedCount.set(
+            r.author, (ninetyDayAuthorRedCount.get(r.author) ?? 0) + 1,
+          );
+        }
+      } else if (inThisWeek && r.first_fail_check) {
+        thisWeekAuthorRedRows.push(r);
+      }
+    }
+  }
+
+  // ── Candidate 1: silent-project ────────────────────────────────
+  // For each project: trailing 4 complete weeks immediately before
+  // this week. Compute average merged-count/week. Fire when avg >= 3
+  // AND this week count == 0. Tie-break by slug ASC across multiple
+  // silent projects.
+  const TRAILING_SILENT_WEEKS = 4;
+  const trailingMondays: string[] = [];
+  for (let i = 1; i <= TRAILING_SILENT_WEEKS; i++) {
+    const m2 = new Date(startDate);
+    m2.setUTCDate(m2.getUTCDate() - i * 7);
+    trailingMondays.push(m2.toISOString().slice(0, 10));
+  }
+  interface SilentCandidate { slug: string; avg: number; thisWeek: number; }
+  const silentCandidates: SilentCandidate[] = [];
+  for (const proj of projectRows) {
+    const m = countsByProject.get(proj.id);
+    let sum = 0;
+    for (const wk of trailingMondays) sum += (m?.get(wk) ?? 0);
+    const avg = sum / TRAILING_SILENT_WEEKS;
+    const thisWeekCount = (m?.get(startIso) ?? 0);
+    if (avg >= 3 && thisWeekCount === 0) {
+      silentCandidates.push({ slug: proj.slug, avg, thisWeek: thisWeekCount });
+    }
+  }
+  silentCandidates.sort((a, b) => a.slug.localeCompare(b.slug));
+  if (silentCandidates.length > 0) {
+    const c = silentCandidates[0];
+    const avgRounded = Math.round(c.avg);
+    return {
+      generated_at: generatedAt,
+      week_start_iso: startIso,
+      week_end_iso: endIso,
+      kind: "silent_project",
+      sentence: c.slug + " went quiet this week - 0 PRs merged after 4 weeks averaging " + avgRounded + ".",
+      metric_label: "PRs/week",
+      metric_baseline: "avg " + avgRounded,
+      metric_this_week: "0",
+      deep_link: "/projects/" + c.slug,
+      candidate_project_slug: c.slug,
+    };
+  }
+
+  // ── Candidate 2: first-time-check ──────────────────────────────
+  // Any pr.first_fail_check value present this week and absent from
+  // the trailing baseline. Tie-break by check-name ASC.
+  const firstTimeChecks: BsPrRow[] = [];
+  for (const r of thisWeekFailRows) {
+    if (r.first_fail_check && !baselineFailChecks.has(r.first_fail_check)) {
+      firstTimeChecks.push(r);
+    }
+  }
+  firstTimeChecks.sort((a, b) =>
+    (a.first_fail_check ?? "").localeCompare(b.first_fail_check ?? ""),
+  );
+  if (firstTimeChecks.length > 0) {
+    const r = firstTimeChecks[0];
+    const link = prDeepLink(r.url);
+    return {
+      generated_at: generatedAt,
+      week_start_iso: startIso,
+      week_end_iso: endIso,
+      kind: "first_time_check",
+      sentence: "'" + r.first_fail_check + "' failed for the first time this week (last 8 weeks: never).",
+      metric_label: "first-time check",
+      metric_baseline: "never",
+      metric_this_week: String(r.first_fail_check),
+      deep_link: link,
+      candidate_project_slug: projectById.get(r.project_id)?.slug ?? null,
+    };
+  }
+
+  // ── Candidate 3: spend-doubled ─────────────────────────────────
+  // For each project: per-week cost-per-PR over the trailing 8w
+  // PLUS this week. Cost-per-PR(week) = SUM(cost_rollup_day in week)
+  // / COUNT(merged is_agent PRs in week). Skip weeks with zero
+  // merges (the ratio is undefined). Median over the 8 baseline
+  // weeks gives the comparison anchor.
+  // Pull all cost_rollup_day rows in [baselineStartIso, endIso].
+  const rollupRows = db.prepare(
+    "SELECT project_id, day, COALESCE(cost_usd, 0) AS cost_usd "
+    + "  FROM cost_rollup_day "
+    + " WHERE day >= ? AND day <= ?",
+  ).all(baselineStartIso, endIso) as unknown as BsRollupRow[];
+  const costsByProjectWeek = new Map<number, Map<string, number>>();
+  for (const r of rollupRows) {
+    const week = mondayOf(r.day);
+    let m = costsByProjectWeek.get(r.project_id);
+    if (!m) { m = new Map(); costsByProjectWeek.set(r.project_id, m); }
+    m.set(week, (m.get(week) ?? 0) + Number(r.cost_usd ?? 0));
+  }
+  interface SpendCandidate {
+    slug: string;
+    baselineMedian: number;
+    thisWeek: number;
+  }
+  const spendCandidates: SpendCandidate[] = [];
+  for (const proj of projectRows) {
+    const counts = countsByProject.get(proj.id);
+    const costs = costsByProjectWeek.get(proj.id);
+    if (!counts || !costs) continue;
+    const baselineCpps: number[] = [];
+    for (const wk of trailingMondays) {
+      const c = counts.get(wk) ?? 0;
+      const s = costs.get(wk) ?? 0;
+      if (c > 0) baselineCpps.push(s / c);
+    }
+    // Use up to baselineWeeks back. Include the prior 4 weeks
+    // covered by trailingMondays plus the older ones; rebuild.
+    const fullBaselineMondays: string[] = [];
+    for (let i = 1; i <= baselineWeeks; i++) {
+      const m2 = new Date(startDate);
+      m2.setUTCDate(m2.getUTCDate() - i * 7);
+      fullBaselineMondays.push(m2.toISOString().slice(0, 10));
+    }
+    const fullCpps: number[] = [];
+    for (const wk of fullBaselineMondays) {
+      const c = counts.get(wk) ?? 0;
+      const s = costs.get(wk) ?? 0;
+      if (c > 0) fullCpps.push(s / c);
+    }
+    const med = median(fullCpps);
+    if (med == null || med <= 0) continue;
+    const thisWeekCount = counts.get(startIso) ?? 0;
+    const thisWeekCost = costs.get(startIso) ?? 0;
+    if (thisWeekCount === 0) continue;
+    const thisWeekCpp = thisWeekCost / thisWeekCount;
+    const absDelta = thisWeekCpp - med;
+    if (thisWeekCpp >= 2 * med && absDelta >= 1.0) {
+      spendCandidates.push({
+        slug: proj.slug,
+        baselineMedian: med,
+        thisWeek: thisWeekCpp,
+      });
+    }
+    void baselineCpps;
+  }
+  // Tie-break: highest absolute delta first; then slug ASC.
+  spendCandidates.sort((a, b) => {
+    const dA = a.thisWeek - a.baselineMedian;
+    const dB = b.thisWeek - b.baselineMedian;
+    if (dA !== dB) return dB - dA;
+    return a.slug.localeCompare(b.slug);
+  });
+  if (spendCandidates.length > 0) {
+    const c = spendCandidates[0];
+    const formatUsd = (n: number) => "$" + (Math.round(n * 100) / 100).toFixed(2);
+    return {
+      generated_at: generatedAt,
+      week_start_iso: startIso,
+      week_end_iso: endIso,
+      kind: "spend_doubled",
+      sentence: c.slug + "'s cost-per-PR jumped from " + formatUsd(c.baselineMedian)
+        + " to " + formatUsd(c.thisWeek) + " this week.",
+      metric_label: "cost-per-PR",
+      metric_baseline: formatUsd(c.baselineMedian),
+      metric_this_week: formatUsd(c.thisWeek),
+      deep_link: "/projects/" + c.slug,
+      candidate_project_slug: c.slug,
+    };
+  }
+
+  // ── Candidate 4: heal-streak-broken ────────────────────────────
+  // For each project: take all merged PRs ordered by fetched_at
+  // DESC. If a this-week row has heal_attempts >= 1 AND the
+  // five PRIOR merges (older than this-week) all have
+  // heal_attempts = 0, fire. Tie-break: highest heal_attempts on
+  // this week's row; then slug ASC.
+  interface HealCandidate {
+    slug: string; healAttempts: number; prNumber: number;
+    url: string | null;
+  }
+  const healCandidates: HealCandidate[] = [];
+  for (const proj of projectRows) {
+    const allRows = allMergedByProject.get(proj.id);
+    if (!allRows || allRows.length === 0) continue;
+    // Newest first; this-week first if equal.
+    const sorted = allRows.slice().sort((a, b) => {
+      const fa = a.fetched_at ?? "";
+      const fb = b.fetched_at ?? "";
+      if (fb !== fa) return fb.localeCompare(fa);
+      return b.number - a.number;
+    });
+    // Find the newest this-week row with heal_attempts >= 1.
+    const thisWeekHeal = sorted.find((r) => {
+      if (!r.fetched_at) return false;
+      const day = r.fetched_at.slice(0, 10);
+      return day >= startIso && day <= endIso
+        && (r.heal_attempts ?? 0) >= 1;
+    });
+    if (!thisWeekHeal) continue;
+    // Walk five prior merges (older than this-week-row's fetched_at).
+    const priorClean = sorted.filter((r) => {
+      if (!r.fetched_at || !thisWeekHeal.fetched_at) return false;
+      return r.fetched_at < thisWeekHeal.fetched_at;
+    });
+    if (priorClean.length < 5) continue;
+    const lastFive = priorClean.slice(0, 5);
+    if (lastFive.every((r) => (r.heal_attempts ?? 0) === 0)) {
+      healCandidates.push({
+        slug: proj.slug,
+        healAttempts: thisWeekHeal.heal_attempts ?? 0,
+        prNumber: thisWeekHeal.number,
+        url: thisWeekHeal.url,
+      });
+    }
+  }
+  healCandidates.sort((a, b) => {
+    if (b.healAttempts !== a.healAttempts) return b.healAttempts - a.healAttempts;
+    return a.slug.localeCompare(b.slug);
+  });
+  if (healCandidates.length > 0) {
+    const c = healCandidates[0];
+    const link = prDeepLink(c.url);
+    const healWord = c.healAttempts === 1 ? "heal" : "heals";
+    return {
+      generated_at: generatedAt,
+      week_start_iso: startIso,
+      week_end_iso: endIso,
+      kind: "heal_streak_broken",
+      sentence: c.slug + "'s 5-PR clean-merge streak ended this week (PR #"
+        + c.prNumber + " took " + c.healAttempts + " " + healWord + ").",
+      metric_label: "heal-attempts",
+      metric_baseline: "0",
+      metric_this_week: String(c.healAttempts),
+      deep_link: link,
+      candidate_project_slug: c.slug,
+    };
+  }
+
+  // ── Candidate 5: new-author-red ────────────────────────────────
+  // For each author with >= 5 trailing-90d merged PRs and ZERO
+  // first_fail_check across that 90d window, a this-week row with
+  // first_fail_check set fires. Tie-break: author ASC.
+  const newAuthorRedRows: BsPrRow[] = [];
+  for (const r of thisWeekAuthorRedRows) {
+    if (!r.author) continue;
+    const ninety = ninetyDayAuthorCounts.get(r.author) ?? 0;
+    const ninetyRed = ninetyDayAuthorRedCount.get(r.author) ?? 0;
+    if (ninety >= 5 && ninetyRed === 0) {
+      newAuthorRedRows.push(r);
+    }
+  }
+  newAuthorRedRows.sort((a, b) =>
+    (a.author ?? "").localeCompare(b.author ?? ""),
+  );
+  if (newAuthorRedRows.length > 0) {
+    const r = newAuthorRedRows[0];
+    const link = prDeepLink(r.url);
+    return {
+      generated_at: generatedAt,
+      week_start_iso: startIso,
+      week_end_iso: endIso,
+      kind: "new_author_red",
+      sentence: r.author + "'s first red CI in 90 days landed this week.",
+      metric_label: "red CIs (90d)",
+      metric_baseline: "0",
+      metric_this_week: "1",
+      deep_link: link,
+      candidate_project_slug: projectById.get(r.project_id)?.slug ?? null,
+    };
+  }
+
+  return NONE;
+}
