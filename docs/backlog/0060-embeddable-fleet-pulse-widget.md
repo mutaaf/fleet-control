@@ -1,7 +1,7 @@
 ---
 id: 0060
 title: Embeddable HTML pulse widget - paste-one-line snippet that drops a live fleet pulse into any personal blog or README so every reader becomes a fleet-control prospect
-status: in-progress
+status: shipped
 priority: P2
 area: portal
 created: 2026-06-13
@@ -459,3 +459,9 @@ tuple uses `(MAX(pr.fetched_at), COUNT(*))` over `pr`, mirroring 0040 /
     copy-pastable snippets (iframe / img / markdown). The existing
     `GET /share/<token>` snapshot route stays untouched.
   - One `tests/embed-pulse.test.ts` with one `test(...)` per AC.
+- 2026-06-13: PR #142 squash-merged to main with both gating checks
+  green (typecheck + validate). The embed widget is live: paste
+  `<iframe src="<host>/embed/pulse.html" width="300" height="180"
+  frameborder="0"></iframe>` into any blog or paste `[![fleet
+  pulse](<host>/embed/pulse.svg)](<host>/pulse)` into any GitHub
+  README. The operator copies the snippet from `/share` on the portal.
