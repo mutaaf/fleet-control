@@ -1,7 +1,7 @@
 ---
 id: 0058
 title: Public failure-mode landing pages - anonymised /failures/<signature> SEO surface authored from real cross-project correlations the fleet caught
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-13
