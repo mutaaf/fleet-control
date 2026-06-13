@@ -52,6 +52,16 @@ export interface FleetConfig {
     hourly_rate_usd?: number;
     hours_per_pr?: number;
   };
+  /** Embed-origin allowlist for the /embed/pulse.html iframe widget
+   *  (ticket 0060). When omitted (or empty) the embed page's
+   *  X-Frame-Options + Content-Security-Policy frame-ancestors are
+   *  SAMEORIGIN / 'self' — the widget renders ONLY on the operator's
+   *  own host. When the operator lists explicit origins (e.g.
+   *  ["https://operator.dev", "https://github.com"]) both headers
+   *  widen to include them so the embed can render on those surfaces.
+   *  The list is value-filtered downstream; passing junk leaves the
+   *  default-safe headers in place. */
+  embedOrigins?: string[];
 }
 
 const DEFAULTS: FleetConfig = {

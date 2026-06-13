@@ -184,5 +184,15 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_failure_modes_invalidate__?: () => void }).__fleet_failure_modes_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0060: embeddable pulse widget memo cache. Same globalThis-
+  // slot pattern as every other read-side cache. A freshly-merged PR
+  // or a freshly-landed run row shifts the embed payload; clearing
+  // the cache on every commit lets the next /embed/pulse.html or
+  // /embed/pulse.svg render rebuild without waiting out the 5-minute
+  // TTL.
+  try {
+    const hook = (globalThis as { __fleet_embed_pulse_invalidate__?: () => void }).__fleet_embed_pulse_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }
