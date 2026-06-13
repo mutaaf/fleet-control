@@ -636,6 +636,13 @@ async function fetchMondayCatchUp() {
 // dismissed:<YYYY-MM-DD>. Quiet hours suppress the dismiss chevron
 // and soften the eyebrow ("tip of the day" → "tonight's lesson") per
 // the 0030 pull-vs-push contract.
+// Ticket 0059: biggest surprise this week. Lazy-fetched from
+// /api/fleet/biggest-surprise; errors fall through silently so the
+// rest of the home page still loads when the endpoint is unreachable.
+async function fetchBiggestSurprise() {
+  try { return await get("/api/fleet/biggest-surprise"); } catch { return null; }
+}
+
 async function fetchLessonOfTheDay() {
   try { return await get("/api/fleet/lesson-of-the-day"); } catch { return null; }
 }
@@ -2213,6 +2220,89 @@ function renderLessonOfTheDay(data, opts) {
   </a>`;
 }
 
+// Ticket 0059: biggest surprise this week. One subdued card below the
+// lesson-of-the-day card; the dismiss chevron POSTs to
+// /api/fleet/inbox/dismiss with kind='biggest_surprise' and
+// payload_id=week_start_iso so the dismissal lives for the rest of
+// the week (a fresh week un-hides the card on its own because the
+// payload_id rolls forward). The card hides on Monday (0038's catch-
+// up owns Monday) — that branch is driven by the today() weekday
+// check below.
+function todayWeekdayKey() {
+  const w = new Date().getUTCDay(); // Sun=0..Sat=6
+  return ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"][w];
+}
+
+function renderBiggestSurprise(data) {
+  if (!data) return "";
+  // Server flag — the route appends a `dismissed` boolean by reading
+  // inbox_dismissal for this week's payload_id.
+  if (data.dismissed === true) return "";
+  // Monday-hide: the 0038 Monday catch-up card owns Monday; this
+  // card stands down so they don't compete for attention.
+  if (todayWeekdayKey() === "monday") return "";
+  const quiet = !!data.quiet_hours_active;
+  const eyebrow = quiet ? "this week's surprise (quiet)" : "this week's surprise";
+  const sentence = String(data.sentence || "");
+  if (data.kind === "none") {
+    return `<section class="biggest-surprise-card" data-testid="biggest-surprise-card">`
+      + `<div class="biggest-surprise-eyebrow" data-testid="biggest-surprise-eyebrow">${esc(eyebrow)}</div>`
+      + `<div class="biggest-surprise-sentence" data-testid="biggest-surprise-sentence">${esc(sentence)}</div>`
+      + `</section>`;
+  }
+  const metricLabel = esc(String(data.metric_label || ""));
+  const metricBaseline = esc(String(data.metric_baseline || ""));
+  const metricThisWeek = esc(String(data.metric_this_week || ""));
+  const weekStart = esc(String(data.week_start_iso || ""));
+  const deepLink = data.deep_link
+    ? `<a class="biggest-surprise-cta" data-testid="biggest-surprise-cta" href="${esc(String(data.deep_link))}">Look here</a>`
+    : "";
+  const dismiss = `<button class="biggest-surprise-dismiss" data-testid="biggest-surprise-dismiss"`
+    + ` data-act="biggest-surprise-dismiss" data-week-start="${weekStart}"`
+    + ` type="button" aria-label="Dismiss for the rest of the week">×</button>`;
+  return `<section class="biggest-surprise-card" data-testid="biggest-surprise-card" data-kind="${esc(String(data.kind || ""))}">`
+    + `<div class="biggest-surprise-head">`
+    + `<span class="biggest-surprise-eyebrow" data-testid="biggest-surprise-eyebrow">${esc(eyebrow)}</span>`
+    + dismiss
+    + `</div>`
+    + `<div class="biggest-surprise-sentence" data-testid="biggest-surprise-sentence">${esc(sentence)}</div>`
+    + `<div class="biggest-surprise-metric" data-testid="biggest-surprise-metric">`
+    + `<span class="biggest-surprise-metric-label">${metricLabel}</span> `
+    + `<span class="biggest-surprise-metric-baseline" data-testid="biggest-surprise-metric-baseline">${metricBaseline}</span>`
+    + ` → `
+    + `<span class="biggest-surprise-metric-this-week" data-testid="biggest-surprise-metric-this-week">${metricThisWeek}</span>`
+    + `</div>`
+    + deepLink
+    + `</section>`;
+}
+
+// Dismiss handler — POST to /api/fleet/inbox/dismiss with the
+// documented kind/project_slug/payload_id triple, then drop the card
+// from the DOM. localStorage isn't needed because the server-side
+// inbox_dismissal table is the source of truth (re-render reads the
+// dismissed flag off the JSON route).
+document.addEventListener("click", (e) => {
+  const b = e.target && e.target.closest && e.target.closest("[data-act='biggest-surprise-dismiss']");
+  if (!b) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const weekStart = b.getAttribute("data-week-start") || "";
+  if (!weekStart) return;
+  try {
+    fetch("/api/fleet/inbox/dismiss", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "biggest_surprise",
+        project_slug: "fleet",
+        payload_id: weekStart,
+      }),
+    });
+  } catch { /* network-blip: let the next refresh land it */ }
+  const card = b.closest && b.closest("[data-testid='biggest-surprise-card']");
+  if (card && card.parentNode) card.parentNode.removeChild(card);
+});
+
 // Dismiss handler — toggle the per-day localStorage flag and re-render
 // home so the card disappears. localStorage key per the AC:
 // `fleet:lesson-of-the-day-dismissed:<YYYY-MM-DD>`.
@@ -2473,8 +2563,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData, worthItData, lessonOfTheDayData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(), fetchFleetWorthIt(), fetchLessonOfTheDay(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData, worthItData, lessonOfTheDayData, biggestSurpriseData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(), fetchFleetWorthIt(), fetchLessonOfTheDay(), fetchBiggestSurprise(),
   ]);
   // Ticket 0043: fetch the new-since-visit diff using the additive
   // `previous_last_seen` field from /api/fleet (the PRE-upsert
@@ -2528,6 +2618,7 @@ async function home() {
     renderCostPerPrSummary(costPerPrData) +
     renderYesterdayGlance(glanceData) +
     renderLessonOfTheDay(lessonOfTheDayData, { dismissed: isLessonOfTheDayDismissed() }) +
+    renderBiggestSurprise(biggestSurpriseData) +
     renderRiskiestPr(riskiestPrData) +
     renderStuckPrTaxonomyCard(stuckPrTaxonomyData) +
     renderPrAutopsyCard(prAutopsiesData) +

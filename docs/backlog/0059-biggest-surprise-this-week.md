@@ -1,7 +1,7 @@
 ---
 id: 0059
 title: Biggest surprise this week - one Tuesday-morning card surfaces the single thing the operator would have missed so the daily glance becomes a habit ritual
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-13
@@ -422,4 +422,65 @@ COUNT(*) over pr in window)`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13: implementation-dev started on branch
+  feat/0059-biggest-surprise-this-week. Plan:
+  (1) write the failing test suite tests/biggest-surprise.test.ts
+      covering every AC checkbox;
+  (2) add `fleetBiggestSurprise(db, opts)` to src/views.ts next to
+      fleetWeeklyPulse, composing pr + project + inbox_dismissal
+      tables — no schema migration;
+  (3) extend `InboxKind` and `dismissInboxItem` to accept the new
+      `biggest_surprise` kind (the inbox_dismissal table column is
+      TEXT NOT NULL with no CHECK so the storage layer needs no
+      change — just the type and the validator);
+  (4) wire GET /api/fleet/biggest-surprise (auth required, value-side
+      redactor) and a `_resetBiggestSurpriseCacheForTests` /
+      `_getBiggestSurpriseCacheBuildsForTests` cache seam;
+  (5) expose `_renderBiggestSurpriseForTests(payload, opts)` so the
+      Monday-hide + empty-state + mobile-breakpoint branches drive
+      via a renderer-direct seam (per LESSONS 2026-06-11) instead of
+      mutating fleet-control.config.json in cwd;
+  (6) add the home-page card to web/app.js below renderLessonOfTheDay
+      and one CSS selector group in web/style.css; both reuse the
+      existing accent/dim/bg/mono tokens. PRODUCER-VS-SPEC: the
+      pr.state literal is 'MERGED' (uppercase) per src/ingest/prs.ts
+      and the existing costPerMergedPr / spendEfficiencyRanking
+      callers.
+- 2026-06-13: shipped. 17/17 new tests green; local gate (npm ci +
+  tsc --noEmit + scripts/check-backlog.mjs) clean. Full suite delta
+  vs main: 28 pre-existing failures unchanged (all are graveyard
+  tests pinned to time anchors or background-process tests that flake
+  per LESSONS 2026-05-29; none are gating checks). Implementation
+  notes:
+  * The 8-week warming-up threshold (AC10) means the AC2/AC5/AC6
+    fixtures had to seed >=8 weeks of pr data even though the
+    individual candidates only inspect the trailing 4 / 5 / 90-day
+    windows. The pr-data-count check is a counter for COUNT(DISTINCT
+    strftime('%Y-%W', date(fetched_at))) across MERGED is_agent rows,
+    so a fixture with 1 PR/week × 8 weeks satisfies the gate.
+  * The /api/fleet/biggest-surprise route uses real `now` (not a
+    pinned anchor) so the AC8 round-trip test asserts the dismiss
+    contract through the actual week-start emitted by the route. The
+    test reads inbox_dismissal directly to confirm the row landed
+    AND re-fetches to confirm the route surfaces dismissed=true after
+    busting the in-process memo.
+  * Per LESSONS 2026-06-11 (renderer-direct seam for branch tests)
+    the AC9 Monday-hide and AC11 mobile-breakpoint branches drive via
+    `_renderBiggestSurpriseForTests(payload, {today, ...})` instead
+    of mutating fleet-control.config.json in cwd. The boot-path AC8
+    only writes the empty-roots config (no non-default fields), so
+    it doesn't race against parallel test files that also mutate
+    quietHours etc.
+  * Per LESSONS 2026-06-10 (redactSecrets shreds JSON keys) the
+    redactor scrubs the four operator-supplied STRING VALUES
+    (sentence, metric_label, metric_baseline, metric_this_week)
+    BEFORE JSON.stringify; structural fields like
+    `candidate_project_slug` survive intact.
+  * Per LESSONS 2026-06-07 (the pr table has no surrogate id) the
+    cache invalidation tuple uses (MAX(fetched_at), COUNT(*) FROM pr)
+    plus (MAX(day), COUNT(*) FROM cost_rollup_day) so a fresh PR row
+    OR a fresh rollup row both bust the cache.
+  * Per LESSONS 2026-06-13 (function-import cycles ≠ cache-
+    invalidation) the helper avoids any new src/views.ts import edges
+    — `parseGhPrUrl` is a private inline helper, not a re-use of
+    correlate.ts or any module that already imports views.ts.

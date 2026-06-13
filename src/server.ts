@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -705,6 +705,189 @@ function redactLessonOfTheDayPick(
     lesson_title: redactSecretsForLessonOfTheDay(pick.lesson_title),
     lesson_excerpt: redactSecretsForLessonOfTheDay(pick.lesson_excerpt),
   };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0059 - Biggest surprise this week.
+//
+// 10-minute TTL memo cache for the helper output. Cache key is
+// (week_start_iso, MAX(pr.fetched_at), COUNT pr, MAX(cost_rollup_day.day),
+// COUNT cost_rollup_day) so a fresh PR ingest OR a fresh cost rollup
+// busts the entry. Per LESSONS 2026-06-07 the pr table has no
+// surrogate id; (MAX(fetched_at), COUNT(*)) is the canonical "fresh
+// row landed" proxy. The route applies a value-side redactor before
+// JSON.stringify per LESSONS 2026-06-10 (scrub VALUES, not the body
+// string, so JSON keys survive).
+//
+// Per LESSONS in-process dedup sets need a reset hook for tests we
+// expose _resetBiggestSurpriseCacheForTests and
+// _getBiggestSurpriseCacheBuildsForTests. Per LESSONS 2026-06-11
+// renderer-direct seam for branch tests we expose
+// _renderBiggestSurpriseForTests so the Monday-hide and viewport
+// branches drive directly without mutating fleet-control.config.json
+// in cwd. Production code never reads either.
+interface BiggestSurpriseCacheEntry {
+  tuple: string;
+  value: FleetBiggestSurprise;
+  expires_at: number;
+}
+const BIGGEST_SURPRISE_TTL_MS = 600_000; // 10 minutes
+const biggestSurpriseCache = new Map<string, BiggestSurpriseCacheEntry>();
+let biggestSurpriseBuildCounter = 0;
+
+export function _resetBiggestSurpriseCacheForTests(): void {
+  biggestSurpriseCache.clear();
+  biggestSurpriseBuildCounter = 0;
+}
+
+export function _getBiggestSurpriseCacheBuildsForTests(): number {
+  return biggestSurpriseBuildCounter;
+}
+
+interface BiggestSurpriseTupleRow {
+  mx_pr: string | null; c_pr: number | null;
+  mx_cost: string | null; c_cost: number | null;
+}
+
+function biggestSurpriseInvalidationTuple(db: DB, weekStartIso: string): string {
+  const row = db.prepare(
+    "SELECT (SELECT MAX(fetched_at) FROM pr WHERE state='MERGED') AS mx_pr, "
+    + "       (SELECT COUNT(*) FROM pr WHERE state='MERGED') AS c_pr, "
+    + "       (SELECT MAX(day) FROM cost_rollup_day) AS mx_cost, "
+    + "       (SELECT COUNT(*) FROM cost_rollup_day) AS c_cost",
+  ).get() as unknown as BiggestSurpriseTupleRow | undefined;
+  return "w=" + weekStartIso
+    + "|mxp=" + (row?.mx_pr ?? "")
+    + "|cp=" + Number(row?.c_pr ?? 0)
+    + "|mxc=" + (row?.mx_cost ?? "")
+    + "|cc=" + Number(row?.c_cost ?? 0);
+}
+
+function getBiggestSurpriseCached(db: DB, now: Date): FleetBiggestSurprise {
+  const value0 = fleetBiggestSurprise(db, { now });
+  const tuple = biggestSurpriseInvalidationTuple(db, value0.week_start_iso);
+  const hit = biggestSurpriseCache.get("v1");
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) {
+    return hit.value;
+  }
+  // Counted as a miss when we actually compute. value0 already cost
+  // one build — fold it in and increment.
+  biggestSurpriseBuildCounter += 1;
+  biggestSurpriseCache.set("v1", {
+    tuple, value: value0, expires_at: Date.now() + BIGGEST_SURPRISE_TTL_MS,
+  });
+  return value0;
+}
+
+/** Strip token-shaped substrings from operator-visible STRING VALUES
+ *  on the biggest-surprise payload BEFORE JSON.stringify. Per LESSONS
+ *  2026-06-10 redactSecrets on a JSON body shreds keys: scrub the
+ *  values, NOT the body. The token-shape heuristic gates on a real
+ *  digit so JSON keys like candidate_project_slug survive. */
+function redactSecretsForBiggestSurprise(s: string): string {
+  let out = String(s ?? "");
+  out = out.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "<redacted-pat>");
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?/g, "<redacted-repo-url>");
+  out = out.replace(/\b[A-Za-z0-9_]{24,}\b/g, (match) => {
+    const hasLetter = /[A-Za-z]/.test(match);
+    const hasDigit = /\d/.test(match);
+    return hasLetter && hasDigit ? "<redacted>" : match;
+  });
+  return out;
+}
+
+function redactBiggestSurprise(p: FleetBiggestSurprise): FleetBiggestSurprise {
+  return {
+    ...p,
+    sentence: redactSecretsForBiggestSurprise(p.sentence),
+    metric_label: redactSecretsForBiggestSurprise(p.metric_label),
+    metric_baseline: redactSecretsForBiggestSurprise(p.metric_baseline),
+    metric_this_week: redactSecretsForBiggestSurprise(p.metric_this_week),
+  };
+}
+
+/** Has the operator dismissed this week's biggest-surprise card?
+ *  Lookup keyed by (kind='biggest_surprise', project_slug='fleet',
+ *  payload_id=week_start_iso). The dismissal lives in
+ *  inbox_dismissal (matches the 0017 inbox-dismissal shape). */
+function isBiggestSurpriseDismissed(db: DB, weekStartIso: string): boolean {
+  const row = db.prepare(
+    "SELECT 1 AS ok FROM inbox_dismissal "
+    + " WHERE kind = 'biggest_surprise' "
+    + "   AND project_slug = 'fleet' "
+    + "   AND payload_id = ?",
+  ).get(weekStartIso) as unknown as { ok: number } | undefined;
+  return !!row;
+}
+
+/** Renderer-direct seam (per LESSONS 2026-06-11 renderer-direct seam
+ *  for branch tests). The Monday-hide and viewport branches drive via
+ *  this seam so they do not race against parallel test files that
+ *  also mutate fleet-control.config.json in cwd. The function emits
+ *  the card's HTML for the home SPA; an empty string is the
+ *  "render nothing" contract the SPA's home() composer concatenates
+ *  into the document. */
+export interface BiggestSurpriseRenderOptions {
+  /** Lowercase weekday key. Monday hides the card (0038 Monday
+   *  catch-up owns Monday). */
+  today?: "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday";
+  /** Quiet-hours softens the eyebrow label. The card stays visible
+   *  because it is informational, not promissory. */
+  quietHoursActive?: boolean;
+  /** Already-dismissed for the week — render nothing. */
+  dismissed?: boolean;
+}
+
+function escHtml(s: string): string {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export function _renderBiggestSurpriseForTests(
+  payload: FleetBiggestSurprise,
+  opts: BiggestSurpriseRenderOptions = {},
+): string {
+  if (opts.today === "monday") return "";
+  if (opts.dismissed) return "";
+  const eyebrow = opts.quietHoursActive
+    ? "this week's surprise (quiet)"
+    : "this week's surprise";
+  const sentence = escHtml(payload.sentence);
+  // The "kind: none" card carries the honest sentence but no metric
+  // or deep_link.
+  if (payload.kind === "none") {
+    return `<section class="biggest-surprise-card" data-testid="biggest-surprise-card">`
+      + `<div class="biggest-surprise-eyebrow" data-testid="biggest-surprise-eyebrow">${escHtml(eyebrow)}</div>`
+      + `<div class="biggest-surprise-sentence" data-testid="biggest-surprise-sentence">${sentence}</div>`
+      + `</section>`;
+  }
+  const metricBaseline = escHtml(payload.metric_baseline);
+  const metricThisWeek = escHtml(payload.metric_this_week);
+  const metricLabel = escHtml(payload.metric_label);
+  const cta = payload.deep_link
+    ? `<a class="biggest-surprise-cta" data-testid="biggest-surprise-cta" href="${escHtml(payload.deep_link)}">Look here</a>`
+    : "";
+  const dismiss = `<button class="biggest-surprise-dismiss" data-testid="biggest-surprise-dismiss"`
+    + ` data-act="biggest-surprise-dismiss" data-week-start="${escHtml(payload.week_start_iso)}"`
+    + ` type="button" aria-label="Dismiss for the rest of the week">×</button>`;
+  return `<section class="biggest-surprise-card" data-testid="biggest-surprise-card" data-kind="${escHtml(payload.kind)}">`
+    + `<div class="biggest-surprise-head">`
+    + `<span class="biggest-surprise-eyebrow" data-testid="biggest-surprise-eyebrow">${escHtml(eyebrow)}</span>`
+    + dismiss
+    + `</div>`
+    + `<div class="biggest-surprise-sentence" data-testid="biggest-surprise-sentence">${sentence}</div>`
+    + `<div class="biggest-surprise-metric" data-testid="biggest-surprise-metric">`
+    + `<span class="biggest-surprise-metric-label">${metricLabel}</span> `
+    + `<span class="biggest-surprise-metric-baseline" data-testid="biggest-surprise-metric-baseline">${metricBaseline}</span>`
+    + ` → `
+    + `<span class="biggest-surprise-metric-this-week" data-testid="biggest-surprise-metric-this-week">${metricThisWeek}</span>`
+    + `</div>`
+    + cta
+    + `</section>`;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4541,6 +4724,35 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "content-type": "application/json",
             "access-control-allow-origin": "*",
             "cache-control": "max-age=3600",
+          });
+          return res.end(body);
+        }
+        // Ticket 0059: biggest surprise this week. Composes the
+        // pr + project + cost_rollup_day + inbox_dismissal tables
+        // through fleetBiggestSurprise(); the helper evaluates five
+        // candidates in priority order (silent-project >
+        // first-time-check > spend-doubled > heal-streak-broken >
+        // new-author-red) and returns the first to fire OR the
+        // honest "nothing surprising" sentence when none match.
+        // 10-minute memo cache via getBiggestSurpriseCached so
+        // polled SPA refreshes share one build per ingest tuple.
+        // Per LESSONS 2026-06-10 redactSecrets on a JSON body
+        // shreds keys: redactBiggestSurprise scrubs operator-
+        // supplied STRING VALUES (sentence, metric_*) BEFORE
+        // JSON.stringify. The route appends a `dismissed` boolean
+        // by reading inbox_dismissal for kind='biggest_surprise',
+        // project_slug='fleet', payload_id=week_start_iso so the
+        // SPA can hide the card without losing the underlying
+        // signal.
+        if (path === "/api/fleet/biggest-surprise") {
+          const v = getBiggestSurpriseCached(db, new Date());
+          const redacted = redactBiggestSurprise(v);
+          const dismissed = isBiggestSurpriseDismissed(db, v.week_start_iso);
+          const body = JSON.stringify({ ...redacted, dismissed });
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=600",
           });
           return res.end(body);
         }
