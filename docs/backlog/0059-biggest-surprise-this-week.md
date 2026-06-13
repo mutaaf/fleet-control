@@ -1,7 +1,7 @@
 ---
 id: 0059
 title: Biggest surprise this week - one Tuesday-morning card surfaces the single thing the operator would have missed so the daily glance becomes a habit ritual
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-13
