@@ -785,3 +785,46 @@ each side OR hoist the helper to a tiny third module (e.g.
 slot pattern stays in its lane: it's the right answer ONLY when one
 side owns a cache the other side's COMMIT must invalidate. A pure
 function dependency is not that shape.
+
+## 2026-06-13 — per-candidate detection fixtures must also satisfy the global empty-fleet gate
+
+Symptom: while shipping ticket 0059 (biggest surprise this week)
+the AC2/AC5/AC6 candidate-detection tests all failed on first
+run with `kind:'none'` and the warming-up sentence — even though
+each fixture seeded the documented per-candidate minimum (4
+weeks for silent-project, 5 prior merges for heal-streak, 5
+trailing-90d PRs for new-author-red). The helper was correct;
+each candidate's local threshold was met. But the helper ALSO
+enforced a GLOBAL "fleet has < N weeks of pr data → warming
+up" empty-state gate (the documented AC10 honest empty state)
+which fires BEFORE the candidates are evaluated. The per-
+candidate fixtures didn't satisfy that earlier gate, so the
+helper short-circuited into the empty-state branch and never
+ran the per-candidate logic. Cause: the spec lists the per-
+candidate minimums (4 weeks for silent-project, etc.) as the
+"detection threshold" but also lists a SEPARATE global
+"warming up" threshold (< 8 weeks) as a sibling AC. The two
+ACs read as independent in prose but are evaluated in series
+by the helper. A fixture that satisfies only the per-candidate
+local minimum is necessarily a "warming up" fleet under the
+global gate. Fix: each per-candidate test fixture seeds enough
+trailing data to clear BOTH the global empty-fleet gate AND
+the candidate-specific threshold — for biggest-surprise that
+meant adding 4 extra weeks of single-PR baseline rows beyond
+the candidate's own 4-week / 5-PR / 5-trailing-PR fixture so
+the helper's `COUNT(DISTINCT strftime('%Y-%W', date(fetched_at)))`
+across MERGED is_agent rows clears the 8-week threshold. The
+extra rows are below every candidate's per-test threshold so
+they don't accidentally fire a different candidate. General
+rule for this repo: any helper that gates a "are we ready to
+report?" empty-state check BEFORE per-candidate evaluation
+forces every per-candidate test fixture to also satisfy that
+earlier gate. When designing the test suite, write the global
+empty-state fixture FIRST (it's the simplest) then layer each
+per-candidate fixture ON TOP — never assume the per-candidate
+minimums also clear the global gate, because the global gate
+is usually a "data maturity" threshold computed across all
+rows, not the per-candidate subset. Same trap will bite any
+future ticket whose helper composes a "report nothing until
+the fleet has matured for N weeks" guard ahead of the actual
+detection logic.
