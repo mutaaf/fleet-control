@@ -1,7 +1,7 @@
 ---
 id: 0062
 title: Monthly fleet retro card - one home-page card on the first weekday of each month surfaces month-over-month deltas so the operator gets a reflection ritual they would not skip
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-15
@@ -444,4 +444,20 @@ the per-comparison threshold.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15: implementation-dev picked the ticket. Branch
+  feat/0062-monthly-fleet-retro-card off origin/main. Read AGENTS.md,
+  LESSONS, the ticket, and the closest sibling (0059 biggest-surprise).
+  Producer-vs-spec audit: src/ingest/prs.ts:188 writes 'open' lower for
+  open PRs and 'MERGED' upper for merged rows; src/db.ts:352 declares
+  pr.heal_attempts INTEGER DEFAULT 0; src/receipts.ts:127-138 groups by
+  month via lex-comparable monthStart/monthEnd ISO ranges over
+  pr.fetched_at (not strftime). Reusing the receipts pattern. The
+  existing /api/fleet/inbox/dismiss endpoint already supports
+  inbox_dismissal writes for arbitrary kinds; per the AC we ALSO expose
+  a dedicated POST /api/control/dismiss-monthly-retro route so the SPA
+  has the documented endpoint shape and operators / future tests get a
+  clear single chokepoint for this card. Plan: new src/retro.ts module
+  (helper + isMonthlyRetroDay gate) imported by views.ts via a private
+  re-export to keep the function-import cycle lesson in mind; route +
+  cache + globalThis-slot invalidation in src/server.ts; renderer-
+  direct seam + dismiss handler in web/app.js; one CSS selector group.
