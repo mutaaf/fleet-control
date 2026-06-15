@@ -1,7 +1,7 @@
 ---
 id: 0063
 title: Embeddable lesson-of-the-day widget - paste-one-line snippet that rotates a cross-fleet operational lesson into any blog or README so every reader sees a real fleet insight
-status: in-progress
+status: shipped
 priority: P2
 area: portal
 created: 2026-06-15
@@ -445,3 +445,10 @@ for stateful cache invalidation only).
   lessons_file_size)` — file-based invalidation, no globalThis slot needed
   (the signal is OS-side, not producer-pushed). New `/share` snippet
   section appended below the existing 0060 pulse snippets.
+- 2026-06-15 — PR #150 merged green on both gating checks (typecheck +
+  validate). 24 new tests in `tests/embed-lessons.test.ts` all pass.
+  Novel lesson appended to `docs/LESSONS.md`: a static grep that uses
+  `SERVER_TS.indexOf('path.startsWith("/api/")')` to assert
+  "route mounted BEFORE the /api/ auth gate" falsely succeeds when a
+  sibling helper's COMMENT block contains that string verbatim —
+  anchor on the actual `if (path.startsWith(...))` statement instead.
