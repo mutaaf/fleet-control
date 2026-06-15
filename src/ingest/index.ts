@@ -194,5 +194,16 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_embed_pulse_invalidate__?: () => void }).__fleet_embed_pulse_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0061: open-graph image renderer memo cache. Same
+  // globalThis-slot pattern as every other read-side cache. A fresh
+  // PR row or run row shifts the OG card's underlying payload;
+  // clearing on COMMIT lets the next /og/pulse.svg or /og/receipts.svg
+  // or /og/calculator.svg crawl rebuild without waiting out the
+  // 1-hour Cache-Control TTL. Per LESSONS 2026-06-05 the late-bind
+  // via globalThis avoids the ingest <-> server import cycle.
+  try {
+    const hook = (globalThis as { __fleet_og_invalidate__?: () => void }).__fleet_og_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }
