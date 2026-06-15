@@ -881,3 +881,35 @@ helper composes a "first-N" empty-state alongside a "zero-
 denominator-this-period" inline framing — the discriminator
 question is always "what's the OPERATOR's story", not "what's
 the SQL question".
+
+## 2026-06-15 — static "route mounted before /api/ auth gate" greps must anchor on the if-statement, not the prose comment
+
+Symptom: while shipping ticket 0063 I wrote an AC1 test asserting the
+new `/embed/lessons.html` route is mounted BEFORE the `/api/` auth
+gate via `SERVER_TS.indexOf('path.startsWith("/api/")')` and
+`assert.ok(routeIdx < apiGateIdx, ...)`. The test failed even though
+the route was wired correctly — because my own new comment block
+INSIDE the embed-lessons cache layer carried the string
+`path.startsWith("/api/")` verbatim (as descriptive prose:
+"mounted BEFORE the path.startsWith(...) auth gate so they share the
+no-token bypass posture"), and that prose appeared in source order
+BEFORE the route-handler block, so `indexOf` returned the comment's
+offset instead of the actual `if` statement's offset. Cause: a naked
+`indexOf` over source text can't distinguish a prose mention of the
+gate from the gate itself; the moment a sibling helper documents its
+own posture in a comment that names the gate, the test's anchor
+collapses to the comment's position. Fix: anchor on the actual
+statement shape — `SERVER_TS.indexOf('if (path.startsWith("/api/"))')`.
+The `if (` prefix is structurally absent from any reasonable comment
+block that describes the gate (you write "the /api/ auth gate", you
+don't write "the if (path.startsWith(...)) auth gate"). General rule
+for this repo: when a static-grep test asserts ordering ("X mounted
+BEFORE Y") it MUST anchor each side on a unique syntactic shape, not
+a literal substring that could appear in a sibling helper's comment
+block. Same trap will bite any future sibling-of-existing-helper
+ticket whose comment block uses the canonical name of the structural
+boundary it's positioned against — `path.startsWith` is a recurring
+phrase in this repo, and so is `requireAuth(`, `composeEmbedFrameHeaders(`,
+`globalThis.__fleet_*_invalidate__`. The fix is always to anchor on
+a token that ONLY appears at the actual statement site (the `if (`
+prefix here; a unique function-name like `serveX` elsewhere).
