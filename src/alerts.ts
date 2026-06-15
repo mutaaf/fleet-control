@@ -14,21 +14,28 @@ import { ntfyConfigFrom, ntfyForAlert, ntfyForAnomaly } from "./ntfy.ts";
 
 const UID = process.getuid?.() ?? 0;
 // "Too long" *floors* (minutes). The real threshold is adaptive: p95 of this
-// (project, phase)'s historical successful runs × 1.5, with a floor at these
-// values and a hard cap at 8 hours. This matters because legit ship runs on
-// some projects routinely take 30–115m; a flat fleet-wide 15m would auto-kill
-// healthy work. Set the floor with the original conservative defaults so a
+// (project, phase)'s historical successful runs × HUNG_P95_MULTIPLIER, with a
+// floor at these values and a hard cap at 8 hours. Matters because legit ship
+// runs on some projects routinely take 30–115m; a flat fleet-wide 15m would
+// auto-kill healthy work. Floor is the original conservative default so a
 // brand-new project (no history yet) still benefits from auto-heal.
 const HUNG_FLOOR_MIN: Record<string, number> = { ship: 15, groom: 45, review: 8, eng: 15 };
 const HUNG_CAP_MIN = 480; // 8 hours — anything past this really is stuck.
+// Multiplier on p95. Bumped from 1.5 → 2.0 after a retro on 14 days of
+// digitalcraft/ship data: the two-PR shipping pattern clusters legit run times
+// at 28–34m right around p95, so a 1.5× multiplier was killing healthy work
+// 1–2 minutes shy of completion. 2× gives ~44m headroom over a 22m p95 while
+// still catching genuinely hung work at the 60m+ tail.
+const HUNG_P95_MULTIPLIER = 2.0;
 // Re-kill grace: don't auto-kill again within this window per (slug,phase) so a
 // child that's mid-SIGTERM has time to wind down before we escalate to SIGKILL.
 const KILL_COOLDOWN_MS = 90_000;
 const lastKill = new Map<string, number>();
 
 /** Adaptive hung threshold for (project, phase). Returns minutes.
- * Uses p95 of past successful runs × 1.5; bounded by HUNG_FLOOR_MIN[phase]
- * and HUNG_CAP_MIN. Falls back to floor for projects with little history. */
+ * Uses p95 of past successful runs × HUNG_P95_MULTIPLIER; bounded by
+ * HUNG_FLOOR_MIN[phase] and HUNG_CAP_MIN. Falls back to floor for projects
+ * with little history. */
 function hungThresholdMin(db: DB, projectId: number, phase: string): number {
   const floor = HUNG_FLOOR_MIN[phase] ?? 15;
   const count = (db.prepare(
@@ -43,7 +50,7 @@ function hungThresholdMin(db: DB, projectId: number, phase: string): number {
   ).get(projectId, phase, offset) as { duration_ms: number } | undefined;
   if (!row) return floor;
   const p95Min = row.duration_ms / 60_000;
-  return Math.min(HUNG_CAP_MIN, Math.max(floor, Math.round(p95Min * 1.5)));
+  return Math.min(HUNG_CAP_MIN, Math.max(floor, Math.round(p95Min * HUNG_P95_MULTIPLIER)));
 }
 
 interface NewAlert { project_id: number; phase: string | null; type: string; severity: string; title: string; detail: string; dedup_key: string; }
