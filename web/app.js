@@ -2303,6 +2303,118 @@ document.addEventListener("click", (e) => {
   if (card && card.parentNode) card.parentNode.removeChild(card);
 });
 
+// Ticket 0062: monthly fleet retro card. One compact card on the
+// first weekday of each calendar month that surfaces five month-over-
+// month deltas. The server appends:
+//   - is_monthly_retro_day: pure-function gate (also mirrored client-
+//     side below so the SPA doesn't render until the server says yes
+//     AND today is the first weekday).
+//   - dismissed: whether this month's card is in inbox_dismissal.
+// The card hides on day 2-31 of a month so the operator sees it once
+// and never again until next month. Errors fall through silently per
+// the home-page convention.
+async function fetchMonthlyRetro() {
+  try { return await get("/api/fleet/monthly-retro"); } catch { return null; }
+}
+
+function renderMonthlyRetro(data) {
+  if (!data) return "";
+  if (data.dismissed === true) return "";
+  if (data.is_monthly_retro_day !== true) return "";
+  if (data.kind === "warming-up") {
+    return `<section class="monthly-retro-card" data-testid="monthly-retro-card" data-kind="warming-up">`
+      + `<div class="monthly-retro-eyebrow" data-testid="monthly-retro-eyebrow">monthly retro</div>`
+      + `<div class="monthly-retro-sentence" data-testid="monthly-retro-sentence">Your fleet is still warming up - check back after 8 weeks of data.</div>`
+      + `</section>`;
+  }
+  if (data.kind === "first-full-month") {
+    return `<section class="monthly-retro-card" data-testid="monthly-retro-card" data-kind="first-full-month">`
+      + `<div class="monthly-retro-eyebrow" data-testid="monthly-retro-eyebrow">monthly retro</div>`
+      + `<div class="monthly-retro-sentence" data-testid="monthly-retro-sentence">First full month - we'll have a comparison next month.</div>`
+      + `</section>`;
+  }
+  if (data.kind !== "card" || !data.payload) return "";
+  const p = data.payload;
+  const monthIso = esc(String(p.month_iso || ""));
+  const monthLabel = monthLabelForClient(p.month_iso);
+  const eyebrow = "monthly retro - " + monthLabel;
+  const fmtPct = (delta, prev, lastLabel) => {
+    if (delta == null) return ` (no comparison - last month had ${lastLabel})`;
+    const word = delta > 0 ? "up" : (delta < 0 ? "down" : "flat");
+    return `, ${word} ${Math.abs(delta)}% from ${lastLabel}`;
+  };
+  const prsSentence = p.prs_delta_pct == null
+    ? `${p.prs_this_month} PRs this month, no comparison - last month had 0 PRs`
+    : `${p.prs_this_month} PRs this month${fmtPct(p.prs_delta_pct, p.prs_last_month, String(p.prs_last_month))}`;
+  const spendSentence = p.spend_delta_pct == null
+    ? `${fmtUsdSmall(p.spend_this_month)} spent this month, no comparison - last month had $0`
+    : `${fmtUsdSmall(p.spend_this_month)} spent this month${fmtPct(p.spend_delta_pct, p.spend_last_month, fmtUsdSmall(p.spend_last_month))}`;
+  const cppSentence = p.cost_per_pr_delta_pct == null
+    ? `${fmtUsdSmall(p.cost_per_pr_this)} per PR this month, no comparison`
+    : `${fmtUsdSmall(p.cost_per_pr_this)} per PR this month${fmtPct(p.cost_per_pr_delta_pct, p.cost_per_pr_last, fmtUsdSmall(p.cost_per_pr_last))}`;
+  const healWord = p.heal_avg_this < p.heal_avg_last ? "down" : (p.heal_avg_this > p.heal_avg_last ? "up" : "flat");
+  const healSentence = `avg ${Number(p.heal_avg_this || 0).toFixed(1)} healing attempts per PR this month, ${healWord} from ${Number(p.heal_avg_last || 0).toFixed(1)}`;
+  const dismiss = `<button class="monthly-retro-dismiss" data-testid="monthly-retro-dismiss"`
+    + ` data-act="monthly-retro-dismiss" data-month-iso="${monthIso}"`
+    + ` type="button" aria-label="Dismiss for the rest of the month">×</button>`;
+  return `<section class="monthly-retro-card" data-testid="monthly-retro-card" data-kind="card" data-month-iso="${monthIso}">`
+    + `<div class="monthly-retro-head">`
+    + `<span class="monthly-retro-eyebrow" data-testid="monthly-retro-eyebrow">${esc(eyebrow)}</span>`
+    + dismiss
+    + `</div>`
+    + `<div class="monthly-retro-prs" data-testid="monthly-retro-prs">${esc(prsSentence)}</div>`
+    + `<div class="monthly-retro-spend" data-testid="monthly-retro-spend">${esc(spendSentence)}</div>`
+    + `<div class="monthly-retro-cpp" data-testid="monthly-retro-cpp">${esc(cppSentence)}</div>`
+    + `<div class="monthly-retro-heal" data-testid="monthly-retro-heal">${esc(healSentence)}</div>`
+    + `<div class="monthly-retro-best" data-testid="monthly-retro-best">${esc(String(p.best_project_sentence || ""))}</div>`
+    + `<div class="monthly-retro-laggard" data-testid="monthly-retro-laggard">${esc(String(p.laggard_project_sentence || ""))}</div>`
+    + `</section>`;
+}
+
+// "$48.21" / "$148" formatter mirroring the server-side fmtUsd in
+// src/server.ts. 2-decimal precision under $100, integer-rounded
+// above. The SPA's existing `usd()` helper formats with a thousand-
+// separator + cents which is too noisy for the narrative sentences.
+function fmtUsdSmall(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "$0";
+  if (v < 100) return "$" + v.toFixed(2);
+  return "$" + Math.round(v).toString();
+}
+
+// "2026-06" → "June 2026". Mirrors src/retro.ts:monthLabelFor so the
+// SPA renders the same label the server would.
+function monthLabelForClient(iso) {
+  const m = String(iso || "").match(/^(\d{4})-(\d{2})$/);
+  if (!m) return String(iso || "");
+  const names = ["January","February","March","April","May","June",
+    "July","August","September","October","November","December"];
+  const i = Number(m[2]) - 1;
+  return (names[i] || iso) + " " + m[1];
+}
+
+// Dismiss handler — POST to /api/control/dismiss-monthly-retro per
+// the AC8 endpoint shape. The server writes inbox_dismissal keyed by
+// (kind='monthly_retro', payload_id=month_iso); the home page re-
+// reads the dismissed flag off the JSON route on next mount.
+document.addEventListener("click", (e) => {
+  const b = e.target && e.target.closest && e.target.closest("[data-act='monthly-retro-dismiss']");
+  if (!b) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const monthIso = b.getAttribute("data-month-iso") || "";
+  if (!monthIso) return;
+  try {
+    fetch("/api/control/dismiss-monthly-retro", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ month_iso: monthIso }),
+    });
+  } catch { /* network-blip: let the next refresh land it */ }
+  const card = b.closest && b.closest("[data-testid='monthly-retro-card']");
+  if (card && card.parentNode) card.parentNode.removeChild(card);
+});
+
 // Dismiss handler — toggle the per-day localStorage flag and re-render
 // home so the card disappears. localStorage key per the AC:
 // `fleet:lesson-of-the-day-dismissed:<YYYY-MM-DD>`.
@@ -2563,8 +2675,8 @@ async function home() {
   // otherwise — its renderer returns "" when `visible:false` so the
   // home page is byte-identical to the pre-0037 render on
   // Saturday-Thursday. Errors fall through silently per the helper.
-  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData, worthItData, lessonOfTheDayData, biggestSurpriseData] = await Promise.all([
-    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(), fetchFleetWorthIt(), fetchLessonOfTheDay(), fetchBiggestSurprise(),
+  const [data, digestData, inboxData, streakData, glanceData, costPerPrData, fridayWrapData, riskiestPrData, mondayCatchUpData, spendEfficiencyData, stuckPrTaxonomyData, prAutopsiesData, worthItData, lessonOfTheDayData, biggestSurpriseData, monthlyRetroData] = await Promise.all([
+    get("/api/fleet"), fetchDigest(), fetchInbox(), fetchStreak(), fetchGlance(), fetchCostPerPr(), fetchFridayWrap(), fetchRiskiestPr(), fetchMondayCatchUp(), fetchSpendEfficiency(), fetchStuckPrTaxonomy(), fetchPrAutopsies(), fetchFleetWorthIt(), fetchLessonOfTheDay(), fetchBiggestSurprise(), fetchMonthlyRetro(),
   ]);
   // Ticket 0043: fetch the new-since-visit diff using the additive
   // `previous_last_seen` field from /api/fleet (the PRE-upsert
@@ -2613,6 +2725,7 @@ async function home() {
   app.innerHTML =
     renderNewSinceBanner(newSinceData, { quietHoursActive }) +
     digestBanner(digestData) +
+    renderMonthlyRetro(monthlyRetroData) +
     renderMondayCatchUp(mondayCatchUpData) +
     renderFridayWrap(fridayWrapData) +
     renderCostPerPrSummary(costPerPrData) +

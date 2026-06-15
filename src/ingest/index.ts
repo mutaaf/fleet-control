@@ -205,5 +205,18 @@ export function runIngestPass(db: DB, cfg: FleetConfig): { projects: number; run
     const hook = (globalThis as { __fleet_og_invalidate__?: () => void }).__fleet_og_invalidate__;
     if (typeof hook === "function") hook();
   } catch { /* never let an in-process cache fail the ingest */ }
+  // Ticket 0062: monthly fleet retro card memo cache. Same
+  // globalThis-slot pattern as every other read-side cache (per
+  // LESSONS 2026-06-05 "break ingest<->server cache-invalidation
+  // cycles via a globalThis slot"). The card's cache key tuple is
+  // (MAX(pr.fetched_at), COUNT(*) over pr, MAX(run.started_at),
+  // COUNT(*) over run, month_iso); a freshly-merged PR or a fresh
+  // run row shifts the comparison numbers, so clearing the cache
+  // on every commit lets the next /api/fleet/monthly-retro render
+  // rebuild without waiting out the 10-minute TTL.
+  try {
+    const hook = (globalThis as { __fleet_monthly_retro_invalidate__?: () => void }).__fleet_monthly_retro_invalidate__;
+    if (typeof hook === "function") hook();
+  } catch { /* never let an in-process cache fail the ingest */ }
   return { projects: manifests.length, runsIngested: total };
 }

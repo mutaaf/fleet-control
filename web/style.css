@@ -2187,6 +2187,61 @@ svg.tool-mix-bar { display: block; width: 280px; height: 36px;
 }
 
 
+/* Ticket 0062: monthly fleet retro home-page card. Renders ONLY on
+ * the first weekday of each calendar month (the SPA guards via the
+ * server-supplied is_monthly_retro_day flag plus an isMonthlyRetroDay
+ * mirror in app.js). One compact card stacked five deltas vertically
+ * at 375px; >=600px keeps the same column shape since the prose
+ * sentences are narrative not tabular. Reuses existing CSS variables
+ * (accent / dim / ink / mono) per the AC11 "no new variables" rule. */
+.monthly-retro-card { display: block; padding: 14px 16px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  text-decoration: none; color: inherit;
+  margin: 0 0 14px; background: transparent; }
+.monthly-retro-head { display: flex; align-items: center;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.monthly-retro-eyebrow { font-family: var(--mono, ui-monospace);
+  font-size: 11px; text-transform: uppercase; color: var(--accent);
+  letter-spacing: 0.06em; }
+.monthly-retro-sentence { font-weight: 600; font-size: 15px;
+  line-height: 1.4; color: var(--ink); }
+.monthly-retro-prs,
+.monthly-retro-spend,
+.monthly-retro-cpp,
+.monthly-retro-heal,
+.monthly-retro-best,
+.monthly-retro-laggard {
+  font-family: var(--mono, ui-monospace); font-size: 13px;
+  line-height: 1.5; color: var(--ink); margin: 4px 0; }
+.monthly-retro-best { color: var(--good); }
+.monthly-retro-laggard { color: var(--warn); }
+.monthly-retro-dismiss { margin-left: auto; min-width: 44px;
+  min-height: 44px; background: transparent; border: 0;
+  color: var(--dim); font-size: 20px; cursor: pointer;
+  line-height: 1; padding: 0 10px; }
+.monthly-retro-dismiss:hover { color: var(--accent); }
+
+/* Narrow viewport (<600px): each delta sentence stacks vertically
+ * (already the default block layout). The 375px phone view matches
+ * AC's "single-column with the five deltas stacked vertically". */
+@media (max-width: 599px) {
+  .monthly-retro-card { display: block; padding: 12px 14px; }
+  .monthly-retro-prs,
+  .monthly-retro-spend,
+  .monthly-retro-cpp,
+  .monthly-retro-heal,
+  .monthly-retro-best,
+  .monthly-retro-laggard { font-size: 12px; }
+}
+
+/* Wide viewport (>=600px): tighten line-height and let the prose
+ * breathe — narrative cards read better with a touch more vertical
+ * spacing. */
+@media (min-width: 600px) {
+  .monthly-retro-card { padding: 16px 18px; }
+}
+
+
 /* Ticket 0060: /share embed snippets section. */
 .share-embed-main { max-width: 720px; margin: 0 auto; padding: 28px 20px 60px;
   font-family: var(--mono); color: var(--ink); }
