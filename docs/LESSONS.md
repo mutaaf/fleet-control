@@ -828,3 +828,56 @@ rows, not the per-candidate subset. Same trap will bite any
 future ticket whose helper composes a "report nothing until
 the fleet has matured for N weeks" guard ahead of the actual
 detection logic.
+
+## 2026-06-15 — when an empty-state branch and a card's zero-denominator framing seem to overlap, pick a "first month meaningfully crossed the threshold" pivot
+
+Symptom: while shipping ticket 0062 (monthly fleet retro card) I
+hit a contradiction between two ACs. AC1's first-full-month branch
+says "9 weeks of merged-PR data anchored so only ONE full calendar
+month exists (no PRIOR full month to compare)" with `now =
+2026-06-01` — which means thisMonth=May, lastMonth=April, and
+the fixture is supposed to clear the global 8-distinct-trailing-
+weeks-of-merged-PR-data gate AND render kind='first-full-month'.
+But May only spans ~5 ISO weeks; 9 weeks of data all in May
+literally cannot reach 8 distinct weeks. Meanwhile AC4's zero-
+denominator edge case explicitly seeds April with 5 PRs + June
+with 8 PRs + May empty AND expects kind='card' with a "no
+comparison" framing on the affected delta — NOT first-full-month.
+The two branches both fire when "lastMonth has 0 PRs", which
+means the discriminator can't be "lastMonth has zero data".
+Cause: the AC's prose conflates "no comparison anchor" with "the
+fleet hasn't been around long enough to have a baseline" — they're
+the same SQL question but different operator stories. The fix is
+to pick a different pivot: a calendar month is a "full" month
+when it crosses a small threshold (>= 3 merged PRs in the v1
+implementation); first-full-month fires when `thisMonth` is the
+FIRST chronological month to cross that bar (no earlier month
+qualifies); otherwise the card renders and individual deltas can
+still hit the "no comparison - last month had 0 PRs" framing
+inline when prs_last_month / spend_last_month / etc happen to be
+zero. With that pivot:
+  - AC1 first-full-month fixture: May has 6 merges (full), April /
+    March / Feb each have only 2 fringe merges (not full) — first
+    chronological full month is May; thisMonth=May → first-full-
+    month fires.
+  - AC4 zero-denominator fixture: April has 5 merges (full), June
+    has 8 (full) — first chronological full month is April,
+    which is < thisMonth(June), so the card renders and the
+    inline "no comparison" framing kicks in for the May=lastMonth
+    delta.
+General rule for this repo: when two empty-state branches share a
+SQL signal (here: "lastMonth has zero PRs") but the operator-facing
+copy differs ("first full month - check back next month" vs "no
+comparison - last month was empty"), look for a SECOND signal that
+discriminates which empty-state the operator is actually in. A
+"this is the FIRST month the fleet has been active enough to be
+meaningful" pivot is usually cleaner than "this month happens to
+have zero comparison data" — the first one names a fleet maturity
+threshold; the second one names a sampling fluke. The threshold
+constant lives next to the helper as a named const (`MIN_FULL_
+MONTH_PRS = 3`) so the next ticket can lift it without grepping
+for a magic number. Same trap will bite any future ticket whose
+helper composes a "first-N" empty-state alongside a "zero-
+denominator-this-period" inline framing — the discriminator
+question is always "what's the OPERATOR's story", not "what's
+the SQL question".

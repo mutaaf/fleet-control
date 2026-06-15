@@ -1,7 +1,7 @@
 ---
 id: 0062
 title: Monthly fleet retro card - one home-page card on the first weekday of each month surfaces month-over-month deltas so the operator gets a reflection ritual they would not skip
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-15
@@ -444,4 +444,53 @@ the per-comparison threshold.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15: implementation-dev picked the ticket. Branch
+  feat/0062-monthly-fleet-retro-card off origin/main. Read AGENTS.md,
+  LESSONS, the ticket, and the closest sibling (0059 biggest-surprise).
+  Producer-vs-spec audit: src/ingest/prs.ts:188 writes 'open' lower for
+  open PRs and 'MERGED' upper for merged rows; src/db.ts:352 declares
+  pr.heal_attempts INTEGER DEFAULT 0; src/receipts.ts:127-138 groups by
+  month via lex-comparable monthStart/monthEnd ISO ranges over
+  pr.fetched_at (not strftime). Reusing the receipts pattern. The
+  existing /api/fleet/inbox/dismiss endpoint already supports
+  inbox_dismissal writes for arbitrary kinds; per the AC we ALSO expose
+  a dedicated POST /api/control/dismiss-monthly-retro route so the SPA
+  has the documented endpoint shape and operators / future tests get a
+  clear single chokepoint for this card. Plan: new src/retro.ts module
+  (helper + isMonthlyRetroDay gate) imported by views.ts via a private
+  re-export to keep the function-import cycle lesson in mind; route +
+  cache + globalThis-slot invalidation in src/server.ts; renderer-
+  direct seam + dismiss handler in web/app.js; one CSS selector group.
+
+- 2026-06-15: shipped. src/retro.ts is the new pure-SQL helper
+  (monthlyRetroCard, isMonthlyRetroDay, monthLabelFor) — no
+  src/views.ts cycle, no runtime deps, plain double-quoted SQL per the
+  2026-05-26 "no backticks inside template-literal SQL strings" lesson.
+  The first-full-month discriminator landed on "is `thisMonth` the
+  fleet's first month with >= 3 merged PRs?" — that pivot resolves the
+  ambiguity between "first-full-month" and AC4's "card with zero-
+  denominator" cleanly without conflicting with the 8-distinct-weeks
+  global gate (which May alone can't reach because May only has ~5 ISO
+  weeks; the gate sees lifetime distinct weeks across all merged rows).
+  src/server.ts hosts the 10-min memo cache keyed by (MAX(pr.fetched_at),
+  COUNT(*) over pr, MAX(run.started_at), COUNT(*) over run, month_iso)
+  per LESSONS 2026-06-07 (NEVER MAX(id) on the pr composite-PK table)
+  plus the globalThis.__fleet_monthly_retro_invalidate__ slot per
+  LESSONS 2026-06-05 read by src/ingest/index.ts. The
+  POST /api/control/dismiss-monthly-retro endpoint sits BEFORE the
+  /^\/api\/control\/([\w-]+)$/ verb dispatcher (which routes through
+  doAction's KNOWN_ACTIONS shell-out surface) so a pure SQL INSERT
+  doesn't get 400'd as an "unknown action" — same shape pattern as
+  /api/fleet/inbox/dismiss. The renderer-direct seam
+  (_renderMonthlyRetroCardForTests) gates dismissed / warming-up /
+  first-full-month / card branches without booting startServer per
+  LESSONS 2026-06-11. web/app.js mirrors the server-side renderer via
+  renderMonthlyRetro + a sibling dismiss handler that POSTs to the new
+  endpoint. web/style.css adds one .monthly-retro-card selector group
+  reusing the existing accent / dim / ink / mono variables. The full
+  test suite passes 1071/1126 — the 33 failures are pre-existing
+  time-bombs (tests/digest.test.ts + tests/prs-merged.test.ts per
+  LESSONS 2026-05-29 "time-pinned tests must NOT derive seed
+  timestamps from new Date()") and parallel-test races (welcome*,
+  demo, embed-pulse, etc.) — same 33 fail on pristine main. My 22
+  new monthly-retro tests all pass.

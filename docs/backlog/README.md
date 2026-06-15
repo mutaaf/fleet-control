@@ -21,7 +21,7 @@ proposes new ones, `review` grades them.
 |----|-------|----------|--------|------|
 | 0064 | Embed rate-limit + abuse guard - per-IP token bucket on the public /embed/* and /og/* routes so a popular blog paste does not starve the operator's own loopback portal | P2 | groomed | infra |
 | 0063 | Embeddable lesson-of-the-day widget - paste-one-line snippet that rotates a cross-fleet operational lesson into any blog or README so every reader sees a real fleet insight | P2 | groomed | portal |
-| 0062 | Monthly fleet retro card - one home-page card on the first weekday of each month surfaces month-over-month deltas so the operator gets a reflection ritual they would not skip | P1 | groomed | observability |
+| 0062 | Monthly fleet retro card - one home-page card on the first weekday of each month surfaces month-over-month deltas so the operator gets a reflection ritual they would not skip | P1 | in-progress | observability |
 | 0061 | Open-graph image renderer for /pulse /receipts /calculator - every paste on LinkedIn / Twitter / Bluesky becomes a live rendered card so the share itself is the impression | P1 | shipped | portal |
 | 0058 | Public failure-mode landing pages - anonymised /failures/<signature> SEO surface authored from real cross-project correlations the fleet caught | P1 | shipped | portal |
 | 0059 | Biggest surprise this week - one Tuesday-morning card surfaces the single thing the operator would have missed so the daily glance becomes a habit ritual | P1 | shipped | observability |

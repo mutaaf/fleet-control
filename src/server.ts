@@ -55,6 +55,10 @@ import {
   type Scope, type TokenRecord,
 } from "./auth.ts";
 import { consumePairToken, rateLimitAllow, sweepExpiredPairTokens } from "./pair.ts";
+import {
+  monthlyRetroCard, isMonthlyRetroDay, monthLabelFor,
+  type MonthlyRetroResult, type MonthlyRetroPayload,
+} from "./retro.ts";
 
 const CONFIG_FILE = join(process.cwd(), "fleet-control.config.json");
 
@@ -897,6 +901,247 @@ export function _renderBiggestSurpriseForTests(
     + `</div>`
     + cta
     + `</section>`;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0062 — Monthly fleet retro card cache + renderer-direct seam.
+//
+// 10-minute TTL memo cache for monthlyRetroCard(). Cache key is the
+// current month_iso (the COMPLETED prior calendar month relative to
+// now); the invalidation tuple uses
+// (MAX(pr.fetched_at), COUNT(*) over pr,
+//  MAX(run.started_at), COUNT(*) over run, current month_iso)
+// so a fresh PR ingest OR a fresh run row busts the entry. Per
+// LESSONS 2026-06-07 the pr table has no surrogate id; the
+// (MAX(fetched_at), COUNT(*)) pair is the canonical "fresh row
+// landed" proxy (NEVER MAX(id), which 0044 tripped on).
+//
+// Per LESSONS in-process dedup sets need an explicit reset hook for
+// tests we expose _resetMonthlyRetroCacheForTests and
+// _getMonthlyRetroCacheBuildsForTests. Per LESSONS 2026-06-11
+// renderer-direct seam for branch tests we expose
+// _renderMonthlyRetroCardForTests so the card / warming-up / first-
+// full-month / dismissed branches drive directly without mutating
+// fleet-control.config.json in cwd. Production code never reads
+// either.
+//
+// Per LESSONS 2026-06-05 break ingest-to-server cycles via a
+// globalThis slot: the invalidation function is registered on
+// globalThis.__fleet_monthly_retro_invalidate__ from this module at
+// load time and read lazily off the slot by src/ingest/index.ts so
+// a freshly-ingested PR / run busts the memo without a circular
+// import.
+// ────────────────────────────────────────────────────────────────────
+interface MonthlyRetroCacheEntry {
+  tuple: string;
+  value: MonthlyRetroResult;
+  expires_at: number;
+}
+const MONTHLY_RETRO_TTL_MS = 600_000; // 10 minutes
+const monthlyRetroCache = new Map<string, MonthlyRetroCacheEntry>();
+let monthlyRetroBuildCounter = 0;
+
+export function _resetMonthlyRetroCacheForTests(): void {
+  monthlyRetroCache.clear();
+  monthlyRetroBuildCounter = 0;
+}
+
+export function _getMonthlyRetroCacheBuildsForTests(): number {
+  return monthlyRetroBuildCounter;
+}
+
+interface MonthlyRetroTupleRow {
+  mx_pr: string | null; c_pr: number | null;
+  mx_run: string | null; c_run: number | null;
+}
+
+function monthlyRetroInvalidationTuple(db: DB, monthIso: string): string {
+  const row = db.prepare(
+    "SELECT (SELECT MAX(fetched_at) FROM pr) AS mx_pr, "
+    + "       (SELECT COUNT(*) FROM pr) AS c_pr, "
+    + "       (SELECT MAX(started_at) FROM run) AS mx_run, "
+    + "       (SELECT COUNT(*) FROM run) AS c_run",
+  ).get() as unknown as MonthlyRetroTupleRow | undefined;
+  return "m=" + monthIso
+    + "|mxp=" + (row?.mx_pr ?? "")
+    + "|cp=" + Number(row?.c_pr ?? 0)
+    + "|mxr=" + (row?.mx_run ?? "")
+    + "|cr=" + Number(row?.c_run ?? 0);
+}
+
+/** Memoised wrapper around monthlyRetroCard(). The cache key is the
+ *  computed month_iso (the COMPLETED prior calendar month relative
+ *  to now); the tuple includes pr + run row movement so a fresh
+ *  ingest busts the entry. */
+export function getMonthlyRetroCardCached(db: DB, now: Date): MonthlyRetroResult {
+  // Compute the value once so we have a month_iso (when kind=card) or
+  // an empty cache key fallback otherwise.
+  const value0 = monthlyRetroCard(db, now);
+  // Build a stable per-month cache key — the comparison window
+  // doesn't change inside a calendar month, so we use the prior month
+  // as the cache key. We re-derive it from `now` (the helper has
+  // already computed the same shift) so the cache key is consistent
+  // even when the helper returns warming-up / first-full-month
+  // (those branches still memoise per current month).
+  const monthKey = priorMonthKey(now);
+  const tuple = monthlyRetroInvalidationTuple(db, monthKey);
+  const hit = monthlyRetroCache.get("v1");
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) {
+    return hit.value;
+  }
+  monthlyRetroBuildCounter += 1;
+  monthlyRetroCache.set("v1", {
+    tuple, value: value0, expires_at: Date.now() + MONTHLY_RETRO_TTL_MS,
+  });
+  return value0;
+}
+
+/** YYYY-MM key for the COMPLETED prior calendar month relative to
+ *  `now`. Inlined here (matches src/retro.ts's internal shift) so
+ *  the server cache doesn't import a private helper from the retro
+ *  module — per LESSONS 2026-06-13 "function-import cycles aren't
+ *  always cache-invalidation; the cheapest fix is sometimes a 6-line
+ *  inline copy". The retro module already exports `monthLabelFor`,
+ *  which is the only retro-side internal we need at the renderer
+ *  surface. */
+function priorMonthKey(now: Date): string {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth() + 1; // 1..12
+  const total = y * 12 + (m - 1) - 1; // shift back one
+  const ny = Math.floor(total / 12);
+  const nm = (total % 12) + 1;
+  return ny + "-" + String(nm).padStart(2, "0");
+}
+
+/** Cache invalidation hook registered on globalThis so the producer
+ *  side (src/ingest/index.ts on each tick COMMIT) can bust the memo
+ *  without a circular import from ingest back into server. Matches
+ *  the 2026-06-05 LESSONS pattern. */
+function _invalidateMonthlyRetroCacheAfterIngest(): void {
+  monthlyRetroCache.clear();
+}
+(globalThis as { __fleet_monthly_retro_invalidate__?: () => void })
+  .__fleet_monthly_retro_invalidate__ = _invalidateMonthlyRetroCacheAfterIngest;
+
+/** Has the operator dismissed this month's retro card? Lookup keyed
+ *  by (kind='monthly_retro', project_slug='fleet',
+ *  payload_id=month_iso) per LESSONS 2026-05-28 "re-fire-after-
+ *  dismiss needs an aging window, not a partial UNIQUE index" — the
+ *  dismissal lives in inbox_dismissal and is scoped to a single
+ *  month so dismissing June's card does NOT suppress July's. */
+function isMonthlyRetroDismissed(db: DB, monthIso: string): boolean {
+  const row = db.prepare(
+    "SELECT 1 AS ok FROM inbox_dismissal "
+    + " WHERE kind = 'monthly_retro' "
+    + "   AND project_slug = 'fleet' "
+    + "   AND payload_id = ?",
+  ).get(monthIso) as unknown as { ok: number } | undefined;
+  return !!row;
+}
+
+/** Format a $ amount with 2-decimal precision when < $100 and as a
+ *  rounded integer otherwise. Matches the receipts/biggest-surprise
+ *  rendering conventions so the operator sees consistent units
+ *  across the home page. */
+function fmtUsd(n: number): string {
+  if (!Number.isFinite(Number(n))) return "$0";
+  const v = Number(n);
+  if (v < 100) return "$" + v.toFixed(2);
+  return "$" + Math.round(v).toString();
+}
+
+export interface MonthlyRetroRenderOptions {
+  /** When true the renderer emits the empty string so the SPA hides
+   *  the card. Matches the dismissed-for-current-month branch on the
+   *  home page; the dismissal lives in inbox_dismissal per AC8. */
+  dismissed?: boolean;
+}
+
+/** Renderer-direct seam (per LESSONS 2026-06-11). Every branch
+ *  (card / warming-up / first-full-month / dismissed) goes through
+ *  this function so the tests can drive each shape without booting
+ *  startServer() and racing fleet-control.config.json. The home SPA
+ *  uses an equivalent renderer composed in web/app.js so the
+ *  server-side seam is purely for test coverage. */
+export function _renderMonthlyRetroCardForTests(
+  result: MonthlyRetroResult,
+  opts: MonthlyRetroRenderOptions = {},
+): string {
+  if (opts.dismissed) return "";
+  if (result.kind === "warming-up") {
+    return "<section class=\"monthly-retro-card\" data-testid=\"monthly-retro-card\" data-kind=\"warming-up\">"
+      + "<div class=\"monthly-retro-eyebrow\" data-testid=\"monthly-retro-eyebrow\">monthly retro</div>"
+      + "<div class=\"monthly-retro-sentence\" data-testid=\"monthly-retro-sentence\">"
+      + "Your fleet is still warming up - check back after 8 weeks of data."
+      + "</div>"
+      + "</section>";
+  }
+  if (result.kind === "first-full-month") {
+    return "<section class=\"monthly-retro-card\" data-testid=\"monthly-retro-card\" data-kind=\"first-full-month\">"
+      + "<div class=\"monthly-retro-eyebrow\" data-testid=\"monthly-retro-eyebrow\">monthly retro</div>"
+      + "<div class=\"monthly-retro-sentence\" data-testid=\"monthly-retro-sentence\">"
+      + "First full month - we'll have a comparison next month."
+      + "</div>"
+      + "</section>";
+  }
+  const p = result.payload;
+  const monthLabel = escHtml(monthLabelFor(p.month_iso));
+  const eyebrow = "monthly retro - " + monthLabel;
+  // PRs sentence: "12 PRs this month, up 33% from 9" or the no-
+  // comparison framing when last month had 0 PRs.
+  const prsSentence = p.prs_delta_pct == null
+    ? escHtml(p.prs_this_month + " PRs this month, no comparison - last month had 0 PRs")
+    : escHtml(
+        p.prs_this_month + " PRs this month, "
+        + deltaWord(p.prs_delta_pct) + " " + Math.abs(p.prs_delta_pct) + "% from " + p.prs_last_month,
+      );
+  // Spend sentence.
+  const spendSentence = p.spend_delta_pct == null
+    ? escHtml(fmtUsd(p.spend_this_month) + " spent this month, no comparison - last month had $0")
+    : escHtml(
+        fmtUsd(p.spend_this_month) + " spent this month, "
+        + deltaWord(p.spend_delta_pct) + " " + Math.abs(p.spend_delta_pct)
+        + "% from " + fmtUsd(p.spend_last_month),
+      );
+  // $/PR sentence.
+  const cppSentence = p.cost_per_pr_delta_pct == null
+    ? escHtml(fmtUsd(p.cost_per_pr_this) + " per PR this month, no comparison")
+    : escHtml(
+        fmtUsd(p.cost_per_pr_this) + " per PR this month, "
+        + deltaWord(p.cost_per_pr_delta_pct) + " " + Math.abs(p.cost_per_pr_delta_pct)
+        + "% from " + fmtUsd(p.cost_per_pr_last),
+      );
+  // Heal avg sentence.
+  const healSentence = escHtml(
+    "avg " + p.heal_avg_this.toFixed(1) + " healing attempts per PR this month, "
+    + (p.heal_avg_this < p.heal_avg_last ? "down" : (p.heal_avg_this > p.heal_avg_last ? "up" : "flat"))
+    + " from " + p.heal_avg_last.toFixed(1),
+  );
+  const bestSentence = escHtml(p.best_project_sentence);
+  const laggardSentence = escHtml(p.laggard_project_sentence);
+  const dismiss = "<button class=\"monthly-retro-dismiss\" data-testid=\"monthly-retro-dismiss\""
+    + " data-act=\"monthly-retro-dismiss\" data-month-iso=\"" + escHtml(p.month_iso) + "\""
+    + " type=\"button\" aria-label=\"Dismiss for the rest of the month\">×</button>";
+  return "<section class=\"monthly-retro-card\" data-testid=\"monthly-retro-card\" data-kind=\"card\" data-month-iso=\"" + escHtml(p.month_iso) + "\">"
+    + "<div class=\"monthly-retro-head\">"
+    + "<span class=\"monthly-retro-eyebrow\" data-testid=\"monthly-retro-eyebrow\">" + escHtml(eyebrow) + "</span>"
+    + dismiss
+    + "</div>"
+    + "<div class=\"monthly-retro-prs\" data-testid=\"monthly-retro-prs\">" + prsSentence + "</div>"
+    + "<div class=\"monthly-retro-spend\" data-testid=\"monthly-retro-spend\">" + spendSentence + "</div>"
+    + "<div class=\"monthly-retro-cpp\" data-testid=\"monthly-retro-cpp\">" + cppSentence + "</div>"
+    + "<div class=\"monthly-retro-heal\" data-testid=\"monthly-retro-heal\">" + healSentence + "</div>"
+    + "<div class=\"monthly-retro-best\" data-testid=\"monthly-retro-best\">" + bestSentence + "</div>"
+    + "<div class=\"monthly-retro-laggard\" data-testid=\"monthly-retro-laggard\">" + laggardSentence + "</div>"
+    + "</section>";
+}
+
+/** "up" / "down" / "flat" word for a percent delta. The renderer's
+ *  prose is more natural with a verb than a +/- sign. */
+function deltaWord(delta: number): string {
+  if (delta > 0) return "up";
+  if (delta < 0) return "down";
+  return "flat";
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4437,6 +4682,48 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
     const path = url.pathname;
     try {
+      // Ticket 0062: monthly fleet retro card dismissal. Sits BEFORE
+      // the /api/control/<verb> dispatcher so the verb dispatcher's
+      // doAction()-based handler doesn't 400 on an "unknown action"
+      // (the dispatcher's KNOWN_ACTIONS set is the shell-out surface;
+      // this is a pure SQL INSERT, so it doesn't belong there). POST
+      // a JSON body {month_iso: "YYYY-MM"} to mark this month's retro
+      // card dismissed. The dismissal lives in inbox_dismissal keyed
+      // by (kind='monthly_retro', project_slug='fleet',
+      //  payload_id=<month_iso>) per LESSONS 2026-05-28 "re-fire-
+      // after-dismiss needs an aging window, not a partial UNIQUE
+      // index" — dismissing June's card MUST NOT pre-emptively
+      // suppress July's. We gate on `control` scope (same posture as
+      // the other /api/control/* verbs) so a remote viewer with only
+      // `read` can't hide the operator's home card. The route is
+      // net-new (no JSON-shape break to any existing /api/... route
+      // per AC11). Cache invalidation: the home card re-reads
+      // isMonthlyRetroDismissed on every render so no memo bust is
+      // needed; we also clear the monthly-retro memo so a racing GET
+      // sees the fresh dismissal immediately.
+      if (path === "/api/control/dismiss-monthly-retro" && req.method === "POST") {
+        const dauth = requireAuth(db, req, "control", url);
+        if (!dauth.ok) return json(res, { ok: false, message: dauth.message }, dauth.status);
+        return readBody(req).then((body) => {
+          const monthIsoIn = String((body as { month_iso?: unknown })?.month_iso ?? "");
+          if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(monthIsoIn)) {
+            return json(res, { ok: false, message: "bad month_iso (expected YYYY-MM)" }, 400);
+          }
+          // Pure SQL INSERT into the existing inbox_dismissal table;
+          // PK on (kind, project_slug, payload_id) makes re-dismissal
+          // a silent no-op. Plain double-quoted SQL per LESSONS
+          // 2026-05-26 "no backticks inside SQL".
+          db.prepare(
+            "INSERT INTO inbox_dismissal(kind, project_slug, payload_id, dismissed_at) "
+            + " VALUES('monthly_retro', 'fleet', ?, ?) "
+            + " ON CONFLICT(kind, project_slug, payload_id) DO NOTHING",
+          ).run(monthIsoIn, new Date().toISOString());
+          // Clear the memo so the next GET surfaces the dismissed
+          // state without waiting for the 10-min TTL window to drain.
+          monthlyRetroCache.clear();
+          return json(res, { ok: true, month_iso: monthIsoIn }, 200);
+        });
+      }
       // control actions (management) — POST, auth-gated for non-loopback
       const cm = path.match(/^\/api\/control\/([\w-]+)$/);
       if (cm && req.method === "POST") {
@@ -5328,6 +5615,44 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           const redacted = redactBiggestSurprise(v);
           const dismissed = isBiggestSurpriseDismissed(db, v.week_start_iso);
           const body = JSON.stringify({ ...redacted, dismissed });
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=600",
+          });
+          return res.end(body);
+        }
+        // Ticket 0062: monthly fleet retro card. One compact home-
+        // page card on the first weekday of each calendar month that
+        // surfaces five month-over-month deltas (PRs shipped, spend,
+        // $/PR, heal-attempt avg, best & laggard project sentences)
+        // computed deterministically from the existing pr / cost_
+        // rollup_day / project tables. The kind discriminator carries
+        // 'card' / 'warming-up' / 'first-full-month' so the SPA can
+        // render the honest empty states without fabricating a
+        // baseline. The route appends:
+        //   - is_monthly_retro_day: the first-weekday gate result so
+        //     the SPA can hide the card on day 2-31 of a month even
+        //     if the operator clears localStorage / opens a fresh
+        //     browser; the helper is pure (no DB) so the cost is
+        //     trivial.
+        //   - dismissed: whether the current month's card is in
+        //     inbox_dismissal (per AC8 dismissal pattern); a true
+        //     value tells the SPA to hide the card without losing
+        //     the underlying payload.
+        // 10-minute memo cache via getMonthlyRetroCardCached so
+        // polled SPA refreshes share one build per ingest tuple.
+        if (path === "/api/fleet/monthly-retro") {
+          const now = new Date();
+          const v = getMonthlyRetroCardCached(db, now);
+          const monthIso = priorMonthKey(now);
+          const dismissed = isMonthlyRetroDismissed(db, monthIso);
+          const body = JSON.stringify({
+            ...v,
+            month_iso: v.kind === "card" ? v.payload.month_iso : monthIso,
+            is_monthly_retro_day: isMonthlyRetroDay(now),
+            dismissed,
+          });
           res.writeHead(200, {
             "content-type": "application/json",
             "access-control-allow-origin": "*",
