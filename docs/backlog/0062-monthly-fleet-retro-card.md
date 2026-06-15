@@ -1,7 +1,7 @@
 ---
 id: 0062
 title: Monthly fleet retro card - one home-page card on the first weekday of each month surfaces month-over-month deltas so the operator gets a reflection ritual they would not skip
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-15
