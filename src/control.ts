@@ -11,7 +11,7 @@ import { loadConfig } from "./config.ts";
 import * as auth from "./auth.ts";
 import { cleanCheckouts, safeRmUnder } from "./infra.ts";
 import { createSnapshot, revokeSnapshot } from "./snapshot.ts";
-import { fleetView } from "./views.ts";
+import { fleetView, fleetChangelog } from "./views.ts";
 
 const UID = process.getuid?.() ?? 0;
 const KIT = join(homedir(), "Desktop", "projects", "agent-fleet");
@@ -35,6 +35,11 @@ const KNOWN_ACTIONS = new Set([
   // Budget cap control — writes MAX_DAILY_USD to the manifest so the
   // operator doesn't have to hand-edit agents.config.sh + reinstall.
   "set-budget",
+  // Soft-budget autopause resume (ticket 0021). When the budget_guard
+  // autopaused the ship plist for hitting MAX_DAILY_USD, the operator
+  // taps Resume in the portal — that re-bootstraps the plist and clears
+  // the project_pause row.
+  "resume-paused",
 ]);
 
 /** Strict regex for GitHub HTTPS repo URLs (ticket 0010). Owner/name must
@@ -110,6 +115,32 @@ function manifestFileFor(p: Proj): string {
   return join(manifestDirFor(p), "agents.config.sh");
 }
 
+/** Path of the INSTALLED manifest — the one launchd actually reads at
+ *  fire time. Ticket 0020: control actions that bump a single field
+ *  (SELF_CANCEL, ENG_ENABLED, MAX_DAILY_USD) write here directly and
+ *  only mirror into the working tree best-effort, so a stale working
+ *  tree can't silently revert unrelated fields. */
+function installedManifestFor(p: Proj): string {
+  const cfg = loadConfig();
+  return join(cfg.installedRoot, p.slug, "agents.config.sh");
+}
+
+/** Mirror a single key=value edit from the installed manifest into the
+ *  working-tree manifest (best-effort). Skip silently when the working
+ *  tree is missing or already points at the installed file (same path
+ *  or identical bytes). The installed copy is the source of truth; the
+ *  mirror just gives the operator something to `git commit` if they
+ *  want the change pinned. */
+function mirrorIntoWorkingTree(p: Proj, installed: string, key: string, value: string): void {
+  try {
+    const wt = manifestFileFor(p);
+    if (!existsSync(wt)) return;
+    if (wt === installed) return;
+    if (readFileSync(wt, "utf8") === readFileSync(installed, "utf8")) return;
+    editOrAppendManifest(wt, key, value);
+  } catch { /* installed is the source of truth; mirror failure is fine */ }
+}
+
 interface Proj { id: number; slug: string; namespace: string; manifest_path: string; repo_owner: string; repo_name: string; repo_url: string; }
 const VALID = (s: string, re: RegExp) => typeof s === "string" && re.test(s);
 const repoOf = (p: Proj) => `${p.repo_owner}/${p.repo_name}`;
@@ -137,6 +168,36 @@ export function _setRunnerForTests(fn: Runner): void { activeRunner = fn; }
 export function _resetRunnerForTests(): void { activeRunner = defaultRunner; }
 function isRunning(p: Proj): boolean {
   return runningPhases(p).length > 0;
+}
+
+/** Pause the SHIP launchd plist for a project (ticket 0021). Shared
+ *  between the soft-budget autopause guard (src/budget_guard.ts) and any
+ *  future operator-driven pause-cost action. Uses `launchctl bootout`
+ *  with an argv array — never composes a shell string from `slug`. The
+ *  caller is responsible for inserting the project_pause row + posting
+ *  the ntfy event; this helper is purely the shell-out. Returns the
+ *  combined stdout (mostly empty in production). Throws if launchctl
+ *  itself errors — callers downgrade to a best-effort log because the
+ *  plist may already be unloaded (idempotent at the launchd layer). */
+export function pauseShipPlist(db: DB, slug: string): string {
+  if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
+  const p = project(db, slug);
+  return run("launchctl", ["bootout", `gui/${UID}/${label(p, "ship")}`]);
+}
+
+/** Resume the SHIP launchd plist for a project (ticket 0021). The
+ *  symmetric helper to pauseShipPlist — re-bootstraps via
+ *  `bash install.sh` against the INSTALLED manifest dir (the same
+ *  pathway eng-toggle uses, so the cp inside install.sh stays a no-op
+ *  via the `-ef` guard). Argv form throughout; never a shell string. */
+export function resumeShipPlist(db: DB, slug: string): string {
+  if (!VALID(slug, /^[\w-]{1,40}$/)) throw new Error("bad slug");
+  const p = project(db, slug);
+  const installed = installedManifestFor(p);
+  if (!existsSync(installed)) {
+    throw new Error(`installed manifest not found at ${installed} — run install.sh first`);
+  }
+  return run("bash", [KIT_INSTALL, dirname(installed)]);
 }
 
 /** Names of phases currently `state = running` under launchd, for friendlier
@@ -217,7 +278,18 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         for (const ph of phs) { try { out += run("launchctl", ["enable", `gui/${UID}/${label(p, ph)}`]); } catch { /* */ } }
         message = body.phase ? `Resumed ${body.phase} for ${slug}.` : `Resumed ${slug}.`; break;
       }
-      case "keep-running": {          // bump SELF_CANCEL + reinstall
+      case "keep-running": {          // bump SELF_CANCEL (ticket 0020)
+        // SELF_CANCEL is a plain env var read by `fleet_self_cancel` at
+        // fire time, NOT a launchd plist setting. So this action can
+        // (and should) skip install.sh entirely — that was the path
+        // that clobbered the installed manifest when the operator's
+        // working tree was behind origin/main.
+        //
+        // New behavior (matches the set-budget fix in PR #42):
+        //   1. Edit the INSTALLED manifest directly (the one launchd reads).
+        //   2. Mirror into the working tree best-effort so the operator
+        //      can `git commit` the bump if they want it pinned.
+        //   3. NO install.sh — SELF_CANCEL doesn't need a plist regen.
         const days = Math.max(1, Math.min(365, Number(body.days) || 30));
         if (!body?.force) {
           const phs = runningPhases(p);
@@ -225,20 +297,30 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
         }
         const d = new Date(Date.now() + days * 86_400_000);
         const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
-        const mdir = manifestDirFor(p);
-        editManifest(manifestFileFor(p), "SELF_CANCEL", ymd);
-        out = run("bash", [KIT_INSTALL, mdir]);
+        const installed = installedManifestFor(p);
+        if (!existsSync(installed)) throw new Error(`installed manifest not found at ${installed} — run install.sh first`);
+        editManifest(installed, "SELF_CANCEL", ymd);
+        mirrorIntoWorkingTree(p, installed, "SELF_CANCEL", ymd);
+        out = "";
         message = `${slug} will keep running for ${days} more days.`; break;
       }
-      case "eng-toggle": {            // turn the eng (tidy-the-code) queue on/off
+      case "eng-toggle": {            // turn the eng (tidy-the-code) queue on/off (ticket 0020)
+        // ENG_ENABLED flipping requires install.sh because the eng plist
+        // appears/disappears. But we point install.sh at the INSTALLED
+        // dir, not the working tree, so the cp inside install.sh is a
+        // no-op via the `-ef` (same-file) guard. That stops the stale
+        // working tree from clobbering whatever main has since pushed
+        // (cadence pins, MAX_DAILY_USD, etc.).
         if (!body?.force) {
           const phs = runningPhases(p);
           if (phs.length) { audit(db, actor, action, `${slug}/*`, body, 1, "", actorName); return runningResult(phs); }
         }
         const on = body.enabled ? "1" : "0";
-        const mdir = manifestDirFor(p);
-        editManifest(manifestFileFor(p), "ENG_ENABLED", on);
-        out = run("bash", [KIT_INSTALL, mdir]);
+        const installed = installedManifestFor(p);
+        if (!existsSync(installed)) throw new Error(`installed manifest not found at ${installed} — run install.sh first`);
+        editManifest(installed, "ENG_ENABLED", on);
+        out = run("bash", [KIT_INSTALL, dirname(installed)]);
+        mirrorIntoWorkingTree(p, installed, "ENG_ENABLED", on);
         message = `Code-tidying ${on === "1" ? "enabled" : "disabled"} for ${slug}.`; break;
       }
       case "pr-merge": {              // "Approve & publish" — arm auto-merge (lands when CI green)
@@ -322,6 +404,30 @@ export async function doAction(db: DB, actor: string, action: string, body: any,
           : `Daily cap cleared for ${slug}.`;
         break;
       }
+      case "resume-paused": {         // ticket 0021: clear cost-cap pause + re-bootstrap ship plist
+        // The autopause guard (src/budget_guard.ts) sets project_pause
+        // when the daily cost rollup crosses MAX_DAILY_USD; the operator
+        // taps Resume in the portal to clear it. We re-bootstrap via
+        // bash install.sh against the INSTALLED manifest dir so a stale
+        // working tree can't clobber other fields (same posture as
+        // eng-toggle — ticket 0020).
+        out = resumeShipPlist(db, slug);
+        db.prepare("DELETE FROM project_pause WHERE project_id=?").run(p.id);
+        // Ticket 0053: the graveyard memo cache lives in src/server.ts;
+        // its invalidation chokepoint includes the pause/unpause flip
+        // (per the ticket's engineering notes). Late-bind via the
+        // globalThis slot registered by src/server.ts at module load
+        // (per LESSONS 2026-06-05 "break ingest-to-server cache-
+        // invalidation cycles via a globalThis slot"). The hook is a
+        // no-op when the server module hasn't loaded.
+        try {
+          const hook = (globalThis as { __fleet_graveyard_invalidate__?: () => void })
+            .__fleet_graveyard_invalidate__;
+          if (typeof hook === "function") hook();
+        } catch { /* cache hook is best-effort; never block the resume */ }
+        message = `Resumed ${slug}.`;
+        break;
+      }
       case "clean-checkouts": {       // janitor pass over ~/.cache/<slug>-agent-*-checkout
         // Refuse while a job is in flight — its checkout is presumably the
         // working tree, and `rm -rf` underneath a running process is exactly
@@ -362,11 +468,22 @@ function snapshotAction(db: DB, action: string, body: any, actor: string, actorN
       // one — we compute it here from the live DB + config.
       const view = body?.fleet_view ?? fleetView(db, loadConfig());
       const baseUrl = typeof body?.base_url === "string" ? body.base_url : undefined;
+      // Ticket 0039: optional changelog embed. The CLI/route caller
+      // sets `include_changelog: true` to opt in; we compute the
+      // top-50 chronological window server-side here (same shape
+      // the /api/fleet/changelog route returns) so the recipient
+      // sees the same numbers the operator just shared.
+      const includeChangelog = body?.include_changelog === true;
+      const changelog = includeChangelog
+        ? fleetChangelog(db, { limit: 50 })
+        : undefined;
       const m = createSnapshot(db, {
         name,
         fleetView: view,
         ttl_hours: body?.ttl_hours,
         baseUrl,
+        include_changelog: includeChangelog,
+        changelog,
       });
       // Audit args carry the id_prefix + name + ttl — NEVER the plaintext
       // token. We construct the audit args explicitly so a careless

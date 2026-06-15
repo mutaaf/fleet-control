@@ -1,8 +1,8 @@
 ---
 id: 0017
 title: Today's inbox — cross-project "what needs me" view
-status: groomed
-priority: P2
+status: shipped
+priority: P1
 area: portal
 created: 2026-05-26
 owner: gtm-innovation
@@ -153,4 +153,20 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-27 [implementation-dev] picked up groomed → in-progress on
+  branch `feat/0017-todays-inbox-cross-project`. Plan: add the
+  `inbox_dismissal` table to `src/db.ts`, write `fleetInbox(db)` +
+  dismissal helpers in a new `src/inbox.ts` module (kept out of
+  `views.ts` so the home view stays small), wire two routes
+  (`GET /api/fleet/inbox`, `POST /api/fleet/inbox/dismiss`) into
+  `src/server.ts`, and render the inbox section above the project
+  grid in `web/app.js` with mobile-stacking styles in
+  `web/style.css`. Tests live in `tests/inbox.test.ts` — one per AC
+  box.
+- 2026-05-27 [implementation-dev] shipped via PR #49 (squash-merged
+  to main as `9ebd676`). Both gating checks (`typecheck` +
+  `validate`) green. AC8 perf test gated on `PERF=1` measured
+  `fleetInbox` < 100ms against the 10-project / 1000-anomaly /
+  50-PR / 5-snapshot synthetic fleet. Marking shipped via the
+  separate `chore/0017-mark-shipped` branch off freshly-pulled
+  main per LESSONS § 2026-05-22 [ship/0020].

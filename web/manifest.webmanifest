@@ -1,0 +1,25 @@
+{
+  "name": "fleet-control",
+  "short_name": "fleet",
+  "description": "Local control plane for the autonomous agent fleet.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0E0F0D",
+  "theme_color": "#0E0F0D",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any"
+    }
+  ]
+}

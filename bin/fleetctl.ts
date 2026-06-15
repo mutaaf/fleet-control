@@ -11,13 +11,23 @@ import { mintToken, listTokens, revokeToken, type Scope } from "../src/auth.ts";
 import { syncPricing, pricingRows, DEFAULT_PRICING_FILE } from "../src/pricing.ts";
 import { flagRun } from "../src/anomaly.ts";
 import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
+import { resolveWindow, isQuietNow, nextWindowEnd } from "../src/quiet_hours.ts";
 import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
 import { listSnapshots } from "../src/snapshot.ts";
+import {
+  computeReceipts, persistReceipts, unpublishReceipts,
+  listPublishedReceipts, isValidMonthIso,
+} from "../src/receipts.ts";
 import { doAction } from "../src/control.ts";
 import { defaultDeps, runDoctor, renderHuman, renderJson, exitCodeFor } from "../src/doctor.ts";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { runOnboard, productionDeps as onboardProductionDeps, parseOnboardArgs, ONBOARD_HELP } from "../src/onboard.ts";
+import { loadDemoFixture, DEMO_BANNER, DEMO_DEFAULT_PORT } from "../src/demo/fixture.ts";
+import { firstRun, sentinelPathFor, type WelcomeOpts, type WelcomeDeps } from "../src/welcome.ts";
+import { discoverLanUrl } from "../src/lan.ts";
+import { mintPairToken } from "../src/pair.ts";
+import { mkdirSync, writeFileSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync as fsWriteFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 const c = {
   dim: "\x1b[2m", bold: "\x1b[1m", grn: "\x1b[32m", ylw: "\x1b[33m", red: "\x1b[31m", cyan: "\x1b[36m", rst: "\x1b[0m",
@@ -321,6 +331,83 @@ async function snapshot() {
   process.exitCode = 1;
 }
 
+/** `fleetctl receipts <publish <slug> <month> | unpublish <slug> <month> |
+ *   list>` — ticket 0041. Publishes / unpublishes / lists the public
+ *  monthly-receipts artifacts surfaced at /receipts/<slug>/<YYYY-MM>.
+ *  Per LESSONS § "CLI subprocess tests need a FLEET_DB_PATH env seam":
+ *  the helper uses the same DB the rest of the CLI does (driven by
+ *  FLEET_DB_PATH in tests). The publish path is the OFFLINE direct-
+ *  write shape — no HTTP round-trip required — so this CLI works
+ *  whether or not `fleetctl serve` is running.
+ *
+ *  Why the CLI doesn't auto-detect a running server: the production
+ *  use case is "operator runs fleetctl on the laptop where serve is
+ *  also running" — both processes open the same SQLite file via WAL
+ *  (single-writer with non-blocking readers, per src/db.ts), so a
+ *  direct write here is correctly serialised against the server's
+ *  reads. The shape stays simple and the same `FLEET_DB_PATH` seam
+ *  drives both the test path and the production path. */
+function receipts() {
+  const sub = arg;
+  if (sub === "publish") {
+    const slug = argv[2];
+    const month = argv[3];
+    if (!slug || !month) {
+      console.log("usage: fleetctl receipts publish <slug> <YYYY-MM>");
+      process.exitCode = 1; return;
+    }
+    if (!isValidMonthIso(month)) {
+      console.error(`${c.red}error:${c.rst} bad month_iso (expected YYYY-MM); got ${month}`);
+      process.exitCode = 1; return;
+    }
+    if (slug !== "fleet") {
+      const exists = db.prepare("SELECT 1 FROM project WHERE slug = ?").get(slug);
+      if (!exists) {
+        console.error(`${c.red}error:${c.rst} unknown project slug '${slug}'`);
+        process.exitCode = 1; return;
+      }
+    }
+    const baseUrl = process.env.FLEET_BASE_URL || "http://127.0.0.1:7070";
+    const payload = computeReceipts(db, slug, month, new Date());
+    persistReceipts(db, payload);
+    const url = `${baseUrl.replace(/\/+$/, "")}/receipts/${slug}/${month}`;
+    console.log(`${c.grn}published${c.rst} ${c.bold}${slug}${c.rst} ${c.dim}(${month})${c.rst}`);
+    console.log(`  URL: ${url}`);
+    console.log(`  ${c.dim}${payload.merged_prs} PR${payload.merged_prs === 1 ? "" : "s"} merged · ${usd(payload.total_spend_usd)} spent · ${usd(payload.cost_per_pr_usd)}/PR · ${payload.red_days} red day${payload.red_days === 1 ? "" : "s"}${c.rst}`);
+    return;
+  }
+  if (sub === "unpublish") {
+    const slug = argv[2];
+    const month = argv[3];
+    if (!slug || !month) {
+      console.log("usage: fleetctl receipts unpublish <slug> <YYYY-MM>");
+      process.exitCode = 1; return;
+    }
+    const n = unpublishReceipts(db, slug, month);
+    if (n > 0) console.log(`${c.grn}unpublished${c.rst} ${slug} (${month})`);
+    else console.log(`${c.dim}no published row for ${slug} (${month}); nothing to do${c.rst}`);
+    return;
+  }
+  if (sub === "list" || sub === undefined) {
+    const rows = listPublishedReceipts(db);
+    if (!rows.length) {
+      console.log(`${c.dim}no published receipts. publish one with: fleetctl receipts publish <slug> <YYYY-MM>${c.rst}`);
+      return;
+    }
+    const baseUrl = process.env.FLEET_BASE_URL || "http://127.0.0.1:7070";
+    console.log(`\n${c.bold}SLUG            MONTH     PUBLISHED         URL${c.rst}`);
+    console.log(c.dim + "─".repeat(72) + c.rst);
+    for (const r of rows) {
+      const url = `${baseUrl.replace(/\/+$/, "")}/receipts/${r.project_slug}/${r.month_iso}`;
+      console.log(`${r.project_slug.padEnd(15)} ${r.month_iso}  ${ago(r.published_at).padEnd(14)}    ${url}`);
+    }
+    console.log();
+    return;
+  }
+  console.log("usage: fleetctl receipts <publish <slug> <YYYY-MM> | unpublish <slug> <YYYY-MM> | list>");
+  process.exitCode = 1;
+}
+
 switch (cmd) {
   case "backfill": backfill(); break;
   case "status": case undefined: status(); break;
@@ -328,10 +415,115 @@ switch (cmd) {
   case "show": show(arg ?? ""); break;
   case "pricing": pricing(); break;
   case "snapshot": await snapshot(); break;
+  case "receipts": receipts(); break;
   case "serve": {
     db.close(); // server opens its own handle
-    const host = process.env.FLEET_HOST ?? loadConfig().host ?? "127.0.0.1";
-    startServer(host, Number(process.env.FLEET_PORT ?? 7070));
+    const serveCfg = loadConfig();
+    const host = process.env.FLEET_HOST ?? serveCfg.host ?? "127.0.0.1";
+    const port = Number(process.env.FLEET_PORT ?? 7070);
+    // Ticket 0024 — first-run welcome. `--welcome` forces, `--no-welcome`
+    // suppresses. We resolve everything we need (sentinel path, project
+    // list, token source) BEFORE startServer fires onListening so the
+    // callback stays a thin trigger.
+    const forceWelcome = argv.includes("--welcome");
+    const suppressWelcome = argv.includes("--no-welcome");
+    // Ticket 0032 — `--no-pair` suppresses the pair section even when
+    // the LAN URL is discoverable. Useful for headless boots and demos
+    // where the QR would clutter logs.
+    const suppressPair = argv.includes("--no-pair");
+    const sentinelPath = sentinelPathFor(process.env);
+    // Re-open a short-lived handle ONLY to read project slugs for step 3
+    // and to mint the pair token if we'll be showing a QR. Using the
+    // same DB the server is about to open is fine because sqlite
+    // serialises writers and this is a quick SELECT + INSERT.
+    let projectSlugs: string[] = [];
+    let cfgAdminToken = "";
+    let pairSection: { url: string; qrText: string } | undefined;
+    try {
+      const peekDb = openDb(serveCfg.dbPath);
+      try {
+        const rows = peekDb.prepare("SELECT slug FROM project ORDER BY slug LIMIT 4").all() as Array<{ slug: string }>;
+        projectSlugs = rows.map((r) => r.slug);
+      } finally { peekDb.close(); }
+    } catch { /* fresh install — no project table yet, render the register hint */ }
+    try {
+      const cfgFile = pathJoin(process.cwd(), "fleet-control.config.json");
+      if (existsSync(cfgFile)) {
+        const raw = JSON.parse(readFileSync(cfgFile, "utf8")) as Record<string, unknown>;
+        if (typeof raw.adminToken === "string") cfgAdminToken = raw.adminToken;
+      }
+    } catch { /* config absent — auth.ts will mint one on first serve */ }
+    // Pair-section wiring. Only fires when:
+    //   * --no-pair was NOT passed, AND
+    //   * discoverLanUrl returns a non-null URL (operator bound LAN-side
+    //     AND a non-loopback IPv4 interface is discoverable), AND
+    //   * we have a plaintext admin token to mint the pair against
+    //     (fresh installs without a config-file token skip the QR; the
+    //     operator pairs manually until they re-run serve).
+    if (!suppressPair) {
+      try {
+        const lanUrl = discoverLanUrl(host, port);
+        if (lanUrl && cfgAdminToken) {
+          const mintDb = openDb(serveCfg.dbPath);
+          try {
+            const mint = mintPairToken(mintDb, cfgAdminToken);
+            // Human-readable URL keeps the `?t=` form so the operator
+            // can type it if scanning fails. The QR-encoded variant
+            // uses path-style routing (`/P/<TOKEN>`) and uppercase
+            // alphanumeric so it stays inside V1-L's 25-char capacity
+            // — the server's /pair route accepts both forms via the
+            // same query parser (the SPA's URL after redirect is the
+            // `?t=` form).
+            const url = `${lanUrl}/pair?t=${mint.token}`;
+            // Uppercase LAN URL plus path-style token. We accept that
+            // for many home IPs (e.g. 192.168.x.y plus port 7070) the
+            // QR text will exceed 25 chars; in that case the QR render
+            // throws and the welcome falls back to "QR unavailable".
+            const qrText = `${lanUrl.toUpperCase()}/P/${mint.token}`;
+            pairSection = { url, qrText };
+          } finally { mintDb.close(); }
+        }
+      } catch { /* never let a pair-mint failure crash serve */ }
+    }
+    const welcomeOpts: WelcomeOpts = {
+      token: cfgAdminToken,
+      host,
+      port,
+      configPath: pathJoin(process.cwd(), "fleet-control.config.json"),
+      tokenSource: cfgAdminToken ? "config" : "new",
+      color: process.stdout.isTTY === true,
+      projects: projectSlugs,
+      sentinelPath,
+      pairSection,
+    };
+    const welcomeDeps: WelcomeDeps = {
+      fileExists: (p) => { try { return existsSync(p); } catch { return false; } },
+      writeFile: (p, body) => fsWriteFileSync(p, body),
+      mkdir: (p) => mkdirSync(p, { recursive: true }),
+      log: (line) => process.stdout.write(line + "\n"),
+      warn: (line) => process.stderr.write(line + "\n"),
+    };
+    // Suppress the server's stock "fleet-control portal → ..." banner so
+    // the welcome (or, on subsequent runs, its one-line quiet form) is
+    // the sole stdout artifact at boot. When `--no-welcome` is set we
+    // re-emit a minimal line ourselves so a daemon-style operator still
+    // sees confirmation that serve actually listened.
+    startServer(host, port, {
+      quietBanner: true,
+      onListening: () => {
+        try {
+          firstRun(welcomeOpts, welcomeDeps, {
+            force: forceWelcome,
+            suppress: suppressWelcome,
+          });
+          if (suppressWelcome) {
+            // Mirror the legacy banner so existing scrapers don't break.
+            const shown = host === "0.0.0.0" ? "localhost" : host;
+            process.stdout.write(`fleet-control portal → http://${shown}:${port}\n`);
+          }
+        } catch { /* never let a welcome render crash the server */ }
+      },
+    });
     break; // keep process alive (http server is listening)
   }
   case "daemon-run": { db.close(); runDaemon(Number(arg) || 60); break; } // launchd entry (long-running)
@@ -359,6 +551,159 @@ switch (cmd) {
     }
     break;
   }
+  case "quiet-hours": {
+    // `fleetctl quiet-hours` — print the effective windows for the
+    // fleet default + each per-project override + the current active
+    // state. No subcommand for SETTING; operators edit
+    // fleet-control.config.json directly (per ticket 0030 § "matches
+    // the ntfyTopic / portalUrl precedent"). Exits 0 unconditionally.
+    const anyCfg = cfg as unknown as Record<string, unknown>;
+    const fleetDefault = anyCfg.quietHours as
+      { start: string; end: string; tz: string } | undefined;
+    const overrides = (anyCfg.quietHoursOverride
+      ?? {}) as Record<string, false | { start: string; end: string; tz: string }>;
+    const now = new Date();
+    console.log(`${c.bold}quiet-hours${c.rst} ${c.dim}— fleet-control.config.json${c.rst}`);
+    if (fleetDefault) {
+      const active = isQuietNow(cfg, "__fleet__", now);
+      const tail = active
+        ? `${c.grn}ACTIVE${c.rst} ${c.dim}— resumes ${(nextWindowEnd(cfg, "__fleet__", now) ?? new Date()).toISOString()}${c.rst}`
+        : `${c.dim}inactive${c.rst}`;
+      console.log(`  fleet default: ${fleetDefault.start}–${fleetDefault.end} ${c.dim}${fleetDefault.tz}${c.rst}  ${tail}`);
+    } else {
+      console.log(`  fleet default: ${c.dim}(none — set quietHours in fleet-control.config.json)${c.rst}`);
+    }
+    const slugs = Object.keys(overrides);
+    if (slugs.length === 0) {
+      console.log(`  per-project overrides: ${c.dim}(none)${c.rst}`);
+    } else {
+      console.log(`  per-project overrides:`);
+      for (const slug of slugs) {
+        const v = overrides[slug];
+        if (v === false) {
+          console.log(`    ${slug}: ${c.ylw}always page${c.rst} ${c.dim}(quiet hours disabled)${c.rst}`);
+        } else {
+          const win = resolveWindow(cfg, slug);
+          const active = isQuietNow(cfg, slug, now);
+          const tail = active ? `${c.grn}ACTIVE${c.rst}` : `${c.dim}inactive${c.rst}`;
+          if (win) {
+            console.log(`    ${slug}: ${win.start}–${win.end} ${c.dim}${win.tz}${c.rst}  ${tail}`);
+          } else {
+            console.log(`    ${slug}: ${c.red}invalid window${c.rst} ${c.dim}(falls back to fleet default)${c.rst}`);
+          }
+        }
+      }
+    }
+    break;
+  }
+  case "demo": {
+    // `fleetctl demo` — one-command sandbox (ticket 0025). Boots the
+    // same server path as `serve` but against an ephemeral tmpdir DB
+    // pre-seeded with the three-project demo fixture, on port 7071
+    // (deliberately NOT 7070 so a real serve isn't shadowed). All
+    // daemon side-effects are short-circuited via the demoMode flag
+    // on startServer().
+    db.close(); // server opens its own handle against the demo DB
+    const wantHost = process.env.FLEET_HOST ?? "127.0.0.1";
+    if (wantHost !== "127.0.0.1" && wantHost !== "localhost" && wantHost !== "::1") {
+      // The fixture is not a sensitive surface, but exposing it to
+      // the LAN by default makes the operator's threat model murky —
+      // and a real fleet bound to 0.0.0.0 should be the production
+      // serve, not the demo. Refuse the bind with a one-line message
+      // and a non-zero exit so a CI sandbox can't accidentally
+      // publish the demo to the network.
+      process.stderr.write("demo mode refuses non-loopback binds (got FLEET_HOST=" + wantHost + ")\n");
+      process.exit(2);
+    }
+    // Support both `--port 7071` (the existing flag()-style) and the
+    // `--port=7071` shape the ticket spec uses, since the demo
+    // subcommand is the first to advertise `--port=N` in its
+    // user-facing usage line. Other flags can stay simple.
+    const eqPort = argv.find((a) => a.startsWith("--port="))?.slice("--port=".length);
+    const portFlag = eqPort ?? flag("port");
+    const port = Number(portFlag ?? process.env.FLEET_PORT ?? DEMO_DEFAULT_PORT);
+    // Spin up a tmpdir for the ephemeral DB. We deliberately use
+    // mkdtempSync (not the operator's real ~/.local/state path) so
+    // the demo never touches the real fleet history.
+    const demoDir = mkdtempSync(pathJoin(tmpdir(), "fleet-demo-"));
+    const demoDbPath = pathJoin(demoDir, "fleet.db");
+    process.env.FLEET_DB_PATH = demoDbPath;
+    // Seed the fixture BEFORE startServer opens its handle so the
+    // first /api/fleet call answers with populated data.
+    {
+      const seedDb = openDb(demoDbPath);
+      try { loadDemoFixture(seedDb); } finally { seedDb.close(); }
+    }
+    // Print the tmpdir to stderr so curious operators can poke at it
+    // and so the SIGINT-teardown test can assert removal. Banner
+    // itself goes to stdout per AC7.
+    process.stderr.write("demo-tmp=" + demoDir + "\n");
+    const server = startServer("127.0.0.1", port, {
+      demoMode: true,
+      quietBanner: true,
+      onListening: () => {
+        // Print the banner ONLY after the socket is actually accepting
+        // connections — otherwise a fast test (or a curl pipeline) can
+        // race the listen callback and hit ECONNREFUSED before the
+        // first packet is accepted.
+        process.stdout.write(DEMO_BANNER);
+      },
+    });
+    // SIGINT teardown: close HTTP, close any incidental handle (the
+    // server owns its own DB connection internally), rm the tmpdir,
+    // exit 0. Idempotent across repeated signals — a second Ctrl-C
+    // mid-teardown is a no-op.
+    let tearingDown = false;
+    const teardown = (): void => {
+      if (tearingDown) return;
+      tearingDown = true;
+      try {
+        server.close(() => {
+          try { rmSync(demoDir, { recursive: true, force: true }); } catch { /* gone already */ }
+          process.exit(0);
+        });
+      } catch {
+        try { rmSync(demoDir, { recursive: true, force: true }); } catch { /* */ }
+        process.exit(0);
+      }
+      // Safety net: if the server.close callback never fires (a
+      // misbehaving keep-alive connection), force-exit after 500ms.
+      setTimeout(() => {
+        try { rmSync(demoDir, { recursive: true, force: true }); } catch { /* */ }
+        process.exit(0);
+      }, 500).unref();
+    };
+    process.on("SIGINT", teardown);
+    process.on("SIGTERM", teardown);
+    break;
+  }
+  case "onboard": {
+    // `fleetctl onboard [--non-interactive] [--skip <list>] [--help]` —
+    // interactive wizard (ticket 0046). Composes existing helpers
+    // (0010 register-url, 0021 budget, 0030 quiet hours, 0032 LAN+QR,
+    // 0003 token mint, 0016 doctor liveness probe, 0024 welcome
+    // checklist). Per LESSONS 2026-05-29 "when a CLI subcommand adds
+    // boot output, take ownership of the listen banner" — the onboard
+    // branch owns its full stdout; no other module prints during the
+    // wizard.
+    const parsed = parseOnboardArgs(argv.slice(1));
+    if (parsed.help) {
+      process.stdout.write(ONBOARD_HELP);
+      break;
+    }
+    try {
+      const deps = onboardProductionDeps(db, {
+        nonInteractive: parsed.nonInteractive,
+        skip: parsed.skip,
+      });
+      await runOnboard(deps);
+      process.exitCode = 0;
+    } catch (e: any) {
+      process.stderr.write(`onboard: crashed — ${String(e?.message ?? e)}\n`);
+      process.exitCode = 2;
+    }
+    break;
+  }
   case "doctor": {
     // `fleetctl doctor [--json]` — one-shot install + ingest diagnostic
     // (ticket 0016). Wraps runDoctor() in a try/catch so a doctor crash
@@ -379,6 +724,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|doctor [--json]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|doctor [--json]|onboard [--non-interactive] [--skip <list>] [--help]]");
 }
-if (cmd !== "serve" && cmd !== "daemon-run") db.close();
+if (cmd !== "serve" && cmd !== "daemon-run" && cmd !== "demo") db.close();

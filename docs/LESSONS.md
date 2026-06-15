@@ -346,3 +346,538 @@ this repo: any module that renders user/operator data to a terminal
 or HTTP response SHOULD pass the final string through a single
 `redactSecrets()` chokepoint at the boundary — the check authors
 remain primary, but the renderer is the silent backstop.
+
+## 2026-05-28 — re-fire-after-dismiss needs an aging window, not a partial UNIQUE index
+
+Symptom: while shipping ticket 0027 (cross-project failure
+correlation) I wired a `CREATE UNIQUE INDEX IF NOT EXISTS ON
+anomaly(correlation_signature) WHERE kind='fleet_correlated'` to
+guarantee `runCorrelationHook` was idempotent within a 24h window —
+two ticks in a row insert one row, perfect. AC9 then exercised
+"dismiss the correlation, advance 25h, seed a fresh outbreak, the
+inbox must re-surface a new row." It didn't: the partial UNIQUE
+swallowed the second INSERT because the dismissed row was still
+present, so `activeCorrelations`' LEFT JOIN saw a dismissed row
+and nothing fresh. Cause: a hard UNIQUE constraint conflates two
+separate questions — "is this a duplicate WITHIN the dedup window"
+and "is this a duplicate FOR ALL TIME" — and the second answer is
+wrong for any signal that the operator legitimately wants to be
+re-alerted about after they've acknowledged the previous instance.
+Fix: drop the partial UNIQUE for a non-unique index on
+`(correlation_signature, created_at)` and move idempotency into
+the application — the hook does a "is there a row WHERE
+created_at >= now - 24h?" lookup before INSERT. The 24h aging is
+the natural re-fire boundary: a dismissed row falls out of the
+window after 24h, the next tick finds no live row, and a fresh
+INSERT lands. General rule for this repo: any "fire once per
+event family" detector where the OPERATOR can dismiss and the
+EVENT can recur needs an aging-window dedup, not a UNIQUE
+constraint. Reach for SQL UNIQUE only when "duplicate" means
+"identical for all time" (e.g. `auth_token.id` = hash of the
+plaintext — re-minting the same plaintext is genuinely a bug).
+Pair with a LEFT JOIN onto `inbox_dismissal` so the dismissed row
+is invisibly suppressed inside its window without blocking the
+next legitimate fire after the window closes.
+
+## 2026-05-29 — time-pinned tests must NOT derive seed timestamps from `new Date()`
+
+Symptom: while shipping ticket 0018 I ran `node --test tests/*.test.ts`
+to confirm no regressions and saw `tests/prs-merged.test.ts` (5/7
+failing) and `tests/digest.test.ts` (multiple failing) reporting
+`prs_merged: 0` against a fixture that seeded 3 shipped runs. The
+same two test files failed identically against `main` with my
+changes stashed, so the regression wasn't mine. Cause: both files
+pin the digest "now" anchor as a string constant
+(`NOW_ANCHOR = "2026-05-26T12:00:00.000Z"`) but build their seed
+timestamps with a helper that reads `new Date()`:
+`daysAgoIso(N) { const d = new Date(); d.setUTCDate(... - N); ... }`.
+On the day the test was authored (2026-05-26) those two clocks
+agreed. By 2026-05-29 the wall clock had moved three days past the
+anchor — so `daysAgoIso(1)` returned a row dated 2026-05-28 (which
+falls AFTER the 2026-05-26 anchor's seven-day window
+[2026-05-19, 2026-05-26]) and the digest correctly counted zero
+shipped runs in window. The detector is right; the fixture is the
+bug. The CI typecheck gate doesn't catch this because the file
+compiles fine, and the `validate` gate only runs
+`scripts/check-backlog.mjs` — no tests. So the failures sit
+indefinitely on main until a human runs the suite. Fix when next
+touching these files: take a `now: NOW_ANCHOR` (or any pin) option
+through the seed helper and use `new Date(opts.now)` as the
+arithmetic base. General rule for this repo: any test that pins a
+fixed `now` anchor MUST anchor its seed timestamps to that same
+value — never `new Date()` — or the test becomes a time-bomb that
+breaks weeks after the author committed. Same trap will bite any
+future window-scoped digest, leaderboard, streak, or burndown
+test. Pre-existing failures discovered in the wild are fine to
+leave in place under one condition: they MUST NOT be one of the
+gating checks (typecheck + validate). The ship agent's
+"distinguish CI red from CI absent" rule extends here: distinguish
+"test red in MY change" from "test red for reasons that predate
+my change" — fix the first, document the second and move on.
+
+## 2026-05-29 — when a CLI subcommand adds boot output, take ownership of the listen banner
+
+Symptom: while shipping ticket 0024 (first-run welcome printed by
+`fleetctl serve`) my first cut wired `firstRun()` into the existing
+`startServer({ onListening })` hook without setting `quietBanner: true`
+— so a cold-start run printed `fleet-control portal → http://127.0.0.1:7070`
+FIRST (from inside `server.listen`'s default callback) and the
+12-line welcome AFTERWARDS. Subsequent runs printed the legacy banner
+PLUS my new one-line `fleet-control serving on ...` quiet form — two
+lines saying the same thing, in opposite styles. Cause: `startServer`'s
+listen callback is a multiplexer — it prints its own line by default
+AND invokes the caller's `onListening`. Any CLI subcommand that wants
+to own boot output must opt out of the default banner explicitly via
+`quietBanner: true` (the same flag the demo subcommand from ticket
+0025 already uses for the same reason). Fix: set `quietBanner: true`
+in the serve case and have the CLI re-emit the legacy `fleet-control
+portal → ...` line ITSELF when `--no-welcome` is passed (so existing
+scrapers and operator muscle memory still see exactly one banner).
+General rule for this repo: any new CLI subcommand that intends to
+emit a boot banner MUST pass `quietBanner: true` to `startServer` and
+own the full boot stdout — otherwise the operator gets two banners
+that race the kernel's listen callback in unpredictable order. Same
+trap will bite future subcommands (`fleetctl serve --json-logs`,
+`fleetctl serve --quiet`, etc.) that want to control startup output.
+
+## 2026-06-05 — break ingest↔server cache-invalidation cycles via a globalThis slot, not a circular import
+
+Symptom: while shipping ticket 0039 (fleet changelog page) I needed
+the 60s changelog memo cache (defined in `src/server.ts`) to be
+invalidated the moment `runIngestPass()` (in `src/ingest/index.ts`)
+commits a tick — so a freshly-merged PR surfaces on the next
+render instead of waiting out the TTL. The first instinct was the
+direct route: `import { _invalidateChangelogCacheAfterIngest } from
+"../server.ts"` inside `runIngestPass`. That immediately deadlocks
+node's ESM cycle detector — `src/server.ts` already
+`import { runIngestPass } from "./ingest/index.ts"` at the top, so a
+return-trip import would create a cycle whose evaluation order is
+runtime-undefined (one side sees `undefined` for the symbol it
+needs). Cause: the cache lives on the consumer side (server) but
+the invalidation trigger lives on the producer side (ingest);
+making either side import the other creates a cycle the moment they
+both load at boot. Fix: register the invalidation function on
+`globalThis` from `src/server.ts` on module load
+(`(globalThis as { __fleet_changelog_invalidate__?: () => void })
+.__fleet_changelog_invalidate__ = _invalidateChangelogCacheAfterIngest`),
+and have `runIngestPass` read it lazily off `globalThis` after the
+COMMIT — typed `as { __fleet_changelog_invalidate__?: () => void }`
+so tsc still type-checks the call. The hook is a no-op when the
+server module hasn't loaded (e.g. the launchd daemon imports the
+ingest module but not the server), which is exactly the right
+behaviour: no server, no cache, no invalidation needed. General
+rule for this repo: when module A owns a cache that module B's
+side-effect must invalidate AND B is already imported by A, do NOT
+introduce a B→A import — register the invalidation function on a
+documented `globalThis.__fleet_<feature>_<verb>__` slot from A's
+load-time and have B late-bind via the slot. The leading-and-
+trailing-double-underscore convention signals "do not collide" the
+same way `_resetXForTests` signals "do not call in production."
+Same trap will bite any future feature where an ingest tick (or
+any "the world changed" trigger that fires from a producer module
+the server already depends on) needs to wake a consumer-side memo.
+
+## 2026-06-05 — groomer prose can disagree with the schema; the schema wins
+
+Symptom: ticket 0040 (riskiest open PR badge) specified the helper's
+main query as `SELECT FROM pr WHERE state = 'OPEN' AND is_agent = 1`
+in upper-case prose. The first cut of `riskiestOpenPr()` followed the
+prose verbatim and returned `open_count: 0` against every fixture
+that seeded `state: 'open'` — because the production ingester
+(`src/ingest/prs.ts` line 164) writes the literal string `'open'`
+(lower-case) on every pass, and SQLite's `=` is case-sensitive on
+TEXT comparisons by default (no `COLLATE NOCASE`). The helper's tests
+failed instantly; tsc was clean (a string literal compares to any
+string at the type level); the validator was clean (no schema change
+needed). Only the run-the-tests step caught it. Cause: the groomer's
+spec text was written without round-tripping through the actual schema
+— it described the INTENT (open PRs only) using one casing, while the
+ingester historically picked another. Fix: query `state = 'open'` and
+document the reconciliation in the Implementation log. General rule
+for this repo: when a ticket's engineering notes name a column value
+literally (state, ci_state, outcome, kind, phase), `grep` the
+ingester / writer paths in `src/ingest/*.ts` for that exact column
+before writing the SELECT — the source of truth is the producer, not
+the spec. Same family as the courtiq cross-fleet lesson
+"groomer billing-shorthand vs schema": the spec is a hint, the
+schema is the contract. `cost_rollup_day.phase`, `run.outcome`,
+`pr.ci_state` (`'red' | 'pending' | 'green' | 'none'` — NOT the
+GitHub-rollup tokens FAILURE/SUCCESS/PENDING the spec used), and
+`anomaly.kind` are all places this trap could bite next; the producer
+file is the chokepoint to grep.
+
+## 2026-06-07 — the `pr` table has no surrogate `id`; proxy "latest landed" via (MAX(fetched_at), COUNT(*))
+
+Symptom: while wiring ticket 0044's spend-efficiency cache I copied
+the 0040 riskiest-PR invalidation-tuple pattern (`SELECT MAX(id)
+FROM pr WHERE state='MERGED'`) and got an instant runtime 500 against
+the booted test server: `no such column: id`. Cause: the `pr` table
+in `src/db.ts` declares `PRIMARY KEY(project_id, number)` and NO
+`id INTEGER PRIMARY KEY` autoincrement column — unlike `run`,
+`anomaly`, `control_audit`, and most other tables in this DB. The
+spec's "latest_merged_pr_id" is a column that doesn't exist. The
+fix is to proxy "fresh merge landed" with a TWO-VALUE pair:
+`MAX(fetched_at)` (catches the case where the same row's sync
+timestamp advances) AND `COUNT(*)` (catches a new row inserted that
+happens to share the same fetched_at). Either moving busts the
+cache identically to a phantom id. General rule for this repo: any
+new cache that wants to invalidate on "fresh `pr` row landed" MUST
+use the `(MAX(fetched_at), COUNT(*))` pair, never `MAX(id)`. The
+groomer's spec text routinely names a `latest_<table>_id` tuple
+component without confirming the column exists; round-trip every
+such reference through the schema in `src/db.ts` before writing
+the SELECT. Adjacent tables with the same composite-PK shape and
+no surrogate id today: `cost_rollup_day` (PK `(project_id, phase,
+day)`), `project_alias` (PK `alias_slug`), `pricing` (PK `model`),
+`watermark` (PK `source`), `inbox_dismissal` (PK `(kind,
+project_slug, payload_id)`), `home_last_seen` — same trap applies
+to any future cache keyed off "the latest row in any of these."
+
+## 2026-06-10 — when an ingester grows a second shell-out, legacy stubs that don't discriminate on argv silently collide
+
+Symptom: while shipping ticket 0049 I extended
+`src/ingest/prs.ts` to fire `gh pr list --state closed` alongside
+the existing `--state open` call. The new tests in
+`tests/prs-ingest-closed.test.ts` passed instantly, but three
+legacy test files (`tests/prs-ingest.test.ts`,
+`tests/correlate.test.ts`, `tests/health.test.ts`) started
+failing with `UNIQUE constraint failed: pr.project_id, pr.number`.
+Each of those legacy stubs is shaped
+`_setPrRunnerForTests((cmd, args) => { if (cmd === "gh" &&
+args[0] === "pr" && args[1] === "list") return JSON.stringify([
+{ number: 42, ... } ]); return ""; })` — it returned the SAME
+PR payload for ANY `gh pr list` invocation regardless of argv.
+Pre-0049 that was fine because the ingester only called gh once
+per pass. Post-0049 the same row tried to land twice (once
+through the open INSERT, once through the closed INSERT) and
+hit the composite PK. Cause: the test stubs simulated gh's
+behaviour at a coarser granularity than the production
+ingester's call surface — the stubs ignored the very flag
+(`--state`) that real gh uses to differentiate which rows it
+returns. Fix: tighten each affected stub to inspect
+`args.indexOf("--state")` and return `[]` for the non-target
+state (a refinement, not a weakening — real gh never returns
+the same PR row for both `--state open` AND `--state closed`).
+General rule for this repo: when adding a SECOND shell-out
+through an existing runner seam (`_setRunnerForTests`,
+`_setPrRunnerForTests`, etc.), audit every test that uses the
+seam — any stub that returns a non-empty payload for "any
+matching command" is a latent PK / dedup-key collision the
+moment the new shell-out reuses the same gh subcommand with
+different flags. The fix is always in the stub: discriminate
+on the same axis the real CLI does (`--state`, `--repo`,
+`--branch`, `--json` field projection, etc.). Same trap will
+bite any future ingester that grows from one→N shell-outs
+against the same `gh` / `launchctl` / `git` subcommand. The
+production side has an idempotency option (UPSERT or per-row
+dedup map) but that hides the test-stub gap; tightening the
+stub is the cleaner signal.
+
+## 2026-06-10 — `redactSecrets` on a JSON body shreds your KEYS, not just your values
+
+Symptom: while shipping ticket 0052 I wired the new
+`/api/fleet/lessons/savings` JSON route to defence-in-depth-
+scrub token-shape substrings before `res.end`, copy-pasting the
+existing `redactSecrets()` regex from `src/receipts.ts` /
+`src/doctor.ts`. The first test against an empty fleet asserted
+`average_failed_ship_cost_usd` (the documented top-level
+number) and got back `undefined` — the field name was missing
+from the JSON entirely. Cause: the `redactSecrets` regex
+`\b[A-Za-z0-9_]{24,}\b` with the `hasDigit = /\d/.test(match)
+|| /_/.test(match)` heuristic treats UNDERSCORE as a digit-
+qualifier. That's the right call when scanning narrative TEXT
+(a token like `gh_abcdef…` has letters and may have underscores
+but no digits — the underscore stand-in is what gates the
+classifier). It's the WRONG call when the input is a JSON body:
+my own top-level keys (`average_failed_ship_cost_usd` is 27
+chars, letters-and-underscores ONLY) match the
+`[A-Za-z0-9_]{24,}` shape AND the `hasLetter && hasDigit` gate
+(because `_` is "digit"). So `JSON.parse(redactSecrets(JSON.
+stringify(rollup)))` mangled my schema — the JSON parser saw
+`"<redacted>"` where the key name used to be, and the test's
+`typeof j.average_failed_ship_cost_usd === "number"` assertion
+hit `undefined`. Fix: route the redactor through the rollup's
+operator-supplied STRING VALUES (lesson_slug, lesson_date,
+lesson_title) BEFORE the rollup is `JSON.stringify`'d, not over
+the JSON body string. The values are the surface that can
+carry an upstream-tail-leaked token; the keys are repo-authored
+and structurally safe. I also tightened the regex's digit gate
+(`hasDigit = /\d/.test(match)` — no longer treating `_` as a
+digit-qualifier) for this redactor specifically; a real
+token-shape substring always carries at least one numeric
+digit. General rule for this repo: when a defence-in-depth
+redactor moves from text/HTML routes to a JSON route, scrub
+the values, NOT the body string. The token-shape heuristic is
+LATENT-ambiguous between "long underscore-separated identifier"
+(safe — your JSON key) and "long underscore-laden secret"
+(unsafe — your leaked token), and the only side that always
+gets the right answer is the value side. Same trap will bite
+any future JSON route that copy-pastes `redactSecrets` from a
+text renderer — the symptom is silent JSON shape mangling
+(your field names get replaced by `<redacted>`), which the
+typecheck CAN'T catch (it's a runtime string op over a
+serialised body) and which tests catch only if they assert
+shape, not just status code.
+
+## 2026-06-11 — startServer() tests that mutate `fleet-control.config.json` race against parallel test files; expose a renderer-direct seam for branch tests
+
+Symptom: while shipping ticket 0054 I wrote an AC7 quiet-hours
+test that booted `startServer()` against a tmp DB and planted a
+`{ quietHours: { start: "00:01", end: "00:00", tz: "UTC" } }` config
+in cwd to drive the CTA-suppression branch. The test passed when
+run in isolation (`node --test tests/pulse.test.ts`) and passed
+again under `--test-concurrency=1`, but failed the moment another
+test file (e.g. `tests/receipts.test.ts` or
+`tests/year-in-review.test.ts`) ran concurrently: my `boot()`
+helper wrote the quietHours config, a parallel test file's
+`boot()` (in its own subprocess) wrote a DIFFERENT config to the
+SAME `fleet-control.config.json`, and `startServer`'s
+`loadConfig()` then read whichever write landed last — the CTA
+either appeared (quietHours dropped on the floor) or the page
+404'd (someone else's malformed config). Cause: `process.cwd()`
+is shared across all node:test subprocesses on the same machine;
+the `savedConfigText` snapshot in the test's `boot()` helper is
+per-process; the FILE is global. Each subprocess thinks IT owns
+the config; the filesystem disagrees. The receipts/year/lesson-
+savings tests don't see this because none of them mutate
+quietHours — they all write the same empty-roots shape, so a race
+between two identical writes is invisible. The first test to
+mutate a NON-DEFAULT config key (quietHours, projectRoots
+overrides, etc.) is the one that exposes the race. Fix: for any
+test that needs to drive a BRANCH that depends on configuration,
+export a renderer-level test seam (e.g.
+`_renderPulsePageForTests(payload, { quietHoursActive: true })`)
+so the test can hand-roll the input the renderer would have
+received from `quietHoursActiveAnywhere(cfg, now)` — zero cwd
+mutation, zero HTTP, zero race. The boot-path tests stay valuable
+for the integration shape (route exists, content-type, cache-
+control, testids present) but the cfg-dependent BRANCHES belong
+in renderer-direct unit tests. General rule for this repo: any
+new test that needs to write a NON-DEFAULT field to
+`fleet-control.config.json` is a smell — extract the renderer
+function, export a `_render*ForTests` seam, and drive the branch
+directly. The boot-path test is for "the route is wired"; the
+renderer-direct test is for "this input produces this output."
+Same trap will bite any future ticket that needs to drive an
+auth-gated, quietHours-gated, or per-project-override-gated
+branch through a startServer() boot — `--test-concurrency=1`
+"fixes" the symptom but doesn't fix the architecture.
+
+## 2026-06-11 — character-window source greps leak into sibling helpers; backticked identifiers in adjacent comments break the slice
+
+Symptom: while shipping ticket 0056 I added a new sibling helper
+`lessonSavingsByProject` immediately after `lessonSavingsRollup`
+in `src/views.ts`. The new helper's leading comment block
+referenced existing identifiers like `` `lessonSavingsRollup` ``,
+`` `'failure'` ``, and `` `heal_count` `` — backticked because
+that's the standard markdown-in-comment convention this codebase
+uses for inline code. My ticket's typecheck + my new test suite
+were both green, but the existing 0052 AC10 grep test
+(`tests/lesson-savings.test.ts:783`) — which asserts
+"`lessonSavingsRollup` must not embed SQL keywords inside a
+backtick template literal" — started failing. Cause: the 0052
+test computes `const idx = VIEWS_TS.indexOf("lessonSavingsRollup")`
+then slices `VIEWS_TS.slice(idx, idx + 4000)` and regex-greps for
+`` /`[\s\S]*?(SELECT|FROM|WHERE|GROUP BY|ORDER BY)[\s\S]*?`/i ``.
+That slice doesn't end at the closing brace of
+`lessonSavingsRollup`; it just walks 4000 characters forward.
+When I inserted the new helper right after, the slice now
+contained: (a) the first backtick from a comment INSIDE
+`lessonSavingsRollup` (`` `pr` table ``), (b) the actual SQL
+string-concatenation inside `lessonSavingsRollup` (full of
+SELECT/FROM/WHERE), and (c) a second backtick from MY new
+comment block (`` `lessonSavingsRollup` `` as a cross-reference).
+The non-greedy `[\s\S]*?` happily stretched from (a) to (c),
+matching all the SQL keywords in between — even though no SQL
+keyword was ever inside a backtick template literal. The regex
+is correct in shape (any backtick-to-backtick run that contains
+a SQL keyword IS suspicious) but the character-window slice is
+too greedy when there's a sibling helper next door. Fix: drop
+the backticked identifiers from the new helper's comment block
+— plain prose like `lessonSavingsRollup` (no backticks) reads
+identically and stops the regex from matching across helpers.
+The 0052 test stays untouched (it's still the correct guard for
+the helper it names); the new helper just doesn't carry the
+backtick-comment style that overlaps the slice window. General
+rule for this repo: when a test does
+`VIEWS_TS.slice(indexOf(name), indexOf(name) + N)` to scope a
+grep to "this helper", any future sibling inserted within `N`
+chars inherits the test's regex constraints. The safer slicing
+pattern is `VIEWS_TS.slice(indexOf(name),
+VIEWS_TS.indexOf("\n}\n", indexOf(name)))` (walk to the closing
+brace at column 0) — but retrofitting that across every existing
+guard is more churn than just keeping new comment blocks free of
+backticked SQL-adjacent identifiers. Pre-flight check for any
+ticket that adds a sibling helper next to an existing one: grep
+the test suite for that helper's name + ".slice(" or ".indexOf("
+and confirm the new sibling's comment block won't poison the
+window. Same trap will bite any future ticket that adds a helper
+adjacent to one with a character-window source grep
+(views.ts has several: lessonSavingsRollup, lessonCreditRollup,
+fleetWeeklyPulse, etc.).
+
+## 2026-06-12 — greedy `[^>]+id=` regex over a `<h2 id="..." data-testid="...">` captures the wrong attribute
+
+Symptom: while shipping ticket 0057 (public lesson archive) the AC4
+permalink test pulled a slug out of the rendered index HTML via
+`body.match(/<h2[^>]+id=["']([a-z0-9-]+)["']/)`, then hit
+`GET /lessons-public/<slug>` and got an unexpected 404 against a
+server that DEFINITELY had the lesson in its archive. Cause: the
+rendered tag was `<h2 id="redactsecrets-on-..." data-testid=
+"lesson-public-redactsecrets-on-...">` — and the greedy `[^>]+`
+inside the regex slurped right through the `id="..."` attribute
+all the way to `data-testid=` (which ends with `testid=`, which
+contains the literal `id=`), capturing `lesson-public-<slug>`
+instead of the plain `<slug>`. The lookup against the archive's
+`lesson_slug` field then 404'd because no row carries the
+`lesson-public-` prefix. Fix: anchor the parse on the testid
+itself (`/data-testid=["']lesson-public-([a-z0-9-]+)["']/`) — the
+suffix on the testid IS the slug by construction, and the testid
+attribute is unambiguous (no other attribute matches it). General
+rule for this repo: when a test wants to scrape an attribute out
+of an HTML element via regex, NEVER use `[^>]+attr=` with a
+greedy quantifier when ANOTHER attribute on the same tag ends in
+the literal `attr=` substring (`data-testid` collides with any
+greedy `id=` regex; `aria-labelledby` collides with `by=`; etc.).
+Anchor on the most-distinctive attribute name, OR use a non-
+greedy quantifier `[^>]*?` followed by a word-boundary before the
+`attr=` token. The renderer was correct; the test's regex was the
+bug. Same trap will bite any future test that scrapes a slug /
+id / name out of a rendered HTML element that ALSO carries a
+testid suffixed with that same value (a common pattern in this
+codebase: `<a id="<slug>" data-testid="<prefix>-<slug>">`).
+
+## 2026-06-13 — function-import cycles aren't always cache-invalidation; sometimes the cheapest fix is a 6-line inline copy of the helper
+
+Symptom: while shipping ticket 0058 (public failure-mode landing pages)
+I wanted the new `fleetFailureModes()` helper in `src/views.ts` to
+share the 0057 anonymisation pass (`anonymiseLessonBody` in
+`src/lessons.ts`) so operator slugs / `/Users/` paths / agent branches
+collapse to the same placeholders across both public surfaces. The
+natural move was to export `anonymiseLessonBody` from `src/lessons.ts`
+and add `import { anonymiseLessonBody } from "./lessons.ts"` to
+`src/views.ts`. The typecheck passed. The first test run failed at
+module load: `src/lessons.ts` already does `import { lessonSavingsRollup
+} from "./views.ts"` (added in ticket 0055), so my new edge created a
+two-way function-import cycle. Node's ESM cycle detector doesn't crash
+on it but evaluation order is runtime-undefined — one side may see
+`undefined` for the imported symbol depending on which module the
+entrypoint loads first. Cause: the 2026-06-05 globalThis-slot lesson
+covers ONE specific shape of cycle (a server-side cache that an
+ingest-side producer must invalidate); it does NOT cover a vanilla
+two-module function dependency where neither side owns a runtime
+cache. Reaching for the globalThis-slot pattern here would be silly —
+the function is pure, no state, no producer/consumer asymmetry. Fix:
+inline the helper as a private `anonymiseExcerpt` inside `views.ts`
+(6 lines + one local `reEscape`). The two copies will drift the day
+someone adds a fifth anonymisation rule; that's still cheaper than the
+audit cost of a function-import cycle that bites at the next
+`import { somethingElse } from "./views.ts"` inside `lessons.ts`.
+General rule for this repo: BEFORE adding a `from "./views.ts"` import
+to ANY module that `views.ts` already imports (today: `lessons.ts`,
+`config.ts`, `correlate.ts`, `quiet_hours.ts`, `inbox.ts`, `digest.ts`,
+`live.ts`, `alerts.ts`, `daemon.ts`, `drift.ts`, `anomaly.ts`,
+`ingest/prs.ts`), grep for the OTHER direction with
+`grep -n "from \"\\./views" src/<other>.ts`. If both sides need a
+helper that's stateless and short, prefer a private inline copy in
+each side OR hoist the helper to a tiny third module (e.g.
+`src/anonymise.ts`) that neither side already imports. The globalThis-
+slot pattern stays in its lane: it's the right answer ONLY when one
+side owns a cache the other side's COMMIT must invalidate. A pure
+function dependency is not that shape.
+
+## 2026-06-13 — per-candidate detection fixtures must also satisfy the global empty-fleet gate
+
+Symptom: while shipping ticket 0059 (biggest surprise this week)
+the AC2/AC5/AC6 candidate-detection tests all failed on first
+run with `kind:'none'` and the warming-up sentence — even though
+each fixture seeded the documented per-candidate minimum (4
+weeks for silent-project, 5 prior merges for heal-streak, 5
+trailing-90d PRs for new-author-red). The helper was correct;
+each candidate's local threshold was met. But the helper ALSO
+enforced a GLOBAL "fleet has < N weeks of pr data → warming
+up" empty-state gate (the documented AC10 honest empty state)
+which fires BEFORE the candidates are evaluated. The per-
+candidate fixtures didn't satisfy that earlier gate, so the
+helper short-circuited into the empty-state branch and never
+ran the per-candidate logic. Cause: the spec lists the per-
+candidate minimums (4 weeks for silent-project, etc.) as the
+"detection threshold" but also lists a SEPARATE global
+"warming up" threshold (< 8 weeks) as a sibling AC. The two
+ACs read as independent in prose but are evaluated in series
+by the helper. A fixture that satisfies only the per-candidate
+local minimum is necessarily a "warming up" fleet under the
+global gate. Fix: each per-candidate test fixture seeds enough
+trailing data to clear BOTH the global empty-fleet gate AND
+the candidate-specific threshold — for biggest-surprise that
+meant adding 4 extra weeks of single-PR baseline rows beyond
+the candidate's own 4-week / 5-PR / 5-trailing-PR fixture so
+the helper's `COUNT(DISTINCT strftime('%Y-%W', date(fetched_at)))`
+across MERGED is_agent rows clears the 8-week threshold. The
+extra rows are below every candidate's per-test threshold so
+they don't accidentally fire a different candidate. General
+rule for this repo: any helper that gates a "are we ready to
+report?" empty-state check BEFORE per-candidate evaluation
+forces every per-candidate test fixture to also satisfy that
+earlier gate. When designing the test suite, write the global
+empty-state fixture FIRST (it's the simplest) then layer each
+per-candidate fixture ON TOP — never assume the per-candidate
+minimums also clear the global gate, because the global gate
+is usually a "data maturity" threshold computed across all
+rows, not the per-candidate subset. Same trap will bite any
+future ticket whose helper composes a "report nothing until
+the fleet has matured for N weeks" guard ahead of the actual
+detection logic.
+
+## 2026-06-15 — when an empty-state branch and a card's zero-denominator framing seem to overlap, pick a "first month meaningfully crossed the threshold" pivot
+
+Symptom: while shipping ticket 0062 (monthly fleet retro card) I
+hit a contradiction between two ACs. AC1's first-full-month branch
+says "9 weeks of merged-PR data anchored so only ONE full calendar
+month exists (no PRIOR full month to compare)" with `now =
+2026-06-01` — which means thisMonth=May, lastMonth=April, and
+the fixture is supposed to clear the global 8-distinct-trailing-
+weeks-of-merged-PR-data gate AND render kind='first-full-month'.
+But May only spans ~5 ISO weeks; 9 weeks of data all in May
+literally cannot reach 8 distinct weeks. Meanwhile AC4's zero-
+denominator edge case explicitly seeds April with 5 PRs + June
+with 8 PRs + May empty AND expects kind='card' with a "no
+comparison" framing on the affected delta — NOT first-full-month.
+The two branches both fire when "lastMonth has 0 PRs", which
+means the discriminator can't be "lastMonth has zero data".
+Cause: the AC's prose conflates "no comparison anchor" with "the
+fleet hasn't been around long enough to have a baseline" — they're
+the same SQL question but different operator stories. The fix is
+to pick a different pivot: a calendar month is a "full" month
+when it crosses a small threshold (>= 3 merged PRs in the v1
+implementation); first-full-month fires when `thisMonth` is the
+FIRST chronological month to cross that bar (no earlier month
+qualifies); otherwise the card renders and individual deltas can
+still hit the "no comparison - last month had 0 PRs" framing
+inline when prs_last_month / spend_last_month / etc happen to be
+zero. With that pivot:
+  - AC1 first-full-month fixture: May has 6 merges (full), April /
+    March / Feb each have only 2 fringe merges (not full) — first
+    chronological full month is May; thisMonth=May → first-full-
+    month fires.
+  - AC4 zero-denominator fixture: April has 5 merges (full), June
+    has 8 (full) — first chronological full month is April,
+    which is < thisMonth(June), so the card renders and the
+    inline "no comparison" framing kicks in for the May=lastMonth
+    delta.
+General rule for this repo: when two empty-state branches share a
+SQL signal (here: "lastMonth has zero PRs") but the operator-facing
+copy differs ("first full month - check back next month" vs "no
+comparison - last month was empty"), look for a SECOND signal that
+discriminates which empty-state the operator is actually in. A
+"this is the FIRST month the fleet has been active enough to be
+meaningful" pivot is usually cleaner than "this month happens to
+have zero comparison data" — the first one names a fleet maturity
+threshold; the second one names a sampling fluke. The threshold
+constant lives next to the helper as a named const (`MIN_FULL_
+MONTH_PRS = 3`) so the next ticket can lift it without grepping
+for a magic number. Same trap will bite any future ticket whose
+helper composes a "first-N" empty-state alongside a "zero-
+denominator-this-period" inline framing — the discriminator
+question is always "what's the OPERATOR's story", not "what's
+the SQL question".

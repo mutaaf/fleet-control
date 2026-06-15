@@ -27,6 +27,41 @@ export interface FleetConfig {
    *  hash route `http://127.0.0.1:7070/#/p/`. The project slug is
    *  appended per notification. */
   portalUrl?: string;
+  /** Quiet hours — sleep-window suppress non-critical pushes (ticket 0030).
+   *  Operator-wide default. `tz` is an IANA zone name like
+   *  "America/Los_Angeles"; `start` and `end` are HH:MM strings interpreted
+   *  in `tz`. When `start > end` the window wraps midnight. Undefined =
+   *  no quiet hours. Invalid HH:MM / unknown tz falls back to undefined
+   *  via the parser in `src/quiet_hours.ts`. */
+  quietHours?: { start: string; end: string; tz: string };
+  /** Per-project quiet-hours override (ticket 0030). The literal `false`
+   *  means "always page for this project, never quiet" — useful for the
+   *  rare project that warrants 24/7 paging. An object overrides the
+   *  fleet default's window/tz for that slug. */
+  quietHoursOverride?: Record<string, false | { start: string; end: string; tz: string }>;
+  /** Worth-it verdict knobs (ticket 0048). A nested object — same
+   *  shape the in-process reader expects. The two keys (hourly rate
+   *  in USD + hours per merged PR) drive the per-project
+   *  worth-it-verdict's "human equivalent cost" calculation. Both are
+   *  optional with documented defaults (`75` and `1`) baked into the
+   *  helper; the operator overrides via `fleet-control.config.json`.
+   *  Per LESSONS 2026-05-25 "store cascading config values shaped to
+   *  the reader" - any future portal-side setter MUST write in this
+   *  same nested-object shape. */
+  worth_it?: {
+    hourly_rate_usd?: number;
+    hours_per_pr?: number;
+  };
+  /** Embed-origin allowlist for the /embed/pulse.html iframe widget
+   *  (ticket 0060). When omitted (or empty) the embed page's
+   *  X-Frame-Options + Content-Security-Policy frame-ancestors are
+   *  SAMEORIGIN / 'self' — the widget renders ONLY on the operator's
+   *  own host. When the operator lists explicit origins (e.g.
+   *  ["https://operator.dev", "https://github.com"]) both headers
+   *  widen to include them so the embed can render on those surfaces.
+   *  The list is value-filtered downstream; passing junk leaves the
+   *  default-safe headers in place. */
+  embedOrigins?: string[];
 }
 
 const DEFAULTS: FleetConfig = {

@@ -19,11 +19,56 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
+| 0064 | Embed rate-limit + abuse guard - per-IP token bucket on the public /embed/* and /og/* routes so a popular blog paste does not starve the operator's own loopback portal | P2 | groomed | infra |
+| 0063 | Embeddable lesson-of-the-day widget - paste-one-line snippet that rotates a cross-fleet operational lesson into any blog or README so every reader sees a real fleet insight | P2 | groomed | portal |
+| 0062 | Monthly fleet retro card - one home-page card on the first weekday of each month surfaces month-over-month deltas so the operator gets a reflection ritual they would not skip | P1 | shipped | observability |
+| 0061 | Open-graph image renderer for /pulse /receipts /calculator - every paste on LinkedIn / Twitter / Bluesky becomes a live rendered card so the share itself is the impression | P1 | shipped | portal |
+| 0058 | Public failure-mode landing pages - anonymised /failures/<signature> SEO surface authored from real cross-project correlations the fleet caught | P1 | shipped | portal |
+| 0059 | Biggest surprise this week - one Tuesday-morning card surfaces the single thing the operator would have missed so the daily glance becomes a habit ritual | P1 | shipped | observability |
+| 0060 | Embeddable HTML pulse widget - paste-one-line snippet that drops a live fleet pulse into any personal blog or README so every reader becomes a fleet-control prospect | P2 | shipped | portal |
+| 0054 | Public weekly fleet pulse - stable /pulse URL renders the most-recent week so the prospect's bookmark stays warm | P1 | shipped | portal |
+| 0055 | Lesson of the day - one cross-fleet lesson rotates onto the home card each morning so the operator gets a daily intellectual reward | P1 | shipped | portal |
+| 0056 | Time saved this month - each project card surfaces ~Nh saved from cross-fleet lessons so the moat becomes visible on the home grid | P1 | shipped | observability |
+| 0053 | Project graveyard - paused / sunset projects get a memorial page tallying lifetime ROI and what they taught the fleet | P1 | shipped | portal |
+| 0057 | Public lesson archive - anonymised /lessons-public surface where a stranger Googling a node:sqlite error lands and downloads fleet-control | P2 | shipped | portal |
+| 0052 | Lesson-pays-for-itself ledger - each cross-fleet lesson grows a $$ saved tally from the heal-credit attributions | P1 | shipped | observability |
+| 0051 | Pre-install ROI calculator - public /calculator page projects fleet-control's value before any install | P1 | shipped | portal |
+| 0050 | Fleet year-in-review - one shareable annual page only the local SQLite can author | P1 | shipped | portal |
+| 0049 | Ingest closed (non-merged) PRs into the pr table so the autopsy card lights up in production | P1 | shipped | ingest |
+| 0048 | Per-project worth-it verdict - each project card emits a yearly-trajectory "keep, watch, or sunset" call | P2 | shipped | observability |
+| 0047 | PR autopsy card - surface why each non-merged PR died and which signal would have predicted it | P2 | shipped | observability |
+| 0046 | fleetctl onboard wizard - one command from zero-state to first ingested project in under three minutes | P1 | shipped | infra |
+| 0045 | Stuck-PR taxonomy card - label every open agent PR so the operator knows whether to intervene or wait | P1 | shipped | observability |
+| 0044 | Spend-efficiency ranking - rank projects by $/merged-PR and diagnose the laggard | P2 | shipped | observability |
+| 0043 | New-since-last-visit diff - mark every home-page item the operator has not yet seen | P1 | shipped | portal |
+| 0042 | Lesson credit ledger - attribute heal saves to the cross-fleet lesson that caught them | P2 | shipped | observability |
+| 0041 | Fleet receipts - public monthly artifact at a stable URL the prospective operator sees first | P1 | shipped | portal |
+| 0040 | Riskiest open PR badge - one home-page line names the PR most likely to hurt the operator next | P1 | shipped | observability |
+| 0039 | Fleet changelog - one chronological page of every merged PR across every project, ticket-linked | P1 | shipped | portal |
+| 0038 | Monday morning catch-up - bridges the weekend gap between Friday wrap and Yesterday glance | P1 | shipped | portal |
+| 0037 | Friday wrap - one weekly card recaps the fleet's week so the operator closes the laptop on a high | P2 | shipped | portal |
+| 0036 | Cross-fleet lessons portal view - the file the operator never sees becomes a daily surface | P1 | shipped | portal |
+| 0035 | Cost per merged PR - the single number that frames spend in value terms | P1 | shipped | observability |
+| 0032 | Welcome banner prints LAN URL + ASCII-QR so the phone is paired in 60 seconds | P1 | shipped | infra |
+| 0033 | Yesterday at a glance - single morning card recaps shipped, spent, broken | P1 | shipped | portal |
+| 0034 | Self-baseline drift detector - flag when a project diverges from its OWN 14-day shape | P2 | shipped | observability |
+| 0029 | PWA installable portal with offline shell and stale-snapshot banner | P1 | shipped | portal |
+| 0030 | Quiet hours - sleep-window suppress non-critical pushes and demote inbox kinds | P1 | shipped | control |
+| 0031 | Per-project tool-mix sparkline - where this project's tokens actually went | P2 | shipped | observability |
+| 0025 | fleetctl demo - one-command sandbox boots portal against seeded fixture fleet | P1 | shipped | infra |
+| 0026 | Merge streak counter and 90-day calendar heatmap on portal home | P1 | shipped | portal |
+| 0027 | Cross-project failure correlation - same error in N projects fires a fleet alert | P1 | shipped | observability |
+| 0028 | Project card shows month-to-date budget burndown with projection line | P2 | shipped | observability |
+| 0020 | keep-running and eng-toggle clobber installed manifest when working tree is stale | P1 | shipped | control |
+| 0021 | Soft daily budget with autopause when a project blows the cap | P1 | shipped | control |
+| 0017 | Today's inbox — cross-project "what needs me" view | P1 | shipped | portal |
+| 0022 | Fleet temperature — single per-project health score on the home page | P1 | shipped | observability |
+| 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | shipped | ingest |
+| 0023 | PR card shows heal-attempts and first-fail reason inline | P2 | shipped | portal |
+| 0024 | First-run welcome — printed checklist after fleetctl serve cold start | P2 | shipped | infra |
 | 0014 | Cross-project tool-call leaderboard | P1 | shipped | observability |
 | 0015 | Embeddable status badge SVG per project | P1 | shipped | portal |
 | 0016 | fleetctl doctor — one-shot install + ingest diagnostic | P2 | shipped | infra |
-| 0017 | Today's inbox — cross-project "what needs me" view | P2 | groomed | portal |
-| 0018 | Backlog-ticket → merged-commit auto-link via git log | P2 | proposed | ingest |
 | 0001 | Ingest events.jsonl from each project | P0 | shipped | ingest |
 | 0002 | SSE live tool-call stream from active transcripts | P0 | shipped | portal |
 | 0003 | Per-user scoped tokens with audit log | P1 | shipped | control |

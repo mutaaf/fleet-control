@@ -16,6 +16,19 @@
      re-tune card density / tap-target floor without renaming anything. */
   --card-pad-mobile: 12px 14px;
   --tap-min: 44px;
+  /* Ticket 0031: per-project tool-mix sparkline palette. Additive — no
+     rename / repurpose of an existing variable. Hues line up loosely
+     with the leaderboard heatmap so the operator's mental model
+     ("Bash = amber, Edit = green, Read = blue") survives between
+     surfaces. `--tool-other` is a neutral grey for the collapsed tail. */
+  --tool-bash:     #D98A2B;
+  --tool-edit:     #5B8C5A;
+  --tool-read:     #5C8EC7;
+  --tool-glob:     #8A6BB0;
+  --tool-grep:     #4FA09B;
+  --tool-write:    #C8841E;
+  --tool-webfetch: #C25E9C;
+  --tool-other:    #5c5d56;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans);
@@ -83,6 +96,22 @@ a.card:hover { border-color: #3a3b34; background: var(--panel2); }
 .anomaly-pill.fresh { color: var(--bad); border-color: rgba(210,106,94,.55); background: rgba(181,72,60,.14); }
 .anomaly-pill.stale { color: var(--warn); border-color: rgba(217,138,43,.45); background: rgba(217,138,43,.08); }
 .anomaly-badge { margin-top: 14px; }
+
+/* Ticket 0021: soft daily-budget autopause pill. Same shape as
+   .anomaly-pill — sits inside .state and reads as "this project is
+   paused because today's spend hit the cap". Amber palette tied to the
+   existing --warn token so the badge SVG and the SPA pill match. The
+   inline Resume button keeps the operator one tap away from restarting
+   the ship plist. */
+.paused-pill.cost { font-family: var(--mono); font-size: 11px; padding: 1px 8px;
+  border-radius: 20px; border: 1px solid rgba(217,138,43,.55);
+  color: var(--warn); background: rgba(217,138,43,.10);
+  display: inline-flex; align-items: center; gap: 6px; }
+.paused-pill.cost .resume-paused { font-size: 11px; padding: 2px 8px;
+  border-radius: 12px; border: 1px solid rgba(217,138,43,.55);
+  color: var(--warn); background: rgba(217,138,43,.20); cursor: pointer; }
+.paused-pill.cost .resume-paused:hover { filter: brightness(1.15); }
+.btn.xs { font-size: 11px; padding: 2px 8px; line-height: 1.2; }
 
 /* job detail (now/last/next) */
 .jobcard { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; }
@@ -249,6 +278,141 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
   font-family: var(--mono); white-space: nowrap; overflow-x: auto; }
 .embed-row .embed-snippet:focus { outline: none; border-color: var(--accent); }
 
+/* Today's inbox (ticket 0017). One actionable row per "what needs
+   me" item — sits above the project grid on the home view. Same
+   dark-panel chrome as the digest banner, but rendered as a list
+   (not a banner) so each row has its own action surface. The
+   inbox-empty case is a single line so the zero-state stays
+   visually quiet. */
+.inbox-list { display: flex; flex-direction: column; gap: 8px;
+  margin: 0 0 12px; }
+.inbox-row { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 10px 14px;
+  display: grid; grid-template-columns: 1fr auto; gap: 6px 14px;
+  align-items: center; }
+.inbox-row .inbox-meta { font-family: var(--mono); font-size: 11.5px;
+  color: var(--dim); grid-column: 1 / -1; }
+.inbox-row .inbox-meta .inbox-kind { color: var(--accent); font-weight: 600; }
+.inbox-row .inbox-title { color: var(--ink); font-size: 14px;
+  grid-column: 1; min-width: 0; overflow-wrap: anywhere; }
+.inbox-row .inbox-actions { display: flex; align-items: center; gap: 6px;
+  grid-column: 2; }
+.inbox-empty { font-family: var(--mono); font-size: 13px; color: var(--dim);
+  padding: 10px 0 16px; }
+.inbox-badge { color: var(--accent); border: 1px solid rgba(200,132,30,.4);
+  border-radius: 20px; padding: 1px 9px; }
+.inbox-badge:hover { text-decoration: underline; }
+
+/* Ticket 0030: quiet-hours divider sits between items and quietedItems.
+   The moon glyph + dim "Queued during quiet hours" copy give the
+   operator a clear visual break without a heavy separator. Inherits
+   the same dark-panel palette as the rest of the inbox. */
+.inbox-quiet-divider { font-family: var(--mono); font-size: 11.5px;
+  color: var(--dim); display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; margin: 4px 0;
+  border-top: 1px dashed var(--line); }
+.inbox-quiet-divider .moon { font-size: 13px; }
+.inbox-row.inbox-row-quieted { opacity: 0.85; }
+.inbox-row .moon { font-size: 12px; margin-right: 4px; }
+
+/* Ticket 0027: fleet_correlation inbox row + detail view. Project
+   chips render inline under the title (one per affected slug); the
+   detail view stacks each project's failure excerpt side-by-side. */
+.inbox-row .inbox-chips { grid-column: 1 / -1;
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 2px; }
+.inbox-row .inbox-chips .chip { font-family: var(--mono); font-size: 11.5px;
+  color: var(--ink); background: rgba(255,255,255,0.04);
+  border: 1px solid var(--line); border-radius: 12px;
+  padding: 1px 9px; text-decoration: none; }
+.inbox-row .inbox-chips .chip:hover { border-color: var(--accent); color: var(--accent); }
+.correlation-head { display: flex; flex-direction: column; gap: 4px;
+  margin-bottom: 12px; }
+.correlation-sig { font-family: var(--mono); font-size: 18px;
+  color: var(--accent); font-weight: 600; }
+.correlation-grid { display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.correlation-col { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.correlation-col .correlation-slug { font-family: var(--mono); font-size: 13px;
+  color: var(--ink); font-weight: 600; }
+.correlation-col .correlation-excerpt { font-family: var(--mono); font-size: 11.5px;
+  color: var(--dim); margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 240px; overflow-y: auto; }
+
+/* Ticket 0022: per-project "fleet temperature" health dot + tooltip.
+   One coloured dot prefix on each project card's head; reuses the
+   existing palette tokens (--good / --warn / --bad / --paused) so a
+   future palette tweak ripples through. Tap-toggles a tooltip that
+   renders the four sub-score formulas from the API response. */
+.health-dot { width: 10px; height: 10px; border-radius: 50%;
+  padding: 0; border: 0; cursor: pointer; flex-shrink: 0;
+  margin-right: 8px; display: inline-block;
+  /* Reset the <button> default chrome so the dot reads as part of the
+     card head, not a clickable widget with its own background. */
+  -webkit-appearance: none; appearance: none;
+  background: var(--paused); transition: filter .12s, transform .12s; }
+.health-dot:hover { filter: brightness(1.25); }
+.health-dot:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.health-dot.band-green { background: var(--good); }
+.health-dot.band-amber { background: var(--warn); }
+.health-dot.band-red   { background: var(--bad); }
+.health-dot.band-grey  { background: var(--paused); }
+.health-tooltip { position: absolute; z-index: 30; margin-top: 8px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 10px 12px;
+  font-family: var(--mono); font-size: 12px; color: var(--ink);
+  max-width: 320px; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+.health-tooltip .health-head { color: var(--ink); margin-bottom: 6px;
+  border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+.health-tooltip .health-row { display: flex; align-items: baseline;
+  gap: 8px; padding: 3px 0; }
+.health-tooltip .health-row-score { color: var(--accent); font-weight: 600;
+  min-width: 32px; text-align: right; }
+.health-tooltip .health-row-label { font-size: 11.5px; flex: 1; }
+.health-tooltip .health-foot { margin-top: 6px; padding-top: 6px;
+  border-top: 1px solid var(--line); font-size: 11px; }
+
+/* Ticket 0026: merge streak counter + 90-day calendar heatmap. Sits
+   ABOVE the inbox on home. The streak line is one bold integer + a
+   "last red day" trailing note. The heatmap is a 13-week × 7-day
+   grid (91 cells: 90 data + 1 trailing placeholder so the visual
+   stays square). Cells reuse the existing palette: --good tints
+   for the merge bands, --bad for the red streak-breaker, --faint
+   for empty. Cell size is 12px on desktop / 14px on mobile (touch
+   target floor) — the whole grid is < 200px wide so a 375px
+   viewport never overflows. */
+.streak-banner { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 12px 14px; margin: 0 0 12px; }
+.streak-row { font-size: 14px; color: var(--ink); margin: 2px 0 10px;
+  font-family: var(--mono); }
+.streak-line .streak-days { color: var(--good); font-size: 18px;
+  font-weight: 700; font-variant-numeric: tabular-nums; }
+.heatmap { display: grid; grid-template-columns: repeat(13, 12px);
+  grid-template-rows: repeat(7, 12px); grid-auto-flow: column;
+  gap: 3px; margin: 8px 0 4px;
+  /* Keep the grid inside the panel without forcing a horizontal scroll
+     even on the narrowest phone — the 13×12 + 12×3 = 192px footprint
+     fits well inside a 375px viewport with the 14px padding above. */ }
+.heatmap-cell { width: 12px; height: 12px; padding: 0; border: 0;
+  border-radius: 2px; background: var(--panel2); cursor: pointer;
+  /* `appearance: none` strips Safari/Firefox's <button> default
+     chrome so the grid reads as a flat heatmap. */
+  -webkit-appearance: none; appearance: none; transition: filter .12s; }
+.heatmap-cell:hover { filter: brightness(1.4); }
+.heatmap-cell:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.heatmap-cell.band-empty { background: var(--panel2); }
+.heatmap-cell.band-low { background: rgba(91,140,90,.35); }
+.heatmap-cell.band-med { background: rgba(91,140,90,.65); }
+.heatmap-cell.band-high { background: var(--good); }
+.heatmap-cell.band-red { background: var(--bad); }
+.heatmap-cell.band-placeholder { background: transparent; cursor: default; }
+.heatmap-tooltip { font-family: var(--mono); font-size: 11.5px;
+  color: var(--ink); background: #1c1d19; border: 1px solid var(--line);
+  border-radius: var(--r); padding: 4px 8px; margin-top: 6px;
+  display: inline-block; }
+
 /* Mobile-first portal pass (ticket 0011).
    Single phone breakpoint at 640px — covers iPhone 13 mini (375), iPhone
    14 Plus (414), and small Android handsets. The pass is layout-only:
@@ -288,4 +452,1815 @@ table.leaderboard.heatmap td.heat-cell:last-child { border-right: 0; }
      snippet doesn't crowd a phone-sized viewport. */
   .embed-row .embed-label { flex: 1 1 100%; }
   .embed-row .embed-snippet { flex: 1 1 100%; min-width: 0; }
+  /* Ticket 0017: inbox rows stack single-column on phones. The grid
+     collapses to one auto column so the title and actions sit on
+     their own lines — keeps a 44px tap target while every row stays
+     readable at 375px without horizontal scroll. */
+  .inbox-row { grid-template-columns: 1fr; }
+  .inbox-row .inbox-actions { grid-column: 1; }
+  /* Ticket 0030: the quiet-hours divider stays a single text row at
+     375px (no min-width that would force horizontal scroll). */
+  .inbox-quiet-divider { padding: 8px 12px; flex-wrap: wrap; }
+  /* Ticket 0026: heatmap cells lift to 14px on phones for a sturdier
+     tap target. 13 × 14 + 12 × 3 = 218px — still well under 375px. */
+  .heatmap { grid-template-columns: repeat(13, 14px);
+    grid-template-rows: repeat(7, 14px); }
+  .heatmap-cell { width: 14px; height: 14px; }
 }
+
+/* Ticket 0028: month-to-date budget burndown sparkline on each
+   project card. Desktop is 60x32 px; phones (<600px viewport)
+   shrink to 40x24 per the AC. The wrapper is inline-flex so the
+   "$X of $Y cap MTD" label sits to the right of the SVG without
+   forcing a line break on desktop; on phones the label drops to
+   its own line below the SVG. */
+.burndown { display: inline-flex; align-items: center; gap: 8px;
+  margin-top: 6px; font-family: var(--mono); font-size: 11px; }
+svg.burndown { width: 60px; height: 32px; flex: 0 0 60px; display: block; }
+.burndown-cap { stroke: var(--faint); stroke-width: 1; fill: none; }
+.burndown-projected { stroke: var(--dim); stroke-width: 1; fill: none; }
+.burndown-dot.band-green { fill: var(--good); }
+.burndown-dot.band-amber { fill: var(--warn); }
+.burndown-dot.band-red   { fill: var(--bad); }
+.burndown-label { white-space: nowrap; }
+.burndown-empty { margin-top: 6px; font-family: var(--mono);
+  font-size: 11px; }
+
+@media (max-width: 600px) {
+  svg.burndown { width: 40px; height: 24px; flex: 0 0 40px; }
+  .burndown { gap: 6px; font-size: 10.5px; }
+  /* Ticket 0023: under 600px the PR-card head wraps so the heal chip
+     and the existing #N · checks span fall below the title rather
+     than truncate. Same intent as the inbox-row stack-on-phone rule
+     (ticket 0017). The "first failed:" link gets its own line via
+     the .pr-firstfail-row container the SPA emits; we just ensure
+     flex-wrap is on so a long check name doesn't push it off-screen. */
+  .pr-card .pr-head { flex-wrap: wrap; }
+  .pr-card .pr-head .state { display: block; margin-top: 4px; }
+  .pr-firstfail-row { flex-wrap: wrap; }
+  .heal-chip { white-space: nowrap; }
+}
+
+/* Ticket 0023: heal-attempts chip + "first failed: <name>" link on
+   the PR card head. The chip sits inline beside the existing
+   "✗ checks failing" string; the first-fail link drops on its own row
+   beneath the head so a long check name doesn't squeeze the title.
+   Colours: neutral (faint) under the cap, amber at or over the
+   AGENTS.md cap so the operator's eye lands on PRs that are one
+   failure away from escalation. Same chip vocabulary as the existing
+   .anomaly-pill / .paused-pill on the home page so the SPA stays
+   visually cohesive. */
+.heal-chip { display: inline-block; font-family: var(--mono);
+  font-size: 11px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--faint);
+  background: rgba(255,255,255,.02); margin-left: 6px;
+  vertical-align: middle; }
+.heal-chip.amber { color: var(--warn);
+  border-color: rgba(217,138,43,.45); background: rgba(217,138,43,.08); }
+
+.pr-firstfail-row { display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 6px; font-family: var(--mono); font-size: 11.5px; }
+.pr-first-fail { color: var(--accent); text-decoration: none;
+  border-bottom: 1px dotted var(--accent); }
+.pr-first-fail:hover { color: var(--accent); filter: brightness(1.15); }
+.pr-first-fail.dim { color: var(--dim); border-bottom-color: var(--dim); }
+
+/* Ticket 0031: per-project tool-mix sparkline. A 280x36 inline SVG with
+   one <rect> per segment + a wrapping legend underneath. Sits inside a
+   .jobcard above the existing job cards on the project page. Mobile
+   media query below shrinks to 200x28 ≤ 600px and the legend wraps to
+   two lines without horizontal scroll at 375px. Additive — no existing
+   selector is renamed or repurposed. */
+.project-tool-mix { position: relative; display: block;
+  font-family: var(--mono); font-size: 11.5px; }
+svg.tool-mix-bar { display: block; width: 280px; height: 36px;
+  border-radius: var(--r); overflow: hidden;
+  background: var(--panel2); }
+.tool-mix-segment { stroke: var(--bg); stroke-width: 1; cursor: pointer; }
+.tool-mix-segment:hover { filter: brightness(1.15); }
+.tool-mix-segment.seg-bash     { fill: var(--tool-bash); }
+.tool-mix-segment.seg-edit     { fill: var(--tool-edit); }
+.tool-mix-segment.seg-read     { fill: var(--tool-read); }
+.tool-mix-segment.seg-glob     { fill: var(--tool-glob); }
+.tool-mix-segment.seg-grep     { fill: var(--tool-grep); }
+.tool-mix-segment.seg-write    { fill: var(--tool-write); }
+.tool-mix-segment.seg-webfetch { fill: var(--tool-webfetch); }
+.tool-mix-segment.seg-other    { fill: var(--tool-other); }
+.tool-mix-legend { display: flex; flex-wrap: wrap; gap: 6px 14px;
+  margin-top: 8px; color: var(--dim); }
+.tool-mix-chip { display: inline-flex; align-items: center; gap: 5px;
+  white-space: nowrap; }
+.tool-mix-swatch { display: inline-block; width: 9px; height: 9px;
+  border-radius: 2px; background: var(--tool-other); }
+.tool-mix-swatch.swatch-bash     { background: var(--tool-bash); }
+.tool-mix-swatch.swatch-edit     { background: var(--tool-edit); }
+.tool-mix-swatch.swatch-read     { background: var(--tool-read); }
+.tool-mix-swatch.swatch-glob     { background: var(--tool-glob); }
+.tool-mix-swatch.swatch-grep     { background: var(--tool-grep); }
+.tool-mix-swatch.swatch-write    { background: var(--tool-write); }
+.tool-mix-swatch.swatch-webfetch { background: var(--tool-webfetch); }
+.tool-mix-swatch.swatch-other    { background: var(--tool-other); }
+.tool-mix-tooltip { margin-top: 8px; color: var(--ink); font-size: 11.5px;
+  min-height: 1.2em; }
+.tool-mix-empty { font-style: normal; }
+
+@media (max-width: 600px) {
+  svg.tool-mix-bar { width: 200px; height: 28px; }
+  .project-tool-mix { font-size: 11px; }
+  .tool-mix-legend { gap: 4px 10px; }
+}
+
+/* Ticket 0033: "Yesterday at a glance" morning card.
+ * Mobile-first: stats wrap 2x2 on phones (375px viewport),
+ * single row at >=600px (the 0011 mobile breakpoint convention).
+ * Reuses existing palette tokens (--panel / --line / --dim /
+ * --accent / --warn / --bad) — no new variables. */
+.yesterday-glance {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, background .15s;
+}
+.yesterday-glance:hover { border-color: #3a3b34; background: var(--panel2); }
+.glance-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.glance-tap-hint {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: none;
+}
+.glance-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.glance-stat { color: var(--dim); white-space: nowrap; }
+.glance-stat b { color: var(--ink); font-weight: 600; }
+.glance-verdict {
+  font-size: 13.5px;
+  color: var(--ink);
+  line-height: 1.4;
+}
+.glance-verdict-band_shift_red { color: var(--bad); }
+.glance-verdict-band_shift_amber { color: var(--warn); }
+.glance-verdict-budget_threshold { color: var(--warn); }
+.glance-verdict-fleet_correlation { color: var(--bad); }
+.glance-verdict-first_ship { color: var(--good); }
+.glance-verdict-all_quiet { color: var(--dim); }
+
+/* Skeleton state: 4 bars stacked 2x2 + a verdict bar.
+ * The pulsing animation gives the operator a "data is on its way"
+ * cue; CSS-only, no JS. */
+.yesterday-glance-skeleton .glance-stat,
+.yesterday-glance-skeleton .glance-verdict {
+  display: block;
+  background: var(--panel2);
+  border-radius: 2px;
+  height: 14px;
+  min-width: 80px;
+  animation: glance-skeleton-pulse 1.4s ease-in-out infinite;
+}
+.yesterday-glance-skeleton .glance-verdict { height: 16px; min-width: 60%; }
+.skeleton-bar { /* alias for the bar class used in renderGlanceSkeleton */ }
+@keyframes glance-skeleton-pulse {
+  0%, 100% { opacity: .55; }
+  50% { opacity: .9; }
+}
+
+/* Reduced-motion accessibility: flat grey, no pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .yesterday-glance-skeleton .glance-stat,
+  .yesterday-glance-skeleton .glance-verdict {
+    animation: none;
+    background: var(--panel2);
+    opacity: .7;
+  }
+}
+
+/* Phone-first → desktop upgrade. At >=600px the four stats live on a
+ * single row per the AC (0011 convention). */
+@media (min-width: 600px) {
+  .yesterday-glance .glance-stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+/* Ticket 0037: Friday wrap weekly card.
+ * Mobile-first: stats wrap 2x2 on phones (matches the 0033 morning
+ * card layout for visual consistency), single row at >=600px.
+ * Reuses existing palette tokens — no new CSS variables. The wrap
+ * uses a slightly bolder left border than the daily glance card so
+ * the two cards read as a pair when both are visible on Fridays. */
+.friday-wrap {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, background .15s;
+}
+.friday-wrap:hover { border-color: #3a3b34; background: var(--panel2); }
+.wrap-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.wrap-tap-hint {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: none;
+}
+.wrap-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.wrap-stat { color: var(--dim); white-space: nowrap; }
+.wrap-stat b { color: var(--ink); font-weight: 600; }
+.wrap-win, .wrap-watch {
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.4;
+  margin-top: 4px;
+}
+.wrap-win b { font-weight: 600; }
+.wrap-watch-drift { color: var(--bad); }
+.wrap-watch-correlation { color: var(--bad); }
+.wrap-watch-cost_trend { color: var(--warn); }
+.wrap-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+
+@media (min-width: 600px) {
+  .friday-wrap .wrap-stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+/* Ticket 0038: Monday morning catch-up card. Sits at the absolute
+ * top of the home page on Mondays only (the renderer returns "" on
+ * other days so no DOM element is emitted). Reuses the same 2x2
+ * mobile / 4-column desktop grid the 0033 yesterday-glance and 0037
+ * friday-wrap cards use so the three cards read as a triad.
+ *
+ * Border colour: a slightly different stripe from the friday-wrap
+ * (warn amber) so when both happen to render the operator's eye
+ * separates "weekend recap" from "weekly recap" — we use the
+ * neutral --accent for "you're back". Reuses existing palette
+ * tokens — no new CSS variables. */
+.monday-catchup {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, background .15s;
+}
+.monday-catchup:hover { border-color: #3a3b34; background: var(--panel2); }
+.catchup-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.catchup-window {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .04em;
+  text-transform: none;
+}
+.catchup-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.catchup-stat { color: var(--dim); white-space: nowrap; }
+.catchup-stat b { color: var(--ink); font-weight: 600; }
+.catchup-ship, .catchup-needs {
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.4;
+  margin-top: 4px;
+}
+.catchup-ship b { font-weight: 600; }
+.catchup-needs-pr_review { color: var(--ink); }
+.catchup-needs-self_drift { color: var(--bad); }
+.catchup-needs-self_cancel_warn { color: var(--warn); }
+.catchup-needs-hung_run { color: var(--warn); }
+.catchup-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+
+@media (min-width: 600px) {
+  .monday-catchup .catchup-stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+/* Ticket 0043: New-since-last-visit banner + pip. Renders at the
+ * absolute top of the home page when the operator has unseen items
+ * since their last visit. Reuses the existing palette tokens — no
+ * new variables. The pip is a tiny coloured dot that fades out
+ * (via the .new-pip-seen modifier) once the IntersectionObserver
+ * has confirmed the item entered the viewport for the dwell
+ * threshold. The .quiet-hours-mode variant mutes the banner to
+ * neutral colours so the pull surface still renders during the
+ * 0030 sleep window without competing for attention. */
+.new-since-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink);
+}
+.new-since-banner .new-since-label { color: var(--dim); }
+.new-since-banner .new-since-label b { color: var(--ink); font-weight: 600; }
+.new-since-banner .new-since-toggle {
+  white-space: nowrap;
+}
+.new-since-banner.quiet-hours-mode {
+  border-left-color: var(--faint);
+  color: var(--dim);
+  background: var(--panel2);
+}
+
+.new-pip {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 6px;
+  vertical-align: middle;
+  transition: opacity .6s ease;
+}
+.new-pip.new-pip-seen {
+  opacity: 0;
+}
+.new-since-banner.quiet-hours-mode + * .new-pip,
+.new-since-banner.quiet-hours-mode ~ * .new-pip {
+  background: transparent;
+  border: 1px solid var(--faint);
+}
+
+@media (max-width: 480px) {
+  .new-since-banner {
+    padding: 8px 12px;
+    font-size: 12.5px;
+  }
+  .new-since-banner .new-since-label b { font-size: 13px; }
+  .new-pip {
+    width: 6px;
+    height: 6px;
+    margin-left: 4px;
+  }
+}
+
+/* Ticket 0040: Riskiest open PR badge. One inline line above the
+ * project grid. Two-line layout on phones (label on top, "tend it
+ * now" link below); collapses to a single row with the link right-
+ * aligned at >=600px. Reuses the existing palette tokens — no new
+ * variables. The fail-kind colour cue rides on a modifier class
+ * (default = warn amber for a working triage signal; healthy = good
+ * green; the renderer reads fail_kind and could add e.g. `riskiest-
+ * pr-red` for red_test in a future tweak — base rule keeps the
+ * surface readable either way). */
+.riskiest-pr {
+  display: flex;
+  flex-direction: column;
+  gap: 4px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r);
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  text-decoration: none;
+  color: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  transition: border-color .15s, background .15s;
+}
+.riskiest-pr:hover { border-color: #3a3b34; background: var(--panel2); }
+.riskiest-pr-healthy { border-left-color: var(--good); }
+.riskiest-pr-eyebrow {
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+.riskiest-pr-label { color: var(--ink); line-height: 1.45; }
+.riskiest-pr-label b { color: var(--ink); font-weight: 600; }
+.riskiest-pr-title { margin-left: 4px; }
+.riskiest-pr-meta { color: var(--dim); margin-left: 4px; }
+.riskiest-pr-link {
+  color: var(--accent);
+  font-size: 12.5px;
+  align-self: flex-end;
+  white-space: nowrap;
+}
+
+@media (min-width: 600px) {
+  .riskiest-pr {
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .riskiest-pr-link { align-self: auto; }
+}
+
+/* Ticket 0040: PR-card highlight flash. When the project page is
+ * deep-linked with `?pr=<n>` (from the riskiest-PR badge), the
+ * matching card briefly glows so the operator's eye lands on it.
+ * 2-second fade — pure CSS, no JS animation library. Reuses --warn
+ * for the highlight ring to match the badge's left-border colour. */
+.pr-card-flash {
+  animation: pr-card-flash 2s ease-out 1;
+}
+@keyframes pr-card-flash {
+  0%   { box-shadow: 0 0 0 2px rgba(217, 138, 43, .55); border-color: rgba(217, 138, 43, .65); }
+  100% { box-shadow: 0 0 0 0 rgba(217, 138, 43, 0);    border-color: var(--line); }
+}
+
+/* Ticket 0044: project page focus-section flash. When the project page
+ * is deep-linked with `?focus=<signal>` from the spend-efficiency
+ * laggard verdict, the matching .eyebrow section header briefly glows
+ * so the operator's eye lands on the right region. Reuses the 0040
+ * pr-card-flash animation timing + --warn highlight ring (per the
+ * engineering note: "reuse the existing pr-card-flash CSS variable"). */
+.focus-flash {
+  animation: focus-flash 2s ease-out 1;
+  border-radius: var(--r);
+}
+@keyframes focus-flash {
+  0%   { box-shadow: 0 0 0 3px rgba(217, 138, 43, .55); background: rgba(217, 138, 43, .12); }
+  100% { box-shadow: 0 0 0 0 rgba(217, 138, 43, 0);    background: transparent; }
+}
+
+/* Ticket 0044: spend-efficiency ranking card. Stacked single-column at
+ * 375px (phones); inline laggard + leaderboard at >=600px. The card
+ * is a pull surface — info-dense; no hover affordances. Reuses the
+ * generic card surface for consistency with 0033/0035/0040. */
+.spend-efficiency-card {
+  margin: 14px 0;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.spend-efficiency-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.spend-efficiency-title { font-size: 14px; }
+.spend-efficiency-summary { font-size: 12.5px; font-family: var(--mono); }
+.spend-efficiency-laggard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: rgba(217, 138, 43, .08);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r);
+}
+.spend-efficiency-laggard-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+.spend-efficiency-laggard-label {
+  color: var(--warn);
+  font-weight: 600;
+  font-size: 12.5px;
+}
+.spend-efficiency-laggard-stat { font-size: 12.5px; }
+.spend-efficiency-why { font-size: 12px; }
+.spend-efficiency-look-here {
+  font-size: 12.5px;
+  align-self: flex-start;
+}
+.spend-efficiency-leaderboard {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.spend-efficiency-leaderboard td {
+  padding: 4px 6px;
+  border-top: 1px solid var(--line);
+}
+.spend-efficiency-leaderboard tr:first-child td { border-top: none; }
+.spend-efficiency-marker {
+  color: var(--warn);
+  font-size: 11.5px;
+  margin-left: 6px;
+}
+@media (min-width: 600px) {
+  .spend-efficiency-card { padding: 16px 18px; }
+  .spend-efficiency-head {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .spend-efficiency-leaderboard td { padding: 5px 10px; }
+}
+
+/* Ticket 0045: stuck-PR taxonomy card. One row per open agent PR
+ * ordered by urgency rank; the bucket-label chip is colour-coded so
+ * the operator's eye snaps to needs_human / ci_red rows first. Phone
+ * layout (default <600px): rows stack vertically (bucket -> slug ->
+ * evidence -> action), merging + healthy_waiting rows are hidden
+ * behind a "+N healthy or merging" toggle button. Desktop (>=600px):
+ * each row renders inline. Reuses --bad / --warn / --good / --dim
+ * palette tokens — no new variables. */
+.stuck-pr-taxonomy-card {
+  margin: 14px 0;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.stuck-pr-head { display: flex; justify-content: space-between; align-items: baseline; }
+.stuck-pr-title-head { font-size: 14px; }
+.stuck-pr-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel2, transparent);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.stuck-pr-row-needs_human { border-left-color: var(--bad); }
+.stuck-pr-row-ci_red,
+.stuck-pr-row-ci_absent,
+.stuck-pr-row-account_suspended { border-left-color: var(--warn); }
+.stuck-pr-row-infra_flake { border-left-color: var(--accent); }
+.stuck-pr-row-merging { border-left-color: var(--good); }
+.stuck-pr-row-healthy_waiting { border-left-color: var(--dim); }
+.stuck-pr-bucket {
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.stuck-pr-bucket-needs_human { color: var(--bad); }
+.stuck-pr-bucket-ci_red,
+.stuck-pr-bucket-ci_absent,
+.stuck-pr-bucket-account_suspended { color: var(--warn); }
+.stuck-pr-bucket-infra_flake { color: var(--accent); }
+.stuck-pr-bucket-merging { color: var(--good); }
+.stuck-pr-bucket-healthy_waiting { color: var(--dim); }
+.stuck-pr-slug b { color: var(--ink); font-weight: 600; }
+.stuck-pr-title { margin-left: 4px; font-size: 12px; }
+.stuck-pr-evidence { font-size: 12px; }
+.stuck-pr-action {
+  color: var(--accent);
+  font-size: 12.5px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.stuck-pr-action:hover { text-decoration: underline; }
+.stuck-pr-mobile-toggle {
+  display: none;
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: var(--r);
+  cursor: pointer;
+  align-self: flex-start;
+}
+/* Phone: hide the merging + healthy_waiting rows behind the toggle;
+ * tapping the toggle adds .stuck-pr-expanded to the card and reveals
+ * them inline. Action-urgent rows (needs_human / ci_* / infra_flake /
+ * account_suspended) stay visible at all viewport widths. */
+@media (max-width: 599px) {
+  .stuck-pr-taxonomy-card .stuck-pr-row[data-bucket="merging"],
+  .stuck-pr-taxonomy-card .stuck-pr-row[data-bucket="healthy_waiting"] {
+    display: none;
+  }
+  .stuck-pr-taxonomy-card.stuck-pr-expanded .stuck-pr-row[data-bucket="merging"],
+  .stuck-pr-taxonomy-card.stuck-pr-expanded .stuck-pr-row[data-bucket="healthy_waiting"] {
+    display: flex;
+  }
+  .stuck-pr-mobile-toggle { display: inline-block; }
+}
+@media (min-width: 600px) {
+  .stuck-pr-taxonomy-card { padding: 16px 18px; }
+  .stuck-pr-row {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .stuck-pr-bucket { min-width: 130px; }
+  .stuck-pr-evidence { flex: 1 1 auto; }
+}
+
+/* Ticket 0047: PR autopsy card.
+ *
+ * Mobile-first layout: each row stacks vertically (cause label on top,
+ * evidence + verdict below). Color-coded left border per the AC spec:
+ *   - cap_reached         → --bad   (red — heal cap hit on real failures)
+ *   - infra_blocked_giveup → --warn  (amber — infra blocked recovery)
+ *   - everything else     → --dim   (neutral — human / stale / unknown)
+ *
+ * Desktop (>=600px): cause label aligns inline with the slug; the
+ * remaining evidence + verdict + draft link stack underneath. Reuses
+ * the existing --bad / --warn / --good / --dim / --accent palette
+ * tokens — NO new CSS variables. */
+.pr-autopsy-card {
+  margin: 14px 0;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.pr-autopsy-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.pr-autopsy-title-head { font-size: 14px; }
+.pr-autopsy-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel2, transparent);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.pr-autopsy-row-cap_reached { border-left-color: var(--bad); }
+.pr-autopsy-row-infra_blocked_giveup { border-left-color: var(--warn); }
+.pr-autopsy-row-human_rejected,
+.pr-autopsy-row-force_closed_stale,
+.pr-autopsy-row-unknown { border-left-color: var(--dim); }
+.pr-autopsy-cause {
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.pr-autopsy-cause-cap_reached { color: var(--bad); }
+.pr-autopsy-cause-infra_blocked_giveup { color: var(--warn); }
+.pr-autopsy-cause-human_rejected,
+.pr-autopsy-cause-force_closed_stale,
+.pr-autopsy-cause-unknown { color: var(--dim); }
+.pr-autopsy-slug b { color: var(--ink); font-weight: 600; }
+.pr-autopsy-title { margin-left: 4px; font-size: 12px; }
+.pr-autopsy-breakdown,
+.pr-autopsy-heals,
+.pr-autopsy-credit { font-size: 12px; }
+.pr-autopsy-verdict { color: var(--ink); font-size: 12.5px; }
+.pr-autopsy-draft {
+  color: var(--accent);
+  font-size: 12.5px;
+  text-decoration: none;
+  align-self: flex-start;
+  margin-top: 2px;
+}
+.pr-autopsy-draft:hover { text-decoration: underline; }
+@media (min-width: 600px) {
+  .pr-autopsy-card { padding: 16px 18px; }
+  .pr-autopsy-row { gap: 4px; }
+  .pr-autopsy-cause { min-width: 170px; }
+}
+
+/* Ticket 0047: lessons page "Suggested entry" textarea — pre-filled
+ * by the autopsy card's [draft entry →] tap-target. Lives at the top
+ * of /lessons when the ?draft= query param is present; absent
+ * otherwise. Reuses the existing --panel2 / --line / --mono tokens —
+ * no new variables. */
+.lesson-draft-block {
+  margin: 14px 0;
+  padding: 12px 14px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lesson-draft-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.lesson-draft-textarea {
+  width: 100%;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  resize: vertical;
+}
+.lesson-draft-help { font-family: var(--mono); font-size: 11.5px; }
+
+/* Ticket 0034: self-baseline drift detail view. Three rows stacked
+ * single-column on phones; each row carries the metric label, the
+ * baseline mean/sigma + current value as a numeric line, and an
+ * inline SVG with the band (--drift-band) + current marker (orange
+ * via --warn when drifted, --good when within band). */
+.project-drift { margin: 18px 0; }
+.project-drift .drift-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-bottom: 20px;
+}
+.project-drift .drift-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.project-drift .drift-row.drifted { border-color: rgba(217,138,43,.45); }
+.project-drift .drift-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.project-drift .drift-label { color: var(--ink); font-weight: 600; }
+.project-drift .drift-verdict { font-size: 11.5px; }
+.project-drift .drift-row.drifted .drift-verdict {
+  color: var(--warn);
+}
+.project-drift .drift-row-stats {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--dim);
+}
+.project-drift .drift-svg {
+  width: 400px;
+  height: 40px;
+  max-width: 100%;
+  display: block;
+}
+.project-drift .drift-band {
+  fill: var(--panel2);
+  stroke: var(--line);
+  stroke-width: 1;
+}
+.project-drift .drift-mean { fill: var(--faint); }
+.project-drift .drift-current { stroke: none; }
+.project-drift .drift-empty {
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.project-drift .drift-contributors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.project-drift .chip {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 2px 9px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  background: var(--panel2);
+}
+.project-drift .chip:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Mobile contract (ticket 0034 + 0011 conventions): at <=600px the
+ * three rows already stack single-column thanks to the flex-column
+ * parent; the inline SVG shrinks from 400x40 desktop to 280x32 so it
+ * fits inside the 375px viewport without horizontal scroll. */
+@media (max-width: 600px) {
+  .project-drift .drift-svg {
+    width: 280px;
+    height: 32px;
+  }
+  .project-drift .drift-row-head { font-size: 12px; }
+  .project-drift .drift-row-stats { font-size: 11px; }
+}
+
+/* Ticket 0035: cost per merged PR.
+ *
+ * Mobile-first: the summary line on the home page wraps gracefully on
+ * a 375px viewport, and the detail-page table collapses to one row
+ * per project (slug + $/PR + trend) — tapping a row expands the
+ * hidden columns inline. The fleet-rollup row is always expanded
+ * and uses a top border to separate it visually from the project
+ * list.
+ *
+ * Reuses the existing palette tokens (--panel / --line / --dim /
+ * --accent / --ink) so no new variables enter the theme. */
+
+.cost-per-pr-summary {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  text-decoration: none;
+  color: inherit;
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 1.4;
+  transition: border-color .15s, background .15s;
+}
+.cost-per-pr-summary:hover { border-color: #3a3b34; background: var(--panel2); }
+.cost-per-pr-summary .cost-per-pr-headline b,
+.cost-per-pr-summary .cost-per-pr-stat b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.cost-per-pr-summary .cost-per-pr-stat { color: var(--dim); white-space: nowrap; }
+.cost-per-pr-summary .cost-per-pr-sep { color: var(--faint); margin: 0 2px; }
+.cost-per-pr-summary .cost-per-pr-empty {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* Detail table.
+ *
+ * On phones (<= 375px / default mobile-first): the table renders as a
+ * stack of single-line rows showing slug + $/PR + trend glyph only;
+ * the spent + PRs columns are hidden via the .mobile-hide class. When
+ * a row is tapped (JS toggles .expanded), the hidden columns slide
+ * into view as a second line.
+ *
+ * On >= 600px: the table is laid out as a regular 5-column grid.
+ */
+.cost-per-pr-detail { margin: 12px 0 22px; }
+.cost-per-pr-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.cost-per-pr-table thead th {
+  text-align: left;
+  padding: 8px 10px;
+  font-weight: 600;
+  color: var(--dim);
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  user-select: none;
+}
+.cost-per-pr-table thead th.active { color: var(--ink); }
+.cost-per-pr-table tbody td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.cost-per-pr-table tbody tr:hover td { background: var(--panel2); }
+.cost-per-pr-row .cost-per-pr-trend-up { color: var(--warn); }
+.cost-per-pr-row .cost-per-pr-trend-down { color: var(--good); }
+.cost-per-pr-row .cost-per-pr-trend-flat { color: var(--dim); }
+.cost-per-pr-row .cost-per-pr-trend-none { color: var(--faint); }
+.cost-per-pr-row .cost-per-pr-na { color: var(--faint); }
+
+/* Fleet rollup: the last row, visually separated by a thicker top
+ * border that breaks the per-project sequence. Always expanded
+ * regardless of any .expanded toggle. */
+.cost-per-pr-table tbody tr.cost-per-pr-fleet-row td {
+  border-top: 2px solid var(--accent);
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--panel);
+}
+
+/* Mobile collapse: at <=599px (default), hide the spent + PRs columns
+ * (cells 2 and 3) on per-project rows; show them when the row is
+ * tapped (.expanded). The fleet-rollup row always shows everything.
+ *
+ * The trend cell stays visible — it's the most useful glyph at a
+ * glance per the user story ("phone collapses to slug + $/PR + trend
+ * glyph"). */
+@media (max-width: 599px) {
+  .cost-per-pr-table thead th:nth-child(2),
+  .cost-per-pr-table thead th:nth-child(3),
+  .cost-per-pr-table tbody tr:not(.cost-per-pr-fleet-row):not(.expanded) td:nth-child(2),
+  .cost-per-pr-table tbody tr:not(.cost-per-pr-fleet-row):not(.expanded) td:nth-child(3) {
+    display: none;
+  }
+  .cost-per-pr-row { cursor: pointer; }
+  .cost-per-pr-table { display: table; }
+}
+
+/* Desktop upgrade: at >=600px the full 5-column layout always shows
+ * (the .expanded toggle becomes a no-op). */
+@media (min-width: 600px) {
+  .cost-per-pr-table thead th:nth-child(2),
+  .cost-per-pr-table thead th:nth-child(3),
+  .cost-per-pr-table tbody tr td:nth-child(2),
+  .cost-per-pr-table tbody tr td:nth-child(3) {
+    display: table-cell;
+  }
+  .cost-per-pr-detail .cost-per-pr-table { display: table; }
+}
+
+/* Ticket 0036: cross-fleet lessons portal view.
+ *
+ * Per-project H2 headers (one per `## <slug>` in CROSS_LESSONS.md)
+ * stack vertically. Each entry is a <details> element so the operator
+ * can fan out only the one they're investigating; the
+ * project-level shell <details> is open by default on desktop and
+ * collapses to accordion headers at <600px (mobile pass per AC8).
+ *
+ * The search input + "new this week" checkbox sit sticky at the top
+ * of the page so the operator can type while scrolling.
+ *
+ * Topbar LESSONS link sits between the brand and the fleet-summary
+ * at the same monospace cadence as .brand. */
+.topbar-link { font-family: var(--mono); font-weight: 600; letter-spacing: .18em;
+  font-size: 12px; color: var(--dim); text-decoration: none; padding: 4px 6px; }
+.topbar-link:hover { color: var(--ink); }
+.cross-lessons { margin-top: 4px; }
+.cross-lessons .lessons-head { position: sticky; top: 56px; z-index: 5;
+  background: var(--bg, #0E0F0D); padding: 8px 0 12px;
+  border-bottom: 1px solid var(--line); }
+.lessons-title { font-family: var(--mono); font-size: 18px; letter-spacing: .12em;
+  margin: 0 0 8px; }
+.lessons-controls { display: grid; grid-template-columns: 1fr;
+  gap: 8px; align-items: center; }
+.lessons-controls input[type="search"] {
+  font-family: var(--mono); font-size: 13px; padding: 8px 10px;
+  background: var(--panel2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r);
+  width: 100%; min-height: var(--tap-min); }
+.lessons-controls input[type="search"]:focus {
+  outline: 1px solid var(--accent); outline-offset: 1px; }
+.lessons-controls .lessons-new-only { font-family: var(--mono); font-size: 12.5px;
+  color: var(--dim); display: inline-flex; gap: 6px; align-items: center; }
+.lessons-controls .lessons-new-only input { width: 16px; height: 16px; }
+.lessons-grid { display: block; padding-top: 8px; }
+.lessons-project { margin: 12px 0; }
+.lessons-project-shell > summary { list-style: none; cursor: pointer;
+  padding: 4px 0; }
+.lessons-project-shell > summary::-webkit-details-marker { display: none; }
+.lessons-h2 { display: inline; font-family: var(--mono); font-size: 14px;
+  letter-spacing: .14em; margin: 0; font-weight: 600; }
+.lessons-entries { padding: 6px 0 4px 8px;
+  border-left: 1px solid var(--line); margin-left: 4px; }
+.lesson { padding: 6px 0; border-bottom: 1px dashed var(--line); }
+.lesson > summary { cursor: pointer; font-size: 13.5px; line-height: 1.5;
+  list-style: none; padding: 4px 2px; min-height: var(--tap-min);
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.lesson > summary::-webkit-details-marker { display: none; }
+.lesson-date { font-family: var(--mono); font-size: 12px; color: var(--dim);
+  white-space: nowrap; }
+.lesson-title { color: var(--ink); }
+.lesson-body { padding: 8px 4px 6px 0; font-size: 13px; line-height: 1.55;
+  color: var(--ink); white-space: pre-wrap; }
+.lessons-empty { padding: 24px 8px; color: var(--dim); font-size: 13.5px;
+  line-height: 1.55; }
+.lessons-empty a { color: var(--accent); }
+
+/* Mobile-first (default <600px): project shells collapse to accordion
+ * headers (closed by default); the search + checkbox stack into two
+ * rows so the input gets the full width. */
+@media (max-width: 599px) {
+  .cross-lessons .lessons-head { top: 48px; }
+  .lessons-controls { grid-template-columns: 1fr; }
+  .lessons-project-shell:not([data-keep-open]) { /* closed by default */ }
+}
+
+/* Desktop upgrade at >=600px: project shells stay open by default;
+ * the search + checkbox sit on one row so the input shares space with
+ * the new-this-week toggle. */
+@media (min-width: 600px) {
+  .lessons-controls { grid-template-columns: 1fr auto; }
+  .lessons-controls input[type="search"] { max-width: 480px; }
+}
+
+/* ── Lesson credit ledger (ticket 0042) ─────────────────────────────
+ * Mobile-first: the summary line wraps to two lines if needed and
+ * the per-row chip stacks under the lesson title. At >=600px the
+ * chip floats right of the title on the same row. Horizontal scroll
+ * is forbidden at 375px per the 0011 mobile-portal CSS contract. */
+.lesson-credit-summary { font-family: var(--mono); font-size: 12.5px;
+  color: var(--ink); margin: 8px 0 4px; line-height: 1.45;
+  padding: 6px 8px; border-left: 2px solid var(--accent);
+  background: rgba(200, 132, 30, 0.06); word-break: break-word; }
+.lesson-credit-summary b { color: var(--ink); font-weight: 600; }
+.lesson-credit-summary .dim { color: var(--dim); }
+.lesson-credit-chip { display: inline-block; font-family: var(--mono);
+  font-size: 11.5px; color: var(--accent); padding: 1px 6px;
+  border: 1px solid rgba(200, 132, 30, 0.45); border-radius: 10px;
+  margin-left: 8px; white-space: nowrap; }
+@media (max-width: 599px) {
+  /* Chip wraps under the lesson title rather than into the body. The
+   * summary already lays out as flex with flex-wrap; the chip gets a
+   * margin-top on phones so it sits below the title visually. */
+  .lesson-credit-chip { margin-top: 4px; margin-left: 0; }
+}
+@media (min-width: 600px) {
+  /* Push the chip to the right edge of the lesson summary at desktop
+   * widths. The .lesson > summary rule above is flex with
+   * flex-wrap:wrap; margin-left:auto pushes the chip to the right. */
+  .lesson-credit-chip { margin-left: auto; }
+  .lesson-credit-summary { font-size: 13px; }
+}
+
+/* ── Lesson-pays-for-itself savings (ticket 0052) ───────────────────
+ * Per AC5 the savings column header is a sortable, clickable button
+ * (cursor: pointer); per AC6 the per-row cell renders inline with
+ * the lesson title at 375px (mobile) and as a right-aligned
+ * monospace cell at >=600px (desktop). The hover tooltip carries
+ * the arithmetic for transparency; it's display:none by default
+ * and only renders on :hover / :focus-within so the operator
+ * doesn't pay layout cost on the default render. */
+.lessons-savings-head { margin-top: 8px; font-size: 12.5px; }
+.lessons-saved-usd-header { display: inline-block; font-family: var(--mono);
+  font-size: 12px; color: var(--accent); padding: 2px 8px;
+  background: transparent; border: 1px solid rgba(200, 132, 30, 0.45);
+  border-radius: 10px; cursor: pointer; }
+.lessons-saved-usd-header.dim { color: var(--dim); cursor: default;
+  border-color: rgba(120, 120, 120, 0.3); }
+.lessons-saved-usd { display: inline-block; font-family: var(--mono);
+  font-size: 12px; color: var(--accent); margin-left: 8px;
+  position: relative; white-space: nowrap; text-align: right; }
+.lessons-saved-usd-amount { font-family: var(--mono); text-align: right; }
+.lessons-saved-usd-tooltip { display: none; position: absolute; right: 0;
+  top: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--dim);
+  padding: 4px 8px; font-size: 11.5px; white-space: normal; max-width: 280px;
+  z-index: 5; border-radius: 4px; }
+.lessons-saved-usd:hover .lessons-saved-usd-tooltip,
+.lessons-saved-usd:focus-within .lessons-saved-usd-tooltip { display: block; }
+@media (max-width: 599px) {
+  /* Phone: the column collapses INLINE with the lesson title so the
+   * row stays a single tap target. The header stays visible above
+   * the project sections (it shrinks but doesn't disappear). */
+  .lessons-saved-usd { margin-top: 4px; margin-left: 0; display: inline-block; }
+}
+@media (min-width: 600px) {
+  /* Desktop: the cell renders as a separate right-aligned monospace
+   * column inside the lesson summary. The .lesson > summary rule
+   * above is flex; margin-left:auto pushes it to the right edge so
+   * the column lines up across rows. */
+  .lessons-saved-usd { margin-left: auto; text-align: right;
+    font-family: var(--mono); }
+  .lessons-saved-usd-amount { font-family: var(--mono); text-align: right;
+    min-width: 64px; display: inline-block; }
+}
+
+/* ── Fleet changelog page (ticket 0039) ─────────────────────────────
+ * Mobile-first: filters stack (search on its own line, project + date
+ * dropdowns on the next), rows collapse to two lines (title on top,
+ * slug + PR + size + ticket on the bottom). At >=600px the row is
+ * one line and the filter bar is a single row. No horizontal scroll
+ * at 375px per the 0011 mobile-portal CSS contract. */
+.changelog-page { padding: 8px 0 40px; }
+.changelog-head { margin: 4px 0 18px; }
+.changelog-title { font-family: var(--sans); font-size: 22px; font-weight: 600; margin: 4px 0 12px; }
+.changelog-title .dim { font-family: var(--mono); font-size: 12px; font-weight: 400; margin-left: 8px; }
+.changelog-filters { display: grid; gap: 8px; grid-template-columns: 1fr; }
+.changelog-filters input[type="search"],
+.changelog-filters select,
+.changelog-filters input[type="date"] {
+  background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+  border-radius: var(--r); padding: 7px 10px; font-family: var(--mono); font-size: 13px;
+  min-height: var(--tap-min);
+}
+.changelog-filters .changelog-date { display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 12px; color: var(--dim); }
+.changelog-list { margin-top: 18px; }
+.changelog-day { margin-bottom: 22px; }
+.changelog-day-header { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--faint); margin: 0 0 8px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--line); }
+.changelog-row { display: grid; grid-template-columns: 1fr; gap: 4px 12px;
+  padding: 10px 4px; border-bottom: 1px solid #1f201c; font-family: var(--mono); font-size: 13px; }
+.changelog-row:last-child { border-bottom: 0; }
+.changelog-row .changelog-title { color: var(--ink); font-size: 14px; }
+.changelog-row .changelog-slug { color: var(--accent); }
+.changelog-row .changelog-pr { color: var(--dim); }
+.changelog-row .changelog-pr:hover { color: var(--accent); }
+.changelog-row .changelog-size { color: var(--faint); }
+.changelog-row .changelog-ticket { color: var(--dim); }
+.changelog-row .changelog-ticket:hover { color: var(--accent); }
+.changelog-empty { padding: 24px 8px; color: var(--dim); font-size: 13.5px; line-height: 1.55; }
+
+/* Mobile-first row layout (default, <600px): title on its own line at
+ * the top, the meta strip (slug · PR · size · ticket) on the second.
+ * Filters stack into one column. */
+.changelog-row { grid-template-areas:
+  "title"
+  "meta"; }
+.changelog-row .changelog-title { grid-area: title; }
+.changelog-row .changelog-slug,
+.changelog-row .changelog-pr,
+.changelog-row .changelog-size,
+.changelog-row .changelog-ticket { grid-area: meta; display: inline-block; margin-right: 12px; }
+
+/* Desktop upgrade at >=600px: one row per PR, filter bar on a single
+ * row. No horizontal scroll because the title gets the flex space and
+ * everything else is its natural width. */
+@media (min-width: 600px) {
+  .changelog-filters { grid-template-columns: 2fr 1fr auto auto; align-items: center; }
+  .changelog-row {
+    grid-template-columns: auto 1fr auto auto auto;
+    grid-template-areas: "slug title pr size ticket";
+    align-items: baseline;
+  }
+  .changelog-row .changelog-slug { grid-area: slug; margin-right: 0; }
+  .changelog-row .changelog-title { grid-area: title; }
+  .changelog-row .changelog-pr { grid-area: pr; margin-right: 0; }
+  .changelog-row .changelog-size { grid-area: size; margin-right: 0; }
+  .changelog-row .changelog-ticket { grid-area: ticket; margin-right: 0; }
+}
+
+/* Ticket 0041: public monthly receipts layout (/receipts/<slug>/<month>).
+ *
+ * Mobile-first single column at 375px: the four stats stack vertically,
+ * each with a big headline number. Headline is 36px at 375px (AC10
+ * floor). At >=600px the four stats become a 2x2 grid. The receipts
+ * page uses the same --bg/--ink palette as the rest of the portal so
+ * a screenshot reads as part of the fleet-control surface. */
+.receipts-page { background: var(--bg); color: var(--ink); }
+.receipts-main { max-width: 640px; margin: 0 auto; padding: 36px 20px; }
+.receipts-eyebrow { font-family: var(--mono); font-size: 13px; letter-spacing: .08em;
+  color: var(--dim); text-transform: uppercase; }
+.receipts-slug-dim { color: var(--faint); font-weight: 400; }
+.receipts-month { font-family: var(--sans); font-size: 22px; font-weight: 600;
+  margin: 4px 0 26px; color: var(--ink); }
+.receipts-stats { display: grid; grid-template-columns: 1fr; gap: 18px;
+  margin: 18px 0 28px; }
+.receipts-stat { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 18px 20px; }
+.receipts-headline { font-family: var(--mono); font-weight: 700;
+  font-variant-numeric: tabular-nums; font-size: 44px; color: var(--accent);
+  line-height: 1.05; }
+.receipts-stat-value { font-family: var(--mono); font-weight: 700;
+  font-variant-numeric: tabular-nums; font-size: 36px; color: var(--ink);
+  line-height: 1.1; }
+.receipts-stat-label { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); margin-top: 6px; text-transform: lowercase; }
+.receipts-mover { font-family: var(--mono); font-size: 13px; color: var(--good);
+  margin: 0 0 22px; }
+.receipts-foot { font-family: var(--mono); font-size: 11px; color: var(--faint);
+  border-top: 1px solid var(--line); padding-top: 16px; margin-top: 28px; }
+.receipts-foot a { color: var(--accent); text-decoration: underline; }
+.receipts-empty .receipts-empty-title { font-family: var(--sans); font-size: 20px;
+  font-weight: 600; }
+.receipts-empty .receipts-empty-body { color: var(--dim); margin: 8px 0 18px; }
+
+/* >=600px: four stats lay out as a 2x2 grid; headline ticks up to 44px. */
+@media (min-width: 600px) {
+  .receipts-stats { grid-template-columns: repeat(2, 1fr); gap: 18px; }
+  .receipts-headline { font-size: 56px; }
+}
+
+/* Ticket 0041: portal-side publish button + preview modal. The button
+ * sits inside the existing digest banner; the modal fills the viewport
+ * on phones (mobile-first per the 0011 portal contract). */
+.digest-receipts-row { margin-top: 8px; }
+.receipts-publish-btn { font-family: var(--mono); }
+.receipts-modal { position: fixed; inset: 0; z-index: 100;
+  background: rgba(14,15,13,.86); display: flex; align-items: center;
+  justify-content: center; padding: 16px; }
+.receipts-modal .modal-body { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 20px 22px; max-width: 560px; width: 100%;
+  max-height: 90vh; overflow: auto; }
+.receipts-modal h2 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
+.receipts-preview { width: 100%; min-height: 360px; border: 1px solid var(--line);
+  border-radius: var(--r); background: var(--bg); margin: 12px 0 16px; }
+.receipts-modal .actions { display: flex; gap: 10px; }
+@media (max-width: 599px) {
+  .receipts-modal .modal-body { width: 100%; height: 100%; max-height: 100vh;
+    border-radius: 0; }
+}
+
+/* Ticket 0056 — per-card "time saved this month" line.
+ *
+ * One compact muted-grey line sitting below the .metarow (spend +
+ * forecast + runs) on every project card. Reuses existing
+ * --dim / --mono tokens; no new CSS variables.
+ *
+ * At 375px the line sits inline with the spend stat (the parent
+ * .metarow has flex-wrap, and the time-saved line claims the row
+ * below by default — at small viewports it folds back inline). At
+ * >=600px the line claims its own row right-aligned beneath the
+ * spend, matching the spec's "own row right-aligned" framing for
+ * tablet+ viewports.
+ *
+ * The link variant (non-empty) and the span variant (empty-state)
+ * share the base selector; only the empty variant gets the
+ * .project-card-time-saved-empty modifier (rendered in a slightly
+ * lighter dim shade so the empty-state reads as honest signal).
+ */
+.project-card-time-saved {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--dim);
+  text-decoration: none;
+}
+.project-card-time-saved:hover { color: var(--accent); }
+.project-card-time-saved-empty {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* Mobile (<=375px): the line sits inline with the spend stat — the
+ * .metarow above wraps onto a second row, so we collapse the margin
+ * to keep the card compact. */
+@media (max-width: 375px) {
+  .project-card-time-saved {
+    display: inline-block;
+    margin-top: 2px;
+    margin-left: 6px;
+  }
+}
+
+/* Tablet+ (>=600px): the time-saved line claims its own row right-
+ * aligned beneath the metarow, per the spec's "own row right-
+ * aligned" framing. */
+@media (min-width: 600px) {
+  .project-card-time-saved {
+    display: block;
+    text-align: right;
+    margin-top: 4px;
+  }
+}
+
+/* Ticket 0048: Per-project worth-it verdict line.
+ *
+ * One line at the bottom of each project card. The verdict label is
+ * color-coded via the four .worth-it-verdict-<verdict> rules below
+ * (reusing existing --good / --warn / --bad / --dim tokens — no new
+ * CSS variables introduced). The sub-line uses the same smaller-text
+ * pattern as the spend-efficiency "why" row; on phones (375px) it
+ * collapses behind a tap-to-expand chevron per AC9.
+ */
+.worth-it-verdict { margin-top: 10px; padding-top: 10px;
+  border-top: 1px dashed var(--line); font-family: var(--mono);
+  font-size: 12.5px; }
+.worth-it-verdict-head { display: flex; align-items: baseline;
+  gap: 8px; flex-wrap: wrap; }
+.worth-it-verdict-label { color: var(--faint); }
+.worth-it-verdict-name { font-weight: 600; }
+.worth-it-roi { font-size: 12px; color: var(--dim); }
+.worth-it-verdict-detail { margin-top: 4px; font-size: 12px;
+  color: var(--dim); line-height: 1.45; }
+.worth-it-detail-toggle { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); background: transparent; border: 0;
+  cursor: pointer; padding: 0 6px; margin-left: auto; }
+.worth-it-detail-toggle:hover { color: var(--accent); }
+.worth-it-sticky-chip { font-family: var(--mono); font-size: 11px;
+  padding: 1px 8px; border-radius: 20px;
+  border: 1px solid rgba(210,106,94,.55);
+  color: var(--bad); background: rgba(181,72,60,.14); }
+
+/* Verdict label colors — reuse existing tokens; no new variables. */
+.worth-it-verdict-net_positive .worth-it-verdict-name { color: var(--good); }
+.worth-it-verdict-watch .worth-it-verdict-name { color: var(--warn); }
+.worth-it-verdict-sunset_candidate .worth-it-verdict-name { color: var(--bad); }
+.worth-it-verdict-insufficient_data .worth-it-verdict-name { color: var(--dim); }
+
+/* Mobile: at <=375px the sub-line is hidden by default; the chevron
+ * (rendered by renderWorthItVerdict) toggles `.worth-it-expanded`
+ * on the parent, which re-reveals the sub-line. The verdict label
+ * + ROI line always renders. */
+@media (max-width: 375px) {
+  .worth-it-verdict-detail { display: none; }
+  .worth-it-verdict.worth-it-expanded .worth-it-verdict-detail { display: block; }
+}
+
+/* Tablet+: both lines render inline; the chevron is hidden because
+ * the sub-line is always visible — no tap-target needed. */
+@media (min-width: 600px) {
+  .worth-it-verdict-detail { display: block; }
+  .worth-it-detail-toggle { display: none; }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * Ticket 0050 — fleet year-in-review page.
+ *
+ * Mobile-first single-column flow (per 0011): at 375px the hero
+ * stacks vertically, the top-projects / top-lessons cards stack one
+ * per row, the sparkline scales to viewport width. At >=900px the
+ * hero numbers render inline (flex-row) and the top-projects card
+ * grid promotes to a 3-column grid (one card per top project, up
+ * to 3). Reuses the existing portal CSS variables — no new tokens.
+ * ──────────────────────────────────────────────────────────────────── */
+
+.year-in-review-page { background: var(--bg); color: var(--fg); margin: 0;
+  font-family: var(--sans, system-ui); }
+.year-in-review { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px;
+  display: flex; flex-direction: column; gap: 24px; }
+.year-hero { display: flex; flex-direction: column; gap: 8px; }
+.year-hero-headline { font-size: 22px; line-height: 1.3; font-weight: 600; }
+.year-hero-stats { display: flex; flex-direction: column; gap: 4px; }
+.year-hero-stat { font-family: var(--mono, ui-monospace); font-size: 16px;
+  color: var(--dim); }
+.year-sparkline { display: block; }
+.year-sparkline svg { display: block; width: 100%; height: auto; }
+.year-dip-headline { font-family: var(--mono, ui-monospace); font-size: 13px;
+  color: var(--bad); margin-top: 6px; }
+.year-projects, .year-lessons { list-style: none; padding: 0; margin: 0;
+  display: grid; grid-template-columns: 1fr; gap: 12px; }
+.year-project, .year-lesson { border: 1px solid var(--border, #333);
+  border-radius: 8px; padding: 12px 14px; background: var(--card-bg, transparent); }
+.year-project-slug, .year-lesson-slug { font-family: var(--mono, ui-monospace);
+  font-size: 13px; color: var(--dim); }
+.year-project-prose { font-size: 14px; margin-top: 4px; }
+.year-lesson-title { font-size: 14px; margin-top: 4px; }
+.year-lesson-count { font-family: var(--mono, ui-monospace); font-size: 12px;
+  color: var(--good); margin-top: 4px; }
+.year-lesson-date { font-family: var(--mono, ui-monospace); font-size: 11px;
+  color: var(--dim); margin-top: 2px; }
+.year-share { align-self: flex-start; font-family: var(--mono, ui-monospace);
+  font-size: 13px; padding: 6px 12px; border-radius: 6px;
+  border: 1px solid var(--border, #333); background: transparent;
+  color: var(--fg); cursor: pointer; }
+.year-share:hover { border-color: var(--accent); color: var(--accent); }
+
+@media (min-width: 900px) {
+  .year-hero-stats { flex-direction: row; gap: 18px; }
+  .year-hero-headline { font-size: 28px; }
+  .year-projects { grid-template-columns: 1fr 1fr 1fr; }
+  .year-lessons { grid-template-columns: 1fr 1fr 1fr; }
+}
+
+/* Ticket 0054: public weekly fleet pulse — /pulse single-column page.
+ *
+ * Mobile-first per the 0011 portal contract. Default layout (>=600px)
+ * renders .pulse-stats as a horizontal row tile; the narrow override
+ * (max-width: 599px) stacks them vertically. The CTA is a full-width
+ * button with a 44px min tap-height (per AC6) so a thumb at 375px
+ * lands every time.
+ *
+ * Reuses existing CSS variables (--ink, --accent, --mono, etc.) — no
+ * new tokens introduced. */
+.pulse-page { background: var(--bg); color: var(--ink); font-family: var(--sans);
+  margin: 0; padding: 0; }
+.pulse-main { max-width: 640px; margin: 0 auto; padding: 28px 20px 60px;
+  display: flex; flex-direction: column; gap: 14px; }
+.pulse-eyebrow { font-family: var(--mono); font-size: 12px; color: var(--dim);
+  text-transform: lowercase; letter-spacing: 0.04em; }
+.pulse-headline { font-family: var(--sans); font-weight: 600; font-size: 22px;
+  line-height: 1.25; margin: 0 0 6px; color: var(--ink); }
+.pulse-stats { display: flex; flex-direction: row; gap: 18px;
+  margin: 8px 0 14px; }
+.pulse-stat { display: flex; flex-direction: column; gap: 2px;
+  flex: 1 1 0; min-width: 0; }
+.pulse-stat-value { font-family: var(--mono); font-weight: 700;
+  font-variant-numeric: tabular-nums; font-size: 24px; color: var(--ink); }
+.pulse-stat-label { font-family: var(--mono); font-size: 11px;
+  color: var(--dim); text-transform: lowercase; }
+.pulse-line { font-family: var(--mono); font-size: 13px; color: var(--ink);
+  margin: 2px 0; }
+.pulse-empty { font-family: var(--sans); font-size: 18px; color: var(--dim);
+  padding: 12px 0; }
+.pulse-cta { display: block; width: 100%; min-height: 44px;
+  box-sizing: border-box; text-align: center; padding: 12px 16px;
+  border-radius: 6px; border: 1px solid var(--accent);
+  background: transparent; color: var(--accent);
+  font-family: var(--mono); font-size: 14px; text-decoration: none;
+  margin-top: 20px; line-height: 20px; }
+.pulse-cta:hover { background: var(--accent); color: var(--bg); }
+
+/* Narrow viewport (<600px): stack .pulse-stats vertically so each
+ * stat reads as its own line on a phone. */
+@media (max-width: 599px) {
+  .pulse-stats { flex-direction: column; gap: 8px; }
+  .pulse-headline { font-size: 18px; }
+}
+
+/* Year-in-review + receipts pulse cross-link footer (additive, ticket
+ * 0054). Inherits .receipts-foot / .year-foot styling — no new colors. */
+.year-foot { font-family: var(--mono, ui-monospace); font-size: 11px;
+  color: var(--dim); margin-top: 18px; }
+.year-foot a { color: var(--accent); text-decoration: underline; }
+
+/* Ticket 0055: lesson-of-the-day rotating home card. Reuses the same
+ * card structural surface as the 0033 yesterday-glance (the sibling
+ * the rotation lives next to in the home stack). The savings badge
+ * stacks below the title at narrow widths and floats right inline at
+ * >=600px so the operator's phone reading flow stays linear and the
+ * desktop view shows the $$ at a glance. No new CSS variables — we
+ * reuse the existing accent / dim / bg / mono tokens. */
+.lesson-of-the-day { display: block; padding: 14px 16px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  text-decoration: none; color: inherit;
+  margin: 0 0 14px; background: transparent; }
+.lesson-of-the-day:hover { background: rgba(255,255,255,0.02); }
+.lesson-of-the-day-head { display: flex; align-items: center;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.lesson-of-the-day-eyebrow { font-family: var(--mono, ui-monospace);
+  font-size: 11px; text-transform: uppercase; color: var(--accent);
+  letter-spacing: 0.06em; }
+.lesson-of-the-day-date { font-family: var(--mono, ui-monospace);
+  font-size: 11px; }
+.lesson-of-the-day-cached-suffix { font-family: var(--mono, ui-monospace);
+  font-size: 11px; margin-left: 4px; }
+.lesson-of-the-day-title { font-weight: 600; font-size: 15px;
+  line-height: 1.35; margin-bottom: 4px; }
+.lesson-of-the-day-excerpt { font-size: 13px; line-height: 1.4;
+  color: var(--dim); margin-bottom: 8px; }
+.lesson-of-the-day-saved { display: inline-block;
+  font-family: var(--mono, ui-monospace); font-size: 12px;
+  padding: 3px 8px; border-radius: 4px; color: var(--accent);
+  border: 1px solid var(--accent); }
+.lesson-of-the-day-dismiss { margin-left: auto; min-width: 44px;
+  min-height: 44px; background: transparent; border: 0;
+  color: var(--dim); font-size: 20px; cursor: pointer;
+  line-height: 1; padding: 0 10px; }
+.lesson-of-the-day-dismiss:hover { color: var(--accent); }
+.lesson-of-the-day-empty { display: block; padding: 14px 16px;
+  border: 1px dashed var(--dim); border-radius: 8px;
+  text-decoration: none; color: inherit; margin: 0 0 14px; }
+.lesson-of-the-day-empty-copy { font-size: 13px; margin: 4px 0; }
+.lesson-of-the-day-empty-count { font-family: var(--mono, ui-monospace);
+  font-size: 11px; }
+
+/* Desktop layout (>=600px): the savings badge floats right inline
+ * with the title head so the $$ stays visible at-a-glance. The
+ * mobile (<600px) default already stacks. */
+@media (min-width: 600px) {
+  .lesson-of-the-day { display: grid;
+    grid-template-columns: 1fr auto; column-gap: 16px;
+    align-items: start; }
+  .lesson-of-the-day-head { grid-column: 1 / 3; }
+  .lesson-of-the-day-title { grid-column: 1 / 2; }
+  .lesson-of-the-day-excerpt { grid-column: 1 / 2; }
+  .lesson-of-the-day-saved { grid-column: 2 / 3; grid-row: 2 / 4;
+    align-self: center; justify-self: end; }
+}
+
+/* Ticket 0053: project graveyard. One long single-column ledger of
+ * paused / sunset projects, designed for a Sunday-evening "what did I
+ * sunset" review. Subdued palette — the page is a memory aid, not a
+ * dashboard. The desktop layout (>=900px) puts each row on a single
+ * monospaced line; mobile (<=600px) stacks the slug, paused-at, and
+ * action button vertically per the AC7 contract. */
+.graveyard { font-family: var(--sans); padding: 0 0 40px; }
+.graveyard-summary { padding: 18px 0 16px; border-bottom: 1px solid var(--line);
+  margin-bottom: 14px; }
+.graveyard-headline { font-size: 22px; font-weight: 600;
+  letter-spacing: -.01em; margin: 0 0 6px; }
+.graveyard-summary-row { font-family: var(--mono);
+  font-size: 12.5px; color: var(--dim); }
+.graveyard-summary-row span { color: var(--ink); font-weight: 500; }
+.graveyard-list { list-style: none; padding: 0; margin: 0; }
+.graveyard-row { display: grid; grid-template-columns: 1fr;
+  gap: 4px 14px; padding: 14px 0; border-bottom: 1px solid var(--line);
+  font-family: var(--mono); font-size: 12.5px; color: var(--dim); }
+.graveyard-row .graveyard-row-slug { font-family: var(--sans);
+  font-size: 15px; font-weight: 600; color: var(--ink); }
+.graveyard-row [data-testid$="-merged-prs"],
+.graveyard-row [data-testid$="-spend"],
+.graveyard-row [data-testid$="-roi"] { color: var(--ink); }
+.graveyard-revive { display: inline-block; margin-top: 6px;
+  padding: 6px 12px; border: 1px solid var(--line); border-radius: var(--r);
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  min-height: var(--tap-min); line-height: 28px; }
+.graveyard-revive:hover { border-color: var(--accent); }
+
+/* Desktop: single inline row. */
+@media (min-width: 900px) {
+  .graveyard-row { grid-template-columns: 1.6fr 1fr 1fr 1fr 1fr 1fr auto;
+    align-items: baseline; }
+}
+
+/* Mobile: stack vertically per AC7. No horizontal scroll. */
+@media (max-width: 600px) {
+  .graveyard-row { grid-template-columns: 1fr; padding: 14px 4px; }
+  .graveyard-revive { width: 100%; text-align: center; }
+}
+
+/* Ticket 0053: project-page cross-link banner. Informational only —
+ * a single line above the action group that names the pause reason +
+ * date and links to the graveyard. Subdued; not a modal. */
+.project-paused-banner { margin: 12px 0; padding: 8px 12px;
+  border-radius: var(--r); font-family: var(--mono); font-size: 12.5px;
+  background: rgba(141,141,131,.08);
+  border: 1px solid var(--paused); color: var(--dim); }
+.project-paused-banner a { color: var(--accent); text-decoration: underline; }
+
+/* Ticket 0057: public lesson archive (/lessons-public). Centred,
+ * legible single-column reading surface; max-width 80ch on desktop;
+ * full-width on phones. Reuses existing color + font variables; no
+ * new tokens. */
+.lessons-public { max-width: 80ch; margin: 0 auto; padding: 32px 24px 80px;
+  display: flex; flex-direction: column; gap: 28px; line-height: 1.55; }
+.lessons-public-page { background: var(--bg); color: var(--ink);
+  font-family: var(--sans); margin: 0; padding: 0; }
+.lessons-public-head h1 { font-family: var(--sans); font-weight: 600;
+  font-size: 26px; line-height: 1.2; margin: 0 0 10px; color: var(--ink); }
+.lessons-public-head p { font-family: var(--sans); font-size: 15px;
+  color: var(--dim); margin: 0; }
+.lessons-public-entry { border-top: 1px solid rgba(141,141,131,.18);
+  padding-top: 18px; }
+.lessons-public-entry h1, .lessons-public-entry h2 { font-family: var(--sans);
+  font-weight: 600; font-size: 20px; line-height: 1.3; margin: 0 0 6px;
+  color: var(--ink); }
+.lessons-public-entry h1 a, .lessons-public-entry h2 a { color: inherit;
+  text-decoration: none; }
+.lessons-public-entry h1 a:hover, .lessons-public-entry h2 a:hover {
+  text-decoration: underline; }
+.lessons-public-meta { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); margin-bottom: 10px; display: flex; gap: 12px;
+  flex-wrap: wrap; }
+.lessons-public-alias { font-family: var(--mono); font-size: 11px;
+  text-transform: lowercase; color: var(--accent);
+  letter-spacing: 0.04em; }
+.lessons-public-body p { font-family: var(--sans); font-size: 15px;
+  margin: 0 0 10px; color: var(--ink); }
+.lessons-public-back { font-family: var(--mono); font-size: 12px; }
+.lessons-public-back a { color: var(--accent); text-decoration: none; }
+.lessons-public-back a:hover { text-decoration: underline; }
+.lessons-public-foot { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); border-top: 1px solid rgba(141,141,131,.18);
+  padding-top: 16px; margin-top: 12px; }
+.lessons-public-foot a { color: var(--accent); text-decoration: underline; }
+.lessons-public-empty h1 { font-family: var(--sans); font-weight: 600;
+  font-size: 22px; margin: 0 0 8px; }
+
+@media (max-width: 599px) {
+  .lessons-public { padding: 20px 16px 48px; gap: 20px; }
+  .lessons-public-head h1 { font-size: 22px; }
+  .lessons-public-entry h1, .lessons-public-entry h2 { font-size: 17px; }
+}
+
+/* Ticket 0058: public failure-mode landing pages (/failures). Same
+ * centred single-column reading surface as the lesson archive; the
+ * <pre> excerpt block scrolls horizontally inside its own container so
+ * a long stderr line never breaks the page layout on a 375px phone. */
+.failures-public { max-width: 80ch; margin: 0 auto; padding: 32px 24px 80px;
+  display: flex; flex-direction: column; gap: 28px; line-height: 1.55; }
+.failures-public-page { background: var(--bg); color: var(--ink);
+  font-family: var(--sans); margin: 0; padding: 0; }
+.failures-public-head h1 { font-family: var(--sans); font-weight: 600;
+  font-size: 26px; line-height: 1.2; margin: 0 0 10px; color: var(--ink); }
+.failures-public-head p { font-family: var(--sans); font-size: 15px;
+  color: var(--dim); margin: 0; }
+.failures-public-entry { border-top: 1px solid rgba(141,141,131,.18);
+  padding-top: 18px; }
+.failures-public-entry h1, .failures-public-entry h2 { font-family: var(--sans);
+  font-weight: 600; font-size: 20px; line-height: 1.3; margin: 0 0 6px;
+  color: var(--ink); }
+.failures-public-entry h1 a, .failures-public-entry h2 a { color: inherit;
+  text-decoration: none; }
+.failures-public-entry h1 a:hover, .failures-public-entry h2 a:hover {
+  text-decoration: underline; }
+.failures-public-entry code { font-family: var(--mono); font-size: 0.9em;
+  color: var(--accent); }
+.failures-public-meta { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); margin: 8px 0 12px;
+  display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; }
+.failures-public-meta dt { color: var(--dim); }
+.failures-public-meta dd { margin: 0; color: var(--ink); }
+.failures-public-excerpt { font-family: var(--mono); font-size: 12px;
+  background: rgba(141,141,131,.08); border: 1px solid rgba(141,141,131,.18);
+  border-radius: 6px; padding: 10px 12px; margin: 8px 0 12px;
+  overflow-x: auto; white-space: pre; color: var(--ink); }
+.failures-public-matched-lesson { font-family: var(--sans); font-size: 14px;
+  color: var(--dim); margin: 6px 0 0; }
+.failures-public-matched-lesson a { color: var(--accent); text-decoration: underline; }
+.failures-public-back { font-family: var(--mono); font-size: 12px; }
+.failures-public-back a { color: var(--accent); text-decoration: none; }
+.failures-public-back a:hover { text-decoration: underline; }
+.failures-public-foot { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); border-top: 1px solid rgba(141,141,131,.18);
+  padding-top: 16px; margin-top: 12px; }
+.failures-public-foot a { color: var(--accent); text-decoration: underline; }
+.failures-public-empty { font-family: var(--sans); font-size: 15px;
+  color: var(--dim); }
+.failures-public-empty h1 { font-family: var(--sans); font-weight: 600;
+  font-size: 22px; margin: 0 0 8px; color: var(--ink); }
+
+@media (max-width: 599px) {
+  .failures-public { padding: 20px 16px 48px; gap: 20px; }
+  .failures-public-head h1 { font-size: 22px; }
+  .failures-public-entry h1, .failures-public-entry h2 { font-size: 17px; }
+  .failures-public-excerpt { font-size: 11px; }
+}
+
+/* Ticket 0059: biggest surprise this week home-page card. Reuses the
+ * same card structural surface as the 0033 yesterday-glance / 0055
+ * lesson-of-the-day siblings. Default (narrow viewport) stacks the
+ * metric beneath the sentence; the >=600px media block restores the
+ * inline / right-aligned shape so the desktop view shows both at a
+ * glance. No new CSS variables — accent/dim/bg/mono tokens only. */
+.biggest-surprise-card { display: block; padding: 14px 16px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  text-decoration: none; color: inherit;
+  margin: 0 0 14px; background: transparent; }
+.biggest-surprise-head { display: flex; align-items: center;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.biggest-surprise-eyebrow { font-family: var(--mono, ui-monospace);
+  font-size: 11px; text-transform: uppercase; color: var(--accent);
+  letter-spacing: 0.06em; }
+.biggest-surprise-sentence { font-weight: 600; font-size: 15px;
+  line-height: 1.35; margin-bottom: 8px; }
+.biggest-surprise-metric { font-family: var(--mono, ui-monospace);
+  font-size: 12px; color: var(--dim); }
+.biggest-surprise-metric-label { color: var(--dim); }
+.biggest-surprise-metric-baseline { color: var(--dim); }
+.biggest-surprise-metric-this-week { color: var(--accent); }
+.biggest-surprise-cta { display: inline-block; margin-top: 10px;
+  font-family: var(--mono, ui-monospace); font-size: 12px;
+  padding: 8px 12px; border: 1px solid var(--accent); border-radius: 6px;
+  color: var(--accent); text-decoration: none; min-height: 44px;
+  line-height: 28px; }
+.biggest-surprise-cta:hover { background: rgba(255,255,255,0.02); }
+.biggest-surprise-dismiss { margin-left: auto; min-width: 44px;
+  min-height: 44px; background: transparent; border: 0;
+  color: var(--dim); font-size: 20px; cursor: pointer;
+  line-height: 1; padding: 0 10px; }
+.biggest-surprise-dismiss:hover { color: var(--accent); }
+
+/* Narrow viewport (<600px): metric stacks vertically beneath the
+ * sentence. Per AC11 the stacked shape is the 375px baseline. */
+@media (max-width: 599px) {
+  .biggest-surprise-card { display: block; }
+  .biggest-surprise-metric { display: block; margin-top: 4px; }
+}
+
+/* Wide viewport (>=600px): metric right-aligns inline beneath the
+ * head. Per AC11 the inline shape is the >=600px tile. */
+@media (min-width: 600px) {
+  .biggest-surprise-card { display: grid;
+    grid-template-columns: 1fr auto; column-gap: 16px;
+    align-items: start; }
+  .biggest-surprise-head { grid-column: 1 / 3; }
+  .biggest-surprise-sentence { grid-column: 1 / 2; }
+  .biggest-surprise-metric { grid-column: 2 / 3; grid-row: 2;
+    justify-self: end; align-self: center; }
+  .biggest-surprise-cta { grid-column: 1 / 3; justify-self: start; }
+}
+
+
+/* Ticket 0062: monthly fleet retro home-page card. Renders ONLY on
+ * the first weekday of each calendar month (the SPA guards via the
+ * server-supplied is_monthly_retro_day flag plus an isMonthlyRetroDay
+ * mirror in app.js). One compact card stacked five deltas vertically
+ * at 375px; >=600px keeps the same column shape since the prose
+ * sentences are narrative not tabular. Reuses existing CSS variables
+ * (accent / dim / ink / mono) per the AC11 "no new variables" rule. */
+.monthly-retro-card { display: block; padding: 14px 16px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  text-decoration: none; color: inherit;
+  margin: 0 0 14px; background: transparent; }
+.monthly-retro-head { display: flex; align-items: center;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.monthly-retro-eyebrow { font-family: var(--mono, ui-monospace);
+  font-size: 11px; text-transform: uppercase; color: var(--accent);
+  letter-spacing: 0.06em; }
+.monthly-retro-sentence { font-weight: 600; font-size: 15px;
+  line-height: 1.4; color: var(--ink); }
+.monthly-retro-prs,
+.monthly-retro-spend,
+.monthly-retro-cpp,
+.monthly-retro-heal,
+.monthly-retro-best,
+.monthly-retro-laggard {
+  font-family: var(--mono, ui-monospace); font-size: 13px;
+  line-height: 1.5; color: var(--ink); margin: 4px 0; }
+.monthly-retro-best { color: var(--good); }
+.monthly-retro-laggard { color: var(--warn); }
+.monthly-retro-dismiss { margin-left: auto; min-width: 44px;
+  min-height: 44px; background: transparent; border: 0;
+  color: var(--dim); font-size: 20px; cursor: pointer;
+  line-height: 1; padding: 0 10px; }
+.monthly-retro-dismiss:hover { color: var(--accent); }
+
+/* Narrow viewport (<600px): each delta sentence stacks vertically
+ * (already the default block layout). The 375px phone view matches
+ * AC's "single-column with the five deltas stacked vertically". */
+@media (max-width: 599px) {
+  .monthly-retro-card { display: block; padding: 12px 14px; }
+  .monthly-retro-prs,
+  .monthly-retro-spend,
+  .monthly-retro-cpp,
+  .monthly-retro-heal,
+  .monthly-retro-best,
+  .monthly-retro-laggard { font-size: 12px; }
+}
+
+/* Wide viewport (>=600px): tighten line-height and let the prose
+ * breathe — narrative cards read better with a touch more vertical
+ * spacing. */
+@media (min-width: 600px) {
+  .monthly-retro-card { padding: 16px 18px; }
+}
+
+
+/* Ticket 0060: /share embed snippets section. */
+.share-embed-main { max-width: 720px; margin: 0 auto; padding: 28px 20px 60px;
+  font-family: var(--mono); color: var(--ink); }
+.share-embed-headline { font-family: var(--sans); font-weight: 600;
+  font-size: 22px; margin: 0 0 12px; color: var(--ink); }
+.share-embed-intro { font-family: var(--mono); font-size: 13px; color: var(--dim);
+  margin: 0 0 24px; line-height: 1.5; }
+.share-embed-intro a { color: var(--accent); text-decoration: none; }
+.share-embed-section { background: var(--panel); border: 1px solid var(--line);
+  padding: 14px 16px; border-radius: var(--r); margin: 0 0 16px; }
+.share-embed-section h2 { font-family: var(--mono); font-size: 12px;
+  color: var(--dim); margin: 0 0 8px; font-weight: 600;
+  text-transform: lowercase; }
+.share-embed-snippet { font-family: var(--mono); font-size: 12px;
+  background: var(--bg); color: var(--ink); padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 4px; margin: 0 0 10px;
+  white-space: pre-wrap; word-break: break-all; min-height: 44px; }
+.share-embed-copy { font-family: var(--mono); font-size: 12px;
+  background: var(--accent); color: var(--bg); border: none;
+  padding: 8px 14px; border-radius: 4px; cursor: pointer; min-height: 44px;
+  font-weight: 600; }
+.share-embed-copy:hover { opacity: 0.85; }

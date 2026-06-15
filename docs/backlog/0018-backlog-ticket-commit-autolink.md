@@ -1,7 +1,7 @@
 ---
 id: 0018
 title: Backlog-ticket → merged-commit auto-link via git log
-status: proposed
+status: shipped
 priority: P2
 area: ingest
 created: 2026-05-26
@@ -168,5 +168,25 @@ Each box maps 1:1 to a test scenario.
   table).
 
 ## Implementation log
+
+- 2026-05-29 — picked up by implementation-dev. Branch
+  `feat/0018-ticket-commit-autolink` opened off `main`. Status flipped
+  to `in-progress` here + in the README index. Plan: write failing
+  tests first (one per AC checkbox), then implement
+  `src/ingest/git_ticket_links.ts` with the runner-seam pattern,
+  schema migration in `src/db.ts`, daemon hook in `src/daemon.ts`,
+  `ticketShipReport()` in `src/views.ts`, new route
+  `/api/backlog/:id/ship-report`, and a "Shipped as" panel in
+  `web/app.js` for the ticket detail view.
+- 2026-05-29 — shipped as PR #62. CI green on both gating checks
+  (`typecheck` + `validate`); merged via `--auto --squash`. All 15
+  new tests in `tests/git-ticket-links.test.ts` pass; no regression
+  against the other 121 passing tests in the suite. The new ingest
+  hook runs once per project per ingest tick — silently skipped when
+  the project's `<cacheBase>/<slug>-agent/checkout` directory has no
+  `.git/`, so fresh installs / demo-mode fixtures stay clean. Daemon
+  consumers (`src/ingest/index.ts`) wire it after the transcript +
+  run + event ingest so PR-number enrichment via the `pr` table is
+  available on the same tick.
 
 (Appended by the implementation-dev agent during execution.)
