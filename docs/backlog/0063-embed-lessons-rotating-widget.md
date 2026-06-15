@@ -1,7 +1,7 @@
 ---
 id: 0063
 title: Embeddable lesson-of-the-day widget - paste-one-line snippet that rotates a cross-fleet operational lesson into any blog or README so every reader sees a real fleet insight
-status: groomed
+status: in-progress
 priority: P2
 area: portal
 created: 2026-06-15
@@ -434,4 +434,14 @@ for stateful cache invalidation only).
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15 — implementation-dev: branch `feat/0063-embed-lessons-rotating-widget`
+  cut from main. Extending `src/embed.ts` with two new renderers
+  (`renderEmbedLessonsHtml`, `renderEmbedLessonsSvg`) plus a private inline
+  `anonymiseEmbedExcerpt` per LESSONS 2026-06-13 (avoid the function-import
+  cycle with `src/lessons.ts` which already imports from `src/views.ts`).
+  Wiring two new public routes (`/embed/lessons.html`, `/embed/lessons.svg`)
+  in `src/server.ts` BEFORE the `/api/` auth gate, mirroring the 0060
+  posture. Cache memoised on `(date_iso, lessons_file_mtime,
+  lessons_file_size)` — file-based invalidation, no globalThis slot needed
+  (the signal is OS-side, not producer-pushed). New `/share` snippet
+  section appended below the existing 0060 pulse snippets.
