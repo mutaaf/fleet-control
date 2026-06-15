@@ -44,6 +44,9 @@ import { renderBadge, projectBadge, parseMetric } from "./badge.ts";
 import {
   renderEmbedPulseHtml, renderEmbedPulseSvg,
   composeEmbedFrameHeaders, renderSharePage as renderEmbedSharePage,
+  renderEmbedLessonsHtml, renderEmbedLessonsSvg,
+  buildEmbedLessonsPayload, embedLessonsFileTuple,
+  type LessonEmbedPayload,
 } from "./embed.ts";
 import {
   renderOgPulseSvg, renderOgReceiptsSvg, renderOgCalculatorSvg,
@@ -3354,6 +3357,121 @@ function serveEmbedPulseSvg(
   };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0063: embeddable lesson-of-the-day widget.
+//
+// Two PUBLIC routes (no auth, no loopback gate) mounted BEFORE the
+// path.startsWith("/api/") auth gate so they share the no-token bypass
+// posture of /embed/pulse.* and /api/fleet/pulse:
+//
+//   GET /embed/lessons.html → self-contained 320x200 HTML iframe content
+//   GET /embed/lessons.svg  → hand-rolled 320x200 SVG image fallback
+//
+// Both routes share a per-tuple memo cache. The invalidation tuple is
+// (date_iso, lessons_file_mtime_ms, lessons_file_size) — the source of
+// truth is the LESSONS.md file (NOT a SQL table with a fetched_at
+// column), so the natural invalidation signal is the OS-reported
+// mtime + size pair. Per LESSONS 2026-06-05 "break ingest <-> server
+// cache-invalidation cycles via a globalThis slot" — we do NOT need a
+// globalThis slot here because the invalidation signal is read lazily
+// from the filesystem on each request, not pushed from a producer
+// module the server depends on. The globalThis pattern is for
+// producer-pushed invalidation; this is consumer-pulled.
+//
+// Per LESSONS section "in-process dedup sets need an explicit reset
+// hook" + "expose a build counter for cache-hit tests" we expose
+// _resetEmbedLessonsCacheForTests + _getEmbedLessonsCacheBuildsForTests.
+const EMBED_LESSONS_TTL_MS = 300_000; // 5 minutes — embed Cache-Control max-age=300.
+
+interface EmbedLessonsCacheEntry {
+  tuple: string;
+  value: LessonEmbedPayload;
+  expires_at: number;
+}
+const embedLessonsCache = new Map<string, EmbedLessonsCacheEntry>();
+let embedLessonsBuildCounter = 0;
+
+export function _resetEmbedLessonsCacheForTests(): void {
+  embedLessonsCache.clear();
+  embedLessonsBuildCounter = 0;
+}
+
+export function _getEmbedLessonsCacheBuildsForTests(): number {
+  return embedLessonsBuildCounter;
+}
+
+/** Build a stable cache tuple over (date_iso, file_mtime_ms, file_size).
+ *  All three components MUST shift for the cache to bust — per the AC:
+ *  "the lessons file mtime + size is the natural invalidation signal
+ *  because LESSONS.md is a static markdown file the operator edits". */
+function embedLessonsInvalidationTuple(now: Date): { key: string; tuple: string } {
+  const dayIso = now.toISOString().slice(0, 10);
+  const fileTuple = embedLessonsFileTuple();
+  return {
+    key: dayIso,
+    tuple: `${dayIso}|${fileTuple.mtime_ms}|${fileTuple.size}|${fileTuple.exists ? 1 : 0}`,
+  };
+}
+
+/** Look up the cached embed-lessons payload; rebuild on miss. The
+ *  cache key is the UTC day so the entry naturally rolls over at the
+ *  midnight-UTC boundary. */
+function getEmbedLessonsCached(now: Date): LessonEmbedPayload {
+  const { key, tuple } = embedLessonsInvalidationTuple(now);
+  const hit = embedLessonsCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  const value = buildEmbedLessonsPayload({ now });
+  embedLessonsBuildCounter += 1;
+  embedLessonsCache.set(key, {
+    tuple, value, expires_at: Date.now() + EMBED_LESSONS_TTL_MS,
+  });
+  return value;
+}
+
+/** Test-only handle on the cached path so the cache-hit test can
+ *  observe the build counter without going through HTTP. */
+export function _embedLessonsCachedForTests(now: Date): LessonEmbedPayload {
+  return getEmbedLessonsCached(now);
+}
+
+/** Single chokepoint for GET /embed/lessons.html. */
+function serveEmbedLessonsHtml(
+  cfg: FleetConfig, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = getEmbedLessonsCached(now);
+  const body = renderEmbedLessonsHtml(payload);
+  const frame = composeEmbedFrameHeaders({ embedOrigins: cfg.embedOrigins });
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=300",
+      "x-frame-options": frame.xFrameOptions,
+      "content-security-policy": frame.contentSecurityPolicy,
+    },
+    body,
+  };
+}
+
+/** Single chokepoint for GET /embed/lessons.svg. */
+function serveEmbedLessonsSvg(
+  cfg: FleetConfig, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = getEmbedLessonsCached(now);
+  const body = renderEmbedLessonsSvg(payload);
+  const frame = composeEmbedFrameHeaders({ embedOrigins: cfg.embedOrigins });
+  return {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=300",
+      "x-frame-options": frame.xFrameOptions,
+      "content-security-policy": frame.contentSecurityPolicy,
+    },
+    body,
+  };
+}
+
 /** Compose the operator's host URL for the /share snippet section.
  *  Falls back to loopback when no LAN interface is reachable. */
 function embedHostForSnippets(cfg: FleetConfig): string {
@@ -4935,6 +5053,23 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       }
       if (path === "/embed/pulse.svg" && req.method === "GET") {
         const result = serveEmbedPulseSvg(db, cfg, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0063: embeddable lesson-of-the-day widget. Two PUBLIC
+      // routes mounted BEFORE the path.startsWith("/api/") auth gate so
+      // they share the no-token bypass posture of /embed/pulse.* above.
+      // The HTML route powers the operator's iframe paste-line; the SVG
+      // route powers the GitHub-README img fallback. Cache-Control:
+      // max-age=300 — matches the pulse embed cadence so an embedder
+      // gets a consistent refresh experience across both widgets.
+      if (path === "/embed/lessons.html" && req.method === "GET") {
+        const result = serveEmbedLessonsHtml(cfg, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      if (path === "/embed/lessons.svg" && req.method === "GET") {
+        const result = serveEmbedLessonsSvg(cfg, new Date());
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }
