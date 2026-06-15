@@ -1,7 +1,7 @@
 ---
 id: 0061
 title: Open-graph image renderer for /pulse /receipts /calculator - every paste on LinkedIn / Twitter / Bluesky becomes a live rendered card so the share itself is the impression
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-15
@@ -394,4 +394,23 @@ per the existing `src/ingest/prs.ts` writer. Per LESSONS 2026-06-07 "the
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15 — implementation-dev: started on
+  `feat/0061-og-image-public-pages`. Plan: new `src/og.ts` with three
+  pure SVG renderers (pulse, receipts, calculator) following the 0060
+  embed precedent — hand-rolled SVG strings, no template engine, no
+  new dep; renderer-direct seams `_renderOgPulseSvgForTests`,
+  `_renderOgReceiptsSvgForTests`, `_renderOgCalculatorSvgForTests`
+  for branch tests per LESSONS 2026-06-11. Three new routes in
+  `src/server.ts` mounted BEFORE the `/api/` auth gate alongside
+  `/embed/pulse.*` (1h Cache-Control, image/svg+xml content-type),
+  plus a meta-tag block injected into the three existing public-page
+  HTML responses keyed off the request Host header. Cache layer
+  memoises each renderer behind the documented tuple
+  (pulse: MAX(pr.fetched_at) + COUNT + MAX(run.started_at) + COUNT
+  in week; receipts: MAX(pr.fetched_at) + COUNT in month; calculator:
+  MAX(run.started_at) + COUNT in trailing 90d) — per LESSONS
+  2026-06-07 the tuple uses (MAX(fetched_at), COUNT(*)) NOT
+  MAX(pr.id). Ingest invalidation hook registers on
+  `globalThis.__fleet_og_invalidate__` per LESSONS 2026-06-05; any
+  helper needs from views.ts get inlined per LESSONS 2026-06-13 to
+  avoid the function-import cycle.
