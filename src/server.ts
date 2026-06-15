@@ -45,6 +45,10 @@ import {
   renderEmbedPulseHtml, renderEmbedPulseSvg,
   composeEmbedFrameHeaders, renderSharePage as renderEmbedSharePage,
 } from "./embed.ts";
+import {
+  renderOgPulseSvg, renderOgReceiptsSvg, renderOgCalculatorSvg,
+  type OgReceiptsPayload, type OgCalculatorPayload,
+} from "./og.ts";
 import { discoverLanUrl } from "./lan.ts";
 import {
   authenticate, scopeAllows, migrateLegacyAdminTokenIfPresent,
@@ -3116,6 +3120,396 @@ function embedHostForSnippets(cfg: FleetConfig): string {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Ticket 0061: Open-graph image renderers for /pulse, /receipts,
+// /calculator.
+//
+// Three PUBLIC routes (no auth, no loopback gate):
+//   GET /og/pulse.svg       → 1200x630 SVG composing fleetWeeklyPulse
+//   GET /og/receipts.svg    → 1200x630 SVG composing the receipts
+//                             monthly aggregator + a 12-month sparkline
+//   GET /og/calculator.svg  → 1200x630 SVG composing fleetMedianProjection
+//
+// All three share a SINGLE module-level cache (one Map keyed by surface)
+// with per-surface invalidation tuples:
+//   pulse:      (MAX(pr.fetched_at), COUNT(*) in week,
+//                MAX(run.started_at), COUNT(*) in week, week_start_iso)
+//   receipts:   (MAX(pr.fetched_at), COUNT(*) in month, month_iso)
+//   calculator: (MAX(run.started_at), COUNT(*) in trailing 90d)
+//
+// Per LESSONS 2026-06-07 "the pr table has no surrogate id" - every
+// tuple uses (MAX(fetched_at), COUNT(*)) NOT MAX(pr.id) (the column
+// doesn't exist - PK is (project_id, number)).
+//
+// Per LESSONS section "in-process dedup sets need an explicit reset
+// hook" + "expose a build counter for cache-hit tests" we expose
+// _resetOgCacheForTests + _getOgCacheBuildsForTests. Per LESSONS
+// 2026-06-05 "break ingest↔server cache-invalidation cycles via a
+// globalThis slot" the invalidation hook registers on
+// globalThis.__fleet_og_invalidate__ and the ingest pass reads it
+// lazily after COMMIT.
+//
+// Per LESSONS 2026-06-13 "function-import cycles" the og module only
+// imports the FleetWeeklyPulse type from views.ts; helpers are inlined
+// inside og.ts so views.ts never grows a back-edge import.
+
+const OG_TTL_MS = 3_600_000; // 1 hour Cache-Control matches the AC.
+
+interface OgCacheEntry {
+  tuple: string;
+  body: string;
+  expires_at: number;
+}
+const ogCache = new Map<string, OgCacheEntry>();
+let ogBuildCounter = 0;
+
+export function _resetOgCacheForTests(): void {
+  ogCache.clear();
+  ogBuildCounter = 0;
+}
+
+export function _getOgCacheBuildsForTests(): number {
+  return ogBuildCounter;
+}
+
+/** Production cache-invalidation hook — called from runIngestPass
+ *  post-COMMIT via the globalThis slot per LESSONS 2026-06-05. Clears
+ *  the body cache but NOT the build counter so tests can observe a
+ *  counter increment on the next call after an ingest. */
+export function _invalidateOgCacheAfterIngest(): void {
+  ogCache.clear();
+}
+
+(globalThis as { __fleet_og_invalidate__?: () => void })
+  .__fleet_og_invalidate__ = _invalidateOgCacheAfterIngest;
+
+interface OgPrTupleRow { mx: string | null; c: number | null; }
+interface OgRunTupleRow { mx: string | null; c: number | null; }
+
+/** Compute the pulse-OG invalidation tuple. Scoped to the most-recent
+ *  COMPLETE ISO week. Tuple components: (week_start_iso, MAX(pr.
+ *  fetched_at) MERGED-only, COUNT(*) MERGED-only, MAX(run.started_at),
+ *  COUNT(*) run in week). The pr.state literal is 'MERGED' upper-case
+ *  per src/ingest/prs.ts (LESSONS 2026-06-10). */
+function ogPulseInvalidationTuple(db: DB, weekStartIso: string, weekEndIso: string): string {
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr "
+    + " WHERE state = 'MERGED' "
+    + "   AND date(fetched_at) >= ? "
+    + "   AND date(fetched_at) <= ?",
+  ).get(weekStartIso, weekEndIso) as unknown as OgPrTupleRow | undefined;
+  const runRow = db.prepare(
+    "SELECT MAX(started_at) AS mx, COUNT(*) AS c FROM run "
+    + " WHERE date(started_at) >= ? "
+    + "   AND date(started_at) <= ?",
+  ).get(weekStartIso, weekEndIso) as unknown as OgRunTupleRow | undefined;
+  return `pulse|${weekStartIso}|${prRow?.mx ?? ""}|${Number(prRow?.c ?? 0)}|${runRow?.mx ?? ""}|${Number(runRow?.c ?? 0)}`;
+}
+
+/** Compute the receipts-OG invalidation tuple. Scoped to the current
+ *  calendar month. Tuple: (month_iso, MAX(pr.fetched_at), COUNT(*) in
+ *  month). The receipts OG is fleet-LEVEL so the SELECT does NOT scope
+ *  by project_id. */
+function ogReceiptsInvalidationTuple(db: DB, monthIso: string): string {
+  const start = `${monthIso}-01`;
+  // Half-open exclusive end: first day of next month.
+  const [yStr, mStr] = monthIso.split("-");
+  const y = Number(yStr);
+  const m = Number(mStr);
+  const nextY = m === 12 ? y + 1 : y;
+  const nextM = m === 12 ? 1 : m + 1;
+  const end = `${nextY}-${String(nextM).padStart(2, "0")}-01`;
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr "
+    + " WHERE date(fetched_at) >= ? "
+    + "   AND date(fetched_at) < ?",
+  ).get(start, end) as unknown as OgPrTupleRow | undefined;
+  return `receipts|${monthIso}|${prRow?.mx ?? ""}|${Number(prRow?.c ?? 0)}`;
+}
+
+/** Compute the calculator-OG invalidation tuple. Scoped to the trailing
+ *  90 days. Tuple: (MAX(run.started_at), COUNT(*) run in 90d). The
+ *  spend axis derives from cost_rollup_day which itself derives from
+ *  run rows on every ingest pass, so the run-side pair is sufficient. */
+function ogCalculatorInvalidationTuple(db: DB, now: Date): string {
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 90);
+  const startStr = start.toISOString().slice(0, 10);
+  const endStr = end.toISOString().slice(0, 10);
+  const runRow = db.prepare(
+    "SELECT MAX(started_at) AS mx, COUNT(*) AS c FROM run "
+    + " WHERE date(started_at) >= ? "
+    + "   AND date(started_at) <= ?",
+  ).get(startStr, endStr) as unknown as OgRunTupleRow | undefined;
+  return `calculator|${startStr}|${endStr}|${runRow?.mx ?? ""}|${Number(runRow?.c ?? 0)}`;
+}
+
+/** ISO-week boundary helper local to the OG module - mirrors the
+ *  fleetWeeklyPulse helper so the cache-key week aligns with what the
+ *  pulse renderer reads. Per LESSONS 2026-06-13 we keep this inline
+ *  instead of importing from views.ts. */
+function ogPulseWeekBoundary(now: Date): { startIso: string; endIso: string } {
+  const today = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+  ));
+  const isoDay = (today.getUTCDay() + 6) % 7 + 1;
+  const sunday = new Date(today);
+  sunday.setUTCDate(sunday.getUTCDate() - isoDay);
+  const monday = new Date(sunday);
+  monday.setUTCDate(monday.getUTCDate() - 6);
+  return {
+    startIso: monday.toISOString().slice(0, 10),
+    endIso: sunday.toISOString().slice(0, 10),
+  };
+}
+
+/** Helper: format Date to "YYYY-MM" (UTC). */
+function ogMonthIso(d: Date): string {
+  return d.toISOString().slice(0, 7);
+}
+
+interface OgReceiptsMonthCountRow { c: number | null; }
+interface OgReceiptsMonthSpendRow { s: number | null; }
+
+/** Compose the receipts OG payload: this-month merged-PR count + spend
+ *  + 12-month trailing sparkline of monthly merged-PR counts. Pure SQL
+ *  scoped to pr.state='MERGED' (LESSONS 2026-06-10 producer-vs-spec
+ *  casing) and cost_rollup_day for spend. */
+function composeOgReceiptsPayload(db: DB, now: Date): OgReceiptsPayload {
+  const monthIso = ogMonthIso(now);
+  const start = `${monthIso}-01`;
+  const [yStr, mStr] = monthIso.split("-");
+  const y = Number(yStr);
+  const m = Number(mStr);
+  const nextY = m === 12 ? y + 1 : y;
+  const nextM = m === 12 ? 1 : m + 1;
+  const end = `${nextY}-${String(nextM).padStart(2, "0")}-01`;
+  const mergedRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE state = 'MERGED' "
+    + "   AND date(fetched_at) >= ? "
+    + "   AND date(fetched_at) < ?",
+  ).get(start, end) as unknown as OgReceiptsMonthCountRow | undefined;
+  const merged_prs = Number(mergedRow?.c ?? 0);
+  const spendRow = db.prepare(
+    "SELECT SUM(COALESCE(cost_usd, 0)) AS s FROM cost_rollup_day "
+    + " WHERE day >= ? AND day < ?",
+  ).get(start, end) as unknown as OgReceiptsMonthSpendRow | undefined;
+  const total_spend_usd = Number(spendRow?.s ?? 0) || 0;
+  // 12-month trailing sparkline (oldest first); the last entry is THIS
+  // month's count.
+  const sparkline: number[] = [];
+  for (let i = 11; i >= 0; i--) {
+    const refYr = m - i >= 1 ? y : y - 1;
+    const refMo = ((m - i - 1 + 12) % 12) + 1;
+    const refStart = `${refYr}-${String(refMo).padStart(2, "0")}-01`;
+    const refNextY = refMo === 12 ? refYr + 1 : refYr;
+    const refNextM = refMo === 12 ? 1 : refMo + 1;
+    const refEnd = `${refNextY}-${String(refNextM).padStart(2, "0")}-01`;
+    const r = db.prepare(
+      "SELECT COUNT(*) AS c FROM pr "
+      + " WHERE state = 'MERGED' "
+      + "   AND date(fetched_at) >= ? "
+      + "   AND date(fetched_at) < ?",
+    ).get(refStart, refEnd) as unknown as OgReceiptsMonthCountRow | undefined;
+    sparkline.push(Number(r?.c ?? 0));
+  }
+  return {
+    generated_at: now.toISOString(),
+    month_iso: monthIso,
+    // month_label is structurally derivable from month_iso inside the
+    // renderer; we pass a defensive label here that the renderer never
+    // reads (per LESSONS 2026-06-10 value-side anonymisation).
+    month_label: monthIso,
+    merged_prs,
+    total_spend_usd,
+    sparkline,
+  };
+}
+
+/** Compose the calculator OG payload from fleetMedianProjection.
+ *  hours_saved_per_week is derived from merged_prs_per_month assuming
+ *  one engineer-hour per merged PR - the same shape as the existing
+ *  computeRoiProjection helper used by the /calculator page. */
+function composeOgCalculatorPayload(db: DB, now: Date): OgCalculatorPayload {
+  const median = getMedianProjectionCached(db, now, 90, "p25");
+  const insufficient = median.projects_observed < 2
+    || median.merged_prs_per_month <= 0
+    || median.cost_per_pr_usd == null;
+  // hours_saved_per_week: median.merged_prs_per_month / 4.333 (weeks
+  // per month) at 1 engineer-hour per PR. The percentile_label is NOT
+  // forwarded to the renderer per the AC6 leak-defence; the renderer
+  // composes its own label from the documented branch.
+  const hoursPerWeek = insufficient ? 0 : median.merged_prs_per_month / 4.333;
+  return {
+    generated_at: now.toISOString(),
+    hours_saved_per_week: hoursPerWeek,
+    merged_prs_per_month: median.merged_prs_per_month,
+    cost_per_pr_usd: median.cost_per_pr_usd,
+    percentile_label: "fleet median",
+    insufficient_data: insufficient,
+  };
+}
+
+/** Render + memoise the pulse OG SVG body. */
+function getOgPulseSvgCached(db: DB, now: Date): string {
+  const { startIso, endIso } = ogPulseWeekBoundary(now);
+  const tuple = ogPulseInvalidationTuple(db, startIso, endIso);
+  const key = `pulse|${startIso}`;
+  const hit = ogCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.body;
+  ogBuildCounter += 1;
+  const payload = fleetWeeklyPulse(db, { now });
+  const body = renderOgPulseSvg(payload);
+  ogCache.set(key, { tuple, body, expires_at: Date.now() + OG_TTL_MS });
+  return body;
+}
+
+/** Render + memoise the receipts OG SVG body. */
+function getOgReceiptsSvgCached(db: DB, now: Date): string {
+  const monthIso = ogMonthIso(now);
+  const tuple = ogReceiptsInvalidationTuple(db, monthIso);
+  const key = `receipts|${monthIso}`;
+  const hit = ogCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.body;
+  ogBuildCounter += 1;
+  const payload = composeOgReceiptsPayload(db, now);
+  const body = renderOgReceiptsSvg(payload);
+  ogCache.set(key, { tuple, body, expires_at: Date.now() + OG_TTL_MS });
+  return body;
+}
+
+/** Render + memoise the calculator OG SVG body. */
+function getOgCalculatorSvgCached(db: DB, now: Date): string {
+  const tuple = ogCalculatorInvalidationTuple(db, now);
+  const key = "calculator|default";
+  const hit = ogCache.get(key);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.body;
+  ogBuildCounter += 1;
+  const payload = composeOgCalculatorPayload(db, now);
+  const body = renderOgCalculatorSvg(payload);
+  ogCache.set(key, { tuple, body, expires_at: Date.now() + OG_TTL_MS });
+  return body;
+}
+
+/** Test-only seams so cache-hit tests observe the build counter
+ *  without going through HTTP. The trailing-underscore "ForTests"
+ *  suffix matches the existing convention across server.ts. */
+export function _ogPulseCachedForTests(db: DB, now: Date): string {
+  return getOgPulseSvgCached(db, now);
+}
+export function _ogReceiptsCachedForTests(db: DB, now: Date): string {
+  return getOgReceiptsSvgCached(db, now);
+}
+export function _ogCalculatorCachedForTests(db: DB, now: Date): string {
+  return getOgCalculatorSvgCached(db, now);
+}
+
+/** Single chokepoint for GET /og/pulse.svg. */
+function serveOgPulseSvg(db: DB, now: Date): {
+  status: number; headers: Record<string, string>; body: string;
+} {
+  return {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: getOgPulseSvgCached(db, now),
+  };
+}
+
+/** Single chokepoint for GET /og/receipts.svg. */
+function serveOgReceiptsSvg(db: DB, now: Date): {
+  status: number; headers: Record<string, string>; body: string;
+} {
+  return {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: getOgReceiptsSvgCached(db, now),
+  };
+}
+
+/** Single chokepoint for GET /og/calculator.svg. */
+function serveOgCalculatorSvg(db: DB, now: Date): {
+  status: number; headers: Record<string, string>; body: string;
+} {
+  return {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: getOgCalculatorSvgCached(db, now),
+  };
+}
+
+/** Per LESSONS 2026-06-12 "greedy [^>]+id= regex over a <h2 id=...
+ *  data-testid=...>" - every meta tag carries a data-testid so the
+ *  test assertions anchor on it (no greedy `property=` match). */
+type OgSurface = "pulse" | "receipts" | "calculator";
+
+const OG_SURFACE_META: Record<OgSurface, { title: string; description: string }> = {
+  pulse: {
+    title: "fleet pulse - this week",
+    description: "A live weekly card of the operator's fleet: PRs shipped, dollars spent, dollars per PR.",
+  },
+  receipts: {
+    title: "fleet receipts - this month",
+    description: "A live monthly artifact of the operator's fleet: PRs shipped and total spend with a 12-month trailing sparkline.",
+  },
+  calculator: {
+    title: "fleet-control - pre-install ROI calculator",
+    description: "Project how many hours fleet-control saves operators like you per week, with live fleet-median throughput.",
+  },
+};
+
+function ogHostFromRequest(req: any): string {
+  // Derive the host substring from the incoming Host header. Strip
+  // anything that isn't a printable URL character to defeat a
+  // hypothetical malformed-header attack; never compose a shell
+  // string from this value (Hard NO).
+  const raw = String(req.headers?.host ?? "").trim();
+  const safe = raw.replace(/[^A-Za-z0-9.:_-]/g, "");
+  return safe || "127.0.0.1:7070";
+}
+
+/** Compose the og:* / twitter:* meta-tag block for a public page. Each
+ *  meta tag carries a data-testid="og-meta-<key>" anchor per LESSONS
+ *  2026-06-12. The og:image URL is composed from the request Host
+ *  header so a LAN operator's host is picked up automatically. */
+function composeOgMetaTags(surface: OgSurface, req: any): string {
+  const host = ogHostFromRequest(req);
+  const ogUrl = `http://${host}/og/${surface}.svg`;
+  const safeUrl = ogUrl.replace(/[<>"']/g, "");
+  const meta = OG_SURFACE_META[surface];
+  const safeTitle = meta.title.replace(/[<>"']/g, "");
+  const safeDesc = meta.description.replace(/[<>"']/g, "");
+  return `
+<meta property="og:type" content="website" data-testid="og-meta-og-type" />
+<meta property="og:title" content="${safeTitle}" data-testid="og-meta-og-title" />
+<meta property="og:description" content="${safeDesc}" data-testid="og-meta-og-description" />
+<meta property="og:image" content="${safeUrl}" data-testid="og-meta-og-image" />
+<meta property="og:image:width" content="1200" data-testid="og-meta-og-image-width" />
+<meta property="og:image:height" content="630" data-testid="og-meta-og-image-height" />
+<meta name="twitter:card" content="summary_large_image" data-testid="og-meta-twitter-card" />
+<meta name="twitter:image" content="${safeUrl}" data-testid="og-meta-twitter-image" />`;
+}
+
+/** Inject the og:* meta-tag block into an existing rendered HTML page
+ *  immediately before `</head>`. Returns the original body if no head
+ *  tag is found (defence-in-depth - the page renders fine without the
+ *  meta tags, just without the OG card). */
+function injectOgMetaTags(html: string, surface: OgSurface, req: any): string {
+  if (html.indexOf("</head>") < 0) return html;
+  const block = composeOgMetaTags(surface, req);
+  return html.replace("</head>", block + "\n</head>");
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Ticket 0057: public lesson archive — anonymised /lessons-public
 // surface where a stranger Googling a node-sqlite error lands and
 // downloads fleet-control.
@@ -4257,6 +4651,28 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }
+      // Ticket 0061: open-graph image renderers for /pulse, /receipts,
+      // /calculator. Three PUBLIC routes mounted BEFORE the
+      // path.startsWith("/api/") auth gate so a LinkedIn / Twitter /
+      // Bluesky crawler can fetch them without a token. Cache-Control:
+      // max-age=3600 - crawlers re-fetch on share, so a 1h TTL matches
+      // the expected cadence. Content-Type: image/svg+xml. NO <script>
+      // tag in any rendered body. NO operator project slug in any body.
+      if (path === "/og/pulse.svg" && req.method === "GET") {
+        const result = serveOgPulseSvg(db, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      if (path === "/og/receipts.svg" && req.method === "GET") {
+        const result = serveOgReceiptsSvg(db, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      if (path === "/og/calculator.svg" && req.method === "GET") {
+        const result = serveOgCalculatorSvg(db, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
       // Ticket 0057: public lesson archive JSON. PUBLIC — no auth,
       // no loopback gate (the URL IS the bookmark shape). Handled
       // BEFORE the `path.startsWith("/api/")` auth gate so a remote
@@ -5252,8 +5668,13 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       const rm = path.match(/^\/receipts\/([\w-]+)\/(\d{4}-\d{2})$/);
       if (rm && req.method === "GET") {
         const result = getReceiptsCached(db, rm[1], rm[2]);
+        // Ticket 0061: inject og:* / twitter:* meta tags so a feed
+        // crawler picks the fleet-level /og/receipts.svg card on share.
+        const bodyWithOg = result.status === 200
+          ? injectOgMetaTags(result.body, "receipts", req)
+          : result.body;
         res.writeHead(result.status, result.headers);
-        return res.end(result.body);
+        return res.end(bodyWithOg);
       }
       // Ticket 0051: pre-install ROI calculator HTML page.
       // GET /calculator renders a self-contained single-column HTML
@@ -5270,11 +5691,14 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         const parsed = parseCalculatorParams(url);
         const median = getMedianProjectionCached(db, new Date(), 90, "p25");
         const body = renderCalculatorPage(parsed, median);
+        // Ticket 0061: inject og:* / twitter:* meta tags so a feed
+        // crawler picks the fleet-level /og/calculator.svg card.
+        const bodyWithOg = injectOgMetaTags(body, "calculator", req);
         res.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
           "cache-control": "public, max-age=300",
         });
-        return res.end(body);
+        return res.end(bodyWithOg);
       }
       // Ticket 0050: fleet year-in-review HTML page. Self-contained
       // single-column document (no external JS — the SPA does NOT
@@ -5313,8 +5737,13 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       // shares the same no-auth posture as this HTML route.
       if (path === "/pulse" && req.method === "GET") {
         const result = servePulsePage(db, cfg, new Date());
+        // Ticket 0061: inject og:* / twitter:* meta tags so a feed
+        // crawler picks the fleet-level /og/pulse.svg card on paste.
+        const bodyWithOg = result.status === 200
+          ? injectOgMetaTags(result.body, "pulse", req)
+          : result.body;
         res.writeHead(result.status, result.headers);
-        return res.end(result.body);
+        return res.end(bodyWithOg);
       }
       // Ticket 0057: public lesson archive — index + permalink HTML.
       // PUBLIC — no auth, no loopback gate (the URL IS the bookmark
