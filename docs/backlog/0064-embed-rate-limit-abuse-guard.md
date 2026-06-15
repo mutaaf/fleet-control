@@ -1,7 +1,7 @@
 ---
 id: 0064
 title: Embed rate-limit + abuse guard - per-IP token bucket on the public /embed/* and /og/* routes so a popular blog paste does not starve the operator's own loopback portal
-status: groomed
+status: in-progress
 priority: P2
 area: infra
 created: 2026-06-15
@@ -485,4 +485,30 @@ no cycle risk.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15 — implementation-dev: opened feat/0064 branch.
+  Marked status: in-progress. Plan:
+  1. New `src/rate_limit.ts` exporting `checkRateLimit(ip, now, opts?)`,
+     test seams `_checkRateLimitForTests`, `_resetRateLimitBucketsForTests`,
+     `_getRateLimitBucketsForTests`. Bucket map lives on
+     `globalThis.__fleet_rate_limit_buckets__` (per LESSONS 2026-06-05).
+  2. Reuse existing `isLoopback(req)` IP set from `src/server.ts`:
+     the same `127.0.0.1`/`::1`/`::ffff:127.0.0.1` set is the
+     loopback-exemption surface here. The middleware module exposes a
+     pure `LOOPBACK_IPS` set so the call site that has only an IP
+     string (not a req) can exempt without re-walking the auth gate.
+  3. Wire the middleware at the TOP of the request handler in
+     `src/server.ts`, BEFORE the `if (path.startsWith("/api/"))` auth
+     gate, gated on `path.startsWith("/embed/") || path.startsWith("/og/")
+     || path.startsWith("/share/")`.
+  4. New optional `embedRateLimit: { tokensPerMinute?: number,
+     burst?: number }` in `src/config.ts`. Defaulting pattern matches
+     `embedOrigins` (omitted = defaults applied; downstream consumers
+     read with `?? DEFAULT`).
+  5. New `/api/admin/rate-limit-state` route: auth-required, value-side
+     redacts IP strings via the existing token-shape redactor pattern
+     per LESSONS 2026-06-10.
+  6. New doctor check "rate-limit middleware wired" hitting
+     `/embed/pulse.html` via the existing `deps.fetchUrl` 5 times in
+     the loopback context.
+  7. Stale-bucket cleanup runs inline on every check (sweep entries
+     idle >24h). No timers.
