@@ -1,7 +1,7 @@
 ---
 id: 0061
 title: Open-graph image renderer for /pulse /receipts /calculator - every paste on LinkedIn / Twitter / Bluesky becomes a live rendered card so the share itself is the impression
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-15
@@ -414,3 +414,12 @@ per the existing `src/ingest/prs.ts` writer. Per LESSONS 2026-06-07 "the
   `globalThis.__fleet_og_invalidate__` per LESSONS 2026-06-05; any
   helper needs from views.ts get inlined per LESSONS 2026-06-13 to
   avoid the function-import cycle.
+- 2026-06-15 — shipped via PR #145 (squash-merged on
+  `feat/0061-og-image-public-pages`). 20 OG tests green; full suite
+  shows no NEW red on this branch (pre-existing welcome / pair /
+  pulse / digest failures from the 2026-05-29 time-pin lesson are
+  unrelated and remain). Three new public routes are live:
+  `/og/pulse.svg`, `/og/receipts.svg`, `/og/calculator.svg`;
+  `/pulse`, `/receipts/<slug>/<month>`, `/calculator` now grow a
+  `<head>` block with the six og:* / twitter:* meta tags and a
+  Host-derived og:image URL.
