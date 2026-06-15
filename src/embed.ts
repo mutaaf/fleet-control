@@ -35,6 +35,9 @@
 // so test files never need to mutate the cwd config.
 
 import type { FleetWeeklyPulse } from "./views.ts";
+import { readFileSync, statSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // ────────────────────────────────────────────────────────────────────
 // Constants
@@ -343,44 +346,86 @@ export function composeEmbedSnippets(host: string): EmbedSnippetTriple {
   };
 }
 
-/** Render the authenticated /share HTML page. The page surfaces the
- *  three copy-pastable snippets plus a copy-to-clipboard button per
- *  snippet (testids per the AC). */
+/** Render the authenticated /share HTML page. The page surfaces TWO
+ *  embed-snippet sections (per ticket 0063 — pulse + lessons), each
+ *  carrying three copy-pastable shapes (iframe / img / markdown) with
+ *  per-snippet copy-to-clipboard buttons.
+ *
+ *  Per LESSONS 2026-06-12 "greedy [^>]+id= regex over a <h2 id="..."
+ *  data-testid="...">" — every button + snippet anchor uses a
+ *  data-testid attribute with a distinctive prefix
+ *  (embed-snippet-<kind> for the pulse section, embed-lessons-snippet-
+ *  <kind> for the lessons section). The click handler reads the
+ *  target snippet's testid off the button's data-snippet-target
+ *  attribute so the same script powers BOTH sections without a
+ *  per-section special-case. */
 export function renderSharePage(host: string): string {
-  const snippets = composeEmbedSnippets(host);
-  const iframeSnippet = escEmbed(snippets.iframe);
-  const imgSnippet = escEmbed(snippets.img);
-  const mdSnippet = escEmbed(snippets.markdown);
+  const pulse = composeEmbedSnippets(host);
+  const lessons = composeEmbedLessonsSnippets(host);
+  const pulseIframe = escEmbed(pulse.iframe);
+  const pulseImg = escEmbed(pulse.img);
+  const pulseMd = escEmbed(pulse.markdown);
+  const lessonsIframe = escEmbed(lessons.iframe);
+  const lessonsImg = escEmbed(lessons.img);
+  const lessonsMd = escEmbed(lessons.markdown);
 
   const body = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>fleet-control — embed your pulse</title>
+<title>fleet-control — embed your fleet</title>
 <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
 <main class="share-embed-main">
-  <h1 class="share-embed-headline">Embed your fleet pulse</h1>
-  <p class="share-embed-intro">Paste one snippet into your blog, README, or LinkedIn feature. The widget renders the same numbers as <a href="/pulse">/pulse</a> and refreshes itself every 5 minutes.</p>
+  <h1 class="share-embed-headline">Embed your fleet</h1>
+  <p class="share-embed-intro">Paste one snippet into your blog, README, or LinkedIn feature. Both widgets render live data — the pulse refreshes every 5 minutes, the lesson rotates once per UTC day.</p>
 
-  <section class="share-embed-section">
-    <h2>iframe (any HTML surface)</h2>
-    <pre class="share-embed-snippet" data-testid="embed-snippet-iframe">${iframeSnippet}</pre>
-    <button type="button" class="share-embed-copy" data-testid="embed-copy-iframe" data-snippet-kind="iframe">copy</button>
+  <section class="share-embed-pulse" data-testid="embed-pulse-section">
+    <h2 class="share-embed-section-headline">Embed your fleet pulse</h2>
+    <p class="share-embed-intro">The widget renders the same numbers as <a href="/pulse">/pulse</a>.</p>
+
+    <section class="share-embed-section">
+      <h2>iframe (any HTML surface)</h2>
+      <pre class="share-embed-snippet" data-testid="embed-snippet-iframe">${pulseIframe}</pre>
+      <button type="button" class="share-embed-copy" data-testid="embed-copy-iframe" data-snippet-target="embed-snippet-iframe">copy</button>
+    </section>
+
+    <section class="share-embed-section">
+      <h2>img (GitHub README, surfaces that strip iframes)</h2>
+      <pre class="share-embed-snippet" data-testid="embed-snippet-img">${pulseImg}</pre>
+      <button type="button" class="share-embed-copy" data-testid="embed-copy-img" data-snippet-target="embed-snippet-img">copy</button>
+    </section>
+
+    <section class="share-embed-section">
+      <h2>markdown</h2>
+      <pre class="share-embed-snippet" data-testid="embed-snippet-markdown">${pulseMd}</pre>
+      <button type="button" class="share-embed-copy" data-testid="embed-copy-markdown" data-snippet-target="embed-snippet-markdown">copy</button>
+    </section>
   </section>
 
-  <section class="share-embed-section">
-    <h2>img (GitHub README, surfaces that strip iframes)</h2>
-    <pre class="share-embed-snippet" data-testid="embed-snippet-img">${imgSnippet}</pre>
-    <button type="button" class="share-embed-copy" data-testid="embed-copy-img" data-snippet-kind="img">copy</button>
-  </section>
+  <section class="share-embed-lessons" data-testid="embed-lessons-section">
+    <h2 class="share-embed-section-headline">Embed today's lesson</h2>
+    <p class="share-embed-intro">Rotates one cross-fleet operational lesson each UTC day. Same one-line paste shape as the pulse widget.</p>
 
-  <section class="share-embed-section">
-    <h2>markdown</h2>
-    <pre class="share-embed-snippet" data-testid="embed-snippet-markdown">${mdSnippet}</pre>
-    <button type="button" class="share-embed-copy" data-testid="embed-copy-markdown" data-snippet-kind="markdown">copy</button>
+    <section class="share-embed-section">
+      <h2>iframe (any HTML surface)</h2>
+      <pre class="share-embed-snippet" data-testid="embed-lessons-snippet-iframe">${lessonsIframe}</pre>
+      <button type="button" class="share-embed-copy" data-testid="embed-lessons-copy-iframe" data-snippet-target="embed-lessons-snippet-iframe">copy</button>
+    </section>
+
+    <section class="share-embed-section">
+      <h2>img (GitHub README, surfaces that strip iframes)</h2>
+      <pre class="share-embed-snippet" data-testid="embed-lessons-snippet-img">${lessonsImg}</pre>
+      <button type="button" class="share-embed-copy" data-testid="embed-lessons-copy-img" data-snippet-target="embed-lessons-snippet-img">copy</button>
+    </section>
+
+    <section class="share-embed-section">
+      <h2>markdown</h2>
+      <pre class="share-embed-snippet" data-testid="embed-lessons-snippet-markdown">${lessonsMd}</pre>
+      <button type="button" class="share-embed-copy" data-testid="embed-lessons-copy-markdown" data-snippet-target="embed-lessons-snippet-markdown">copy</button>
+    </section>
   </section>
 </main>
 <script>
@@ -389,8 +434,9 @@ export function renderSharePage(host: string): string {
     for (var i = 0; i < btns.length; i++) {
       btns[i].addEventListener("click", function (ev) {
         var btn = ev.currentTarget;
-        var kind = btn.getAttribute("data-snippet-kind");
-        var pre = document.querySelector('[data-testid="embed-snippet-' + kind + '"]');
+        var target = btn.getAttribute("data-snippet-target");
+        if (!target) return;
+        var pre = document.querySelector('[data-testid="' + target + '"]');
         if (!pre) return;
         var text = pre.textContent || "";
         if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -410,4 +456,487 @@ export function renderSharePage(host: string): string {
 
 export function _renderSharePageForTests(host: string): string {
   return renderSharePage(host);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0063 — Embeddable lesson-of-the-day widget.
+//
+// Two embeddable artifacts (sibling to the 0060 pulse embed):
+//
+//   1. A 320x200 self-contained HTML page served at /embed/lessons.html
+//      (loaded inside an iframe on an operator's personal blog).
+//      NO script tags. NO operator project slug after anonymisation.
+//      CSS is inlined so the iframe needs zero extra HTTP requests.
+//   2. A 320x200 hand-rolled SVG served at /embed/lessons.svg (loaded
+//      as an img on surfaces like GitHub READMEs that strip iframes).
+//      Hand-rolled per the 0015 + 0060 precedent — no template engine,
+//      no new dependency.
+//
+// Both artifacts surface the SAME rotating lesson: today's title, a
+// two-line excerpt, the cadence date, and a footer CTA back to the
+// fleet-control project page. The rotation cadence is deterministic on
+// the UTC day: dayIndex = floor(epoch_ms / 86_400_000) modulo the
+// lessons-count, so two readers on the same UTC day see the same card
+// and adjacent days see different cards.
+//
+// Why this module owns the helper instead of importing lessonOfTheDay
+// from src/lessons.ts: per LESSONS 2026-06-13 "function-import cycles
+// aren't always cache-invalidation; sometimes the cheapest fix is a
+// 6-line inline copy of the helper" the embed module avoids any new
+// import edge to src/lessons.ts (which already imports from
+// src/views.ts; src/embed.ts already imports a TYPE from src/views.ts).
+// The embed rotation is simpler than 0055's savings-weighted rotation
+// anyway — it's an equal-weight modulo over every dated lesson, so
+// inlining the 25-line parser-reader + selector + anonymiser is the
+// right scale tradeoff.
+//
+// Per LESSONS 2026-06-11 "startServer() tests that mutate fleet-
+// control.config.json race against parallel test files; expose a
+// renderer-direct seam for branch tests" the per-AC branches drive
+// the renderer through buildEmbedLessonsPayloadForTests +
+// _renderEmbedLessonsHtmlForTests + _renderEmbedLessonsSvgForTests —
+// no cwd config mutation.
+//
+// Per LESSONS section "no backticks inside template-literal SQL/HTML
+// strings": every backtick inside this module's template literals
+// quotes plain HTML or SVG text — no embedded SQL identifiers in
+// backticks (and the leading comment block uses plain prose so a
+// neighbouring slice-and-grep test on lessonSavingsRollup can't poison
+// itself by walking 4000 chars past that helper into ours).
+// ────────────────────────────────────────────────────────────────────
+
+/** Default lessons file path. Mirrors src/lessons.ts defaultLessonsPath
+ *  exactly — env override is `FLEET_CROSS_LESSONS_PATH`. Inlined here
+ *  per LESSONS 2026-06-13 (avoid the back-edge import). */
+function embedLessonsPath(): string {
+  const override = process.env["FLEET_CROSS_LESSONS_PATH"];
+  if (override) return override;
+  return join(homedir(), ".local", "share", "agent-fleet", "CROSS_LESSONS.md");
+}
+
+/** Max file size we'll read. Mirrors src/lessons.ts MAX_FILE_BYTES. */
+const EMBED_LESSONS_MAX_BYTES = 2 * 1024 * 1024;
+
+/** Minimum dated-lesson count below which the embed renders the honest
+ *  empty state. Per the AC: "when the LESSONS.md file has fewer than
+ *  3 lessons total ... the embed renders 'fleet is still learning'". */
+export const EMBED_LESSONS_MIN_LESSONS = 3;
+
+/** Embed dimensions per the spec. */
+export const EMBED_LESSONS_WIDTH = 320;
+export const EMBED_LESSONS_HEIGHT = 200;
+
+/** Maximum excerpt length so the two-line layout stays predictable. */
+const EMBED_LESSONS_EXCERPT_CHARS = 140;
+
+/** A single dated lesson record. Mirrors the lessons.ts entry shape
+ *  for the fields we need (slug = parent project header, date + title +
+ *  body = the entry). Inlined per LESSONS 2026-06-13. */
+interface EmbedLessonRecord {
+  slug: string;
+  date: string;
+  title: string;
+  body: string;
+}
+
+/** Parse the lessons markdown text into a flat list of dated entries.
+ *  Mirrors the H2 + H3 + bullet structure that src/lessons.ts
+ *  parseCrossLessons handles but only emits dated H3 + bullet entries
+ *  (undated entries can't anchor a stable rotation slot). Pure-string
+ *  operation. */
+function parseEmbedLessons(text: string): EmbedLessonRecord[] {
+  const out: EmbedLessonRecord[] = [];
+  const lines = text.split(/\r?\n/);
+  let currentSlug: string | null = null;
+  let pending: EmbedLessonRecord | null = null;
+  let bodyBuf: string[] = [];
+
+  const flush = () => {
+    if (pending) {
+      pending.body = bodyBuf.join("\n").trim();
+      out.push(pending);
+    }
+    pending = null;
+    bodyBuf = [];
+  };
+
+  const H2 = /^##\s+(.+?)\s*$/;
+  const H3_DATED = /^###\s+(\d{4}-\d{2}-\d{2})\s*[—-]\s*(.+?)\s*$/;
+  const H3_UNDATED = /^###\s+(.+?)\s*$/;
+  const BULLET = /^-\s+(\d{4}-\d{2}-\d{2})\s+(?:\[[^\]]*\]\s+)?(.+?)\s*$/;
+
+  for (const line of lines) {
+    const h2 = line.match(H2);
+    if (h2) {
+      flush();
+      currentSlug = h2[1].trim();
+      continue;
+    }
+    if (!currentSlug) continue;
+    const h3d = line.match(H3_DATED);
+    if (h3d) {
+      flush();
+      pending = { slug: currentSlug, date: h3d[1], title: h3d[2].trim(), body: "" };
+      continue;
+    }
+    const h3u = line.match(H3_UNDATED);
+    if (h3u) {
+      flush();
+      // The bare "### Entries" header is a structural marker, not an
+      // entry. Bullets that follow become bullet-kind entries.
+      pending = null;
+      continue;
+    }
+    const b = line.match(BULLET);
+    if (b) {
+      flush();
+      out.push({ slug: currentSlug, date: b[1], title: b[2].trim(), body: "" });
+      continue;
+    }
+    if (pending) bodyBuf.push(line);
+  }
+  flush();
+  return out;
+}
+
+/** Read + parse the lessons file, returning [] when missing / oversized.
+ *  Pure-fs (no shell-out). */
+function readEmbedLessons(): EmbedLessonRecord[] {
+  const path = embedLessonsPath();
+  if (!existsSync(path)) return [];
+  let size = 0;
+  try {
+    size = statSync(path).size;
+  } catch { return []; }
+  if (size > EMBED_LESSONS_MAX_BYTES) return [];
+  let text = "";
+  try {
+    text = readFileSync(path, "utf8");
+  } catch { return []; }
+  return parseEmbedLessons(text);
+}
+
+/** Lightweight anonymisation pass on a lesson excerpt. Mirrors a tiny
+ *  subset of src/lessons.ts anonymiseLessonBody (operator paths,
+ *  branches, GitHub URLs, custom operator slugs) so the embed body
+ *  never leaks operator-identifying strings. Inlined per LESSONS
+ *  2026-06-13. */
+function anonymiseEmbedExcerpt(body: string): string {
+  let out = String(body ?? "");
+  // 1. Absolute filesystem paths under /Users/ or /home/ → <path>.
+  out = out.replace(/\/(?:Users|home)\/[^\s,;)\]]+/g, "<path>");
+  // 2. Agent branch names (feat/, chore/, eng/) → <branch>.
+  out = out.replace(/\b(?:feat|chore|eng)\/[A-Za-z0-9/_.-]+/g, "<branch>");
+  // 3. GitHub PR / repo URLs → <pr-url>. The fleet-control CTA link
+  //    survives because we never anonymise the rendered CTA href —
+  //    only the lesson body that flows through this helper.
+  out = out.replace(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(?:\/[\w./-]*)?/g, "<pr-url>");
+  // 4. Operator-style slugs of the shape "<word>-<word>-<word>" where
+  //    the operator's project namespace shows up. The 0057 helper does
+  //    a strict alias-map lookup; here we approximate by collapsing
+  //    any non-public lower-kebab slug carrying a clearly-operator
+  //    token (a 3+ word kebab name that does NOT begin with one of
+  //    the well-known public anchors). This is conservative — false
+  //    positives just render the public placeholder, which is the
+  //    right side of the leak/over-redact tradeoff for a public
+  //    embed surface.
+  out = out.replace(/\b(?!agent-fleet\b|fleet-control\b)[a-z][a-z0-9]+(?:-[a-z0-9]+){2,}\b/g, "<project>");
+  // 5. Ticket-id references → "an agent ticket".
+  out = out.replace(/\bticket\s+\d{3,5}\b/gi, "an agent ticket");
+  return out;
+}
+
+/** Build the first-sentence excerpt clipped to EMBED_LESSONS_EXCERPT_CHARS.
+ *  Walks back to a word boundary so we don't slice mid-word. */
+function buildEmbedExcerpt(body: string): string {
+  const text = String(body ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const firstSentenceMatch = text.match(/^[^.\n!?]+[.!?]?/);
+  const firstSentence = firstSentenceMatch ? firstSentenceMatch[0].trim() : text;
+  if (firstSentence.length <= EMBED_LESSONS_EXCERPT_CHARS) return firstSentence;
+  const clipped = firstSentence.slice(0, EMBED_LESSONS_EXCERPT_CHARS);
+  const lastSpace = clipped.lastIndexOf(" ");
+  if (lastSpace > 0) return clipped.slice(0, lastSpace) + "…";
+  return clipped + "…";
+}
+
+/** Sort lessons deterministically: by date ASC, then by slug ASC, then
+ *  by title ASC — so the rotation slot is stable across operators with
+ *  the same lessons file. Pure ordering helper. */
+function sortEmbedLessons(records: EmbedLessonRecord[]): EmbedLessonRecord[] {
+  return records.slice().sort((a, b) => {
+    if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+    if (a.slug !== b.slug) return a.slug < b.slug ? -1 : 1;
+    if (a.title !== b.title) return a.title < b.title ? -1 : 1;
+    return 0;
+  });
+}
+
+export interface LessonEmbedPayloadLesson {
+  kind: "lesson";
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  lesson_excerpt: string;
+  rotation_day_index: number;
+  total_lessons_indexed: number;
+}
+
+export interface LessonEmbedPayloadEmpty {
+  kind: "empty";
+  reason: "no-lessons" | "below-threshold";
+  total_lessons_indexed: number;
+  rotation_day_index: number;
+}
+
+export type LessonEmbedPayload = LessonEmbedPayloadLesson | LessonEmbedPayloadEmpty;
+
+export interface BuildEmbedLessonsOptions {
+  /** Pin the rotation day. Defaults to new Date(). Tests MUST pass
+   *  this per LESSONS 2026-05-29 "time-pinned tests must NOT derive
+   *  seed timestamps from new Date()". */
+  now?: Date;
+}
+
+/** Build the deterministic embed payload for the given UTC day anchor.
+ *  Reads the lessons file via readEmbedLessons(), drops undated rows
+ *  (parser already only emits dated), enforces the >= EMBED_LESSONS_
+ *  MIN_LESSONS gate, and picks `sorted[dayIndex mod sorted.length]`.
+ *  The excerpt is anonymised via anonymiseEmbedExcerpt before the
+ *  payload is returned so EVERY downstream renderer (HTML + SVG) sees
+ *  the already-scrubbed text — a per-value scrub at the renderer
+ *  boundary per LESSONS 2026-06-10 "redactSecrets on a JSON body
+ *  shreds your KEYS, not just your values". */
+export function buildEmbedLessonsPayload(opts: BuildEmbedLessonsOptions = {}): LessonEmbedPayload {
+  const now = opts.now ?? new Date();
+  const dayIndex = Math.floor(now.getTime() / 86_400_000);
+  const records = readEmbedLessons();
+  if (records.length < EMBED_LESSONS_MIN_LESSONS) {
+    return {
+      kind: "empty",
+      reason: records.length === 0 ? "no-lessons" : "below-threshold",
+      total_lessons_indexed: records.length,
+      rotation_day_index: dayIndex,
+    };
+  }
+  const sorted = sortEmbedLessons(records);
+  const slot = ((dayIndex % sorted.length) + sorted.length) % sorted.length;
+  const pick = sorted[slot];
+  return {
+    kind: "lesson",
+    lesson_slug: pick.slug,
+    lesson_date: pick.date,
+    lesson_title: anonymiseEmbedExcerpt(pick.title),
+    lesson_excerpt: anonymiseEmbedExcerpt(buildEmbedExcerpt(pick.body || pick.title)),
+    rotation_day_index: dayIndex,
+    total_lessons_indexed: records.length,
+  };
+}
+
+/** Test-only handle. Per LESSONS 2026-06-11 the per-AC branches drive
+ *  this directly so we never need to boot startServer + plant a cwd
+ *  config file. */
+export function buildEmbedLessonsPayloadForTests(now: Date): LessonEmbedPayload {
+  return buildEmbedLessonsPayload({ now });
+}
+
+/** Read the lessons file's (mtime, size) without parsing — the server-
+ *  side cache uses this pair as part of the invalidation tuple so a
+ *  freshly-edited LESSONS.md busts the cache on the next request. */
+export function embedLessonsFileTuple(): { mtime_ms: number; size: number; exists: boolean } {
+  const path = embedLessonsPath();
+  if (!existsSync(path)) return { mtime_ms: 0, size: 0, exists: false };
+  try {
+    const st = statSync(path);
+    return { mtime_ms: st.mtimeMs, size: st.size, exists: true };
+  } catch {
+    return { mtime_ms: 0, size: 0, exists: false };
+  }
+}
+
+/** Render the self-contained 320x200 HTML embed page. NO script tags.
+ *  CSS inlined. The lesson title + excerpt are already anonymised by
+ *  buildEmbedLessonsPayload; the final HTML body still passes through
+ *  redactSecretsForEmbed at the boundary so a hypothetical upstream
+ *  token-shape leak never reaches the rendered card. */
+export function renderEmbedLessonsHtml(p: LessonEmbedPayload): string {
+  const ctaHref = EMBED_CTA_HREF;
+  const ctaLabel = escEmbed(EMBED_CTA_LABEL);
+
+  if (p.kind === "empty") {
+    const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fleet lesson</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0E0F0D; color: #E8E2D4;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .embed-card { box-sizing: border-box; width: 100%; height: 100vh;
+    display: flex; flex-direction: column; padding: 14px 16px; gap: 8px; }
+  .embed-eyebrow { font-size: 10px; color: #807a6c; }
+  .embed-empty { font-size: 14px; color: #E8E2D4; flex: 1; display: flex;
+    align-items: center; }
+  .embed-foot { font-size: 10px; }
+  .embed-foot a { color: #c0823c; text-decoration: none; }
+</style>
+</head>
+<body>
+<main class="embed-card">
+  <div class="embed-eyebrow">fleet lesson</div>
+  <div class="embed-empty" data-testid="embed-lessons-empty">fleet is still learning — no lessons yet</div>
+  <div class="embed-foot"><a data-testid="embed-lessons-cta" href="${ctaHref}" target="_blank" rel="noopener">${ctaLabel}</a></div>
+</main>
+</body>
+</html>`;
+    return redactSecretsForEmbed(body);
+  }
+
+  const title = escEmbed(p.lesson_title);
+  const excerpt = escEmbed(p.lesson_excerpt);
+  const date = escEmbed(p.lesson_date);
+
+  const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fleet lesson</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0E0F0D; color: #E8E2D4;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
+  .embed-card { box-sizing: border-box; width: 100%; height: 100vh;
+    display: flex; flex-direction: column; padding: 14px 16px; gap: 6px;
+    overflow: hidden; }
+  .embed-eyebrow { font-size: 10px; color: #807a6c; text-transform: lowercase; }
+  .embed-title { font-size: 14px; font-weight: 700; line-height: 1.25;
+    color: #E8E2D4; margin: 0; max-height: 2.5em; overflow: hidden;
+    text-overflow: ellipsis; display: -webkit-box;
+    -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .embed-excerpt { font-size: 11px; line-height: 1.35; color: #c8c2b4;
+    flex: 1; overflow: hidden; max-height: 4em;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    text-overflow: ellipsis; }
+  .embed-foot { font-size: 10px; display: flex; justify-content: space-between;
+    align-items: center; color: #807a6c; }
+  .embed-foot a { color: #c0823c; text-decoration: none; }
+</style>
+</head>
+<body>
+<main class="embed-card">
+  <div class="embed-eyebrow">fleet lesson · <span data-testid="embed-lessons-date">${date}</span></div>
+  <h1 class="embed-title" data-testid="embed-lessons-title">${title}</h1>
+  <p class="embed-excerpt" data-testid="embed-lessons-excerpt">${excerpt}</p>
+  <div class="embed-foot"><a data-testid="embed-lessons-cta" href="${ctaHref}" target="_blank" rel="noopener">${ctaLabel}</a></div>
+</main>
+</body>
+</html>`;
+  return redactSecretsForEmbed(body);
+}
+
+export function _renderEmbedLessonsHtmlForTests(p: LessonEmbedPayload): string {
+  return renderEmbedLessonsHtml(p);
+}
+
+/** Render the self-contained 320x200 SVG embed. Hand-rolled per the
+ *  0015 + 0060 precedent — string concatenation, no template engine. */
+export function renderEmbedLessonsSvg(p: LessonEmbedPayload): string {
+  const w = EMBED_LESSONS_WIDTH;
+  const h = EMBED_LESSONS_HEIGHT;
+
+  if (p.kind === "empty") {
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="fleet lesson — still learning">`
+      + `<rect width="100%" height="100%" fill="#0E0F0D"/>`
+      + `<text x="16" y="24" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="10">fleet lesson</text>`
+      + `<text x="16" y="${Math.floor(h / 2) + 4}" fill="#E8E2D4" font-family="ui-monospace,Menlo,monospace" font-size="13" data-testid="embed-lessons-empty">fleet is still learning — no lessons yet</text>`
+      + `<a href="${EMBED_CTA_HREF}" target="_blank">`
+      + `<text x="16" y="${h - 14}" fill="#c0823c" font-family="ui-monospace,Menlo,monospace" font-size="10" data-testid="embed-lessons-cta">${escEmbed(EMBED_CTA_LABEL)}</text>`
+      + `</a>`
+      + `</svg>`;
+  }
+
+  const title = escEmbed(p.lesson_title);
+  const excerpt = escEmbed(p.lesson_excerpt);
+  const date = escEmbed(p.lesson_date);
+
+  // Wrap the title across up to two lines and the excerpt across up to
+  // two lines so the 320x200 frame stays readable. We do this with a
+  // tiny word-wrap helper rather than relying on browser text-anchor
+  // behaviour (SVG has none).
+  const titleLines = wrapForSvg(title, 38, 2);
+  const excerptLines = wrapForSvg(excerpt, 50, 2);
+
+  const titleY0 = 56;
+  const titleLineH = 18;
+  const excerptY0 = titleY0 + titleLines.length * titleLineH + 12;
+  const excerptLineH = 14;
+
+  const titleTexts = titleLines.map((line, i) =>
+    `<text x="16" y="${titleY0 + i * titleLineH}" fill="#E8E2D4" font-family="ui-monospace,Menlo,monospace" font-size="14" font-weight="700"${i === 0 ? ` data-testid="embed-lessons-title"` : ""}>${line}</text>`
+  ).join("");
+  const excerptTexts = excerptLines.map((line, i) =>
+    `<text x="16" y="${excerptY0 + i * excerptLineH}" fill="#c8c2b4" font-family="ui-monospace,Menlo,monospace" font-size="11"${i === 0 ? ` data-testid="embed-lessons-excerpt"` : ""}>${line}</text>`
+  ).join("");
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="fleet lesson">`
+    + `<rect width="100%" height="100%" fill="#0E0F0D"/>`
+    + `<text x="16" y="24" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="10">fleet lesson</text>`
+    + `<text x="16" y="38" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="10" data-testid="embed-lessons-date">${date}</text>`
+    + titleTexts
+    + excerptTexts
+    + `<a href="${EMBED_CTA_HREF}" target="_blank">`
+    + `<text x="16" y="${h - 14}" fill="#c0823c" font-family="ui-monospace,Menlo,monospace" font-size="10" data-testid="embed-lessons-cta">${escEmbed(EMBED_CTA_LABEL)}</text>`
+    + `</a>`
+    + `</svg>`;
+}
+
+export function _renderEmbedLessonsSvgForTests(p: LessonEmbedPayload): string {
+  return renderEmbedLessonsSvg(p);
+}
+
+/** Word-wrap a single line into at most `maxLines` lines, each at most
+ *  `maxChars` chars. Trailing tokens that overflow get an ellipsis. */
+function wrapForSvg(text: string, maxChars: number, maxLines: number): string[] {
+  const words = String(text ?? "").split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let current = "";
+  for (const w of words) {
+    if (lines.length === maxLines - 1) {
+      // Last line — accumulate until adding the next word would overflow.
+      const candidate = current ? current + " " + w : w;
+      if (candidate.length <= maxChars) {
+        current = candidate;
+      } else {
+        // Truncate with ellipsis.
+        const room = maxChars - current.length - 1;
+        if (room > 1) current = current + " " + w.slice(0, room - 1) + "…";
+        else current = current + "…";
+        lines.push(current);
+        return lines;
+      }
+      continue;
+    }
+    const candidate = current ? current + " " + w : w;
+    if (candidate.length <= maxChars) {
+      current = candidate;
+    } else {
+      if (current) lines.push(current);
+      current = w;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+/** Compose the three copy-pastable lesson-embed snippets for the
+ *  /share page. Same shape as composeEmbedSnippets but pointing at
+ *  /embed/lessons.* instead of /embed/pulse.*. */
+export function composeEmbedLessonsSnippets(host: string): EmbedSnippetTriple {
+  const safeHost = String(host ?? "").replace(/["'<>]/g, "");
+  return {
+    iframe: `<iframe src="${safeHost}/embed/lessons.html" width="${EMBED_LESSONS_WIDTH}" height="${EMBED_LESSONS_HEIGHT}" frameborder="0" title="fleet-control lesson of the day"></iframe>`,
+    img: `<a href="${safeHost}/lessons-public"><img src="${safeHost}/embed/lessons.svg" alt="fleet lesson" width="${EMBED_LESSONS_WIDTH}" height="${EMBED_LESSONS_HEIGHT}"/></a>`,
+    markdown: `[![fleet lesson](${safeHost}/embed/lessons.svg)](${safeHost}/lessons-public)`,
+  };
 }
