@@ -62,6 +62,22 @@ import {
   monthlyRetroCard, isMonthlyRetroDay, monthLabelFor,
   type MonthlyRetroResult, type MonthlyRetroPayload,
 } from "./retro.ts";
+// Ticket 0064: per-IP token-bucket rate limiter on the public surfaces.
+// Pure module - no SQL, no shell-out. The middleware runs BEFORE the
+// /api/ auth gate so a misbehaving crawler is short-circuited to 429
+// before any helper executes. Loopback callers are exempt via the same
+// IP set the existing isLoopback(req) helper above uses.
+import {
+  checkRateLimit, render429, isRateLimitedPath,
+  renderRateLimitState, resolveRateLimitOpts,
+  // Re-export the test seams so tests/rate-limit.test.ts can drive the
+  // module-level bucket map without re-importing from the underlying
+  // helper (production routes through these too).
+  _resetRateLimitBucketsForTests,
+  _getRateLimitBucketsForTests,
+} from "./rate_limit.ts";
+// Re-export so the test files import a single chokepoint.
+export { _resetRateLimitBucketsForTests, _getRateLimitBucketsForTests };
 
 const CONFIG_FILE = join(process.cwd(), "fleet-control.config.json");
 
@@ -4800,6 +4816,26 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
     const path = url.pathname;
     try {
+      // Ticket 0064: per-IP rate limit on the PUBLIC /embed/, /og/,
+      // /share/ surfaces. Runs BEFORE every other route (including the
+      // /api/ auth gate further down) so a misbehaving crawler is
+      // short-circuited to 429 before any helper runs. Loopback callers
+      // hit the LOOPBACK_IPS exemption inside checkRateLimit() so the
+      // operator's own portal is never throttled. The path-prefix gate
+      // means /api/, /, and every other route incur zero overhead.
+      if (isRateLimitedPath(path)) {
+        const ip = String(req.socket?.remoteAddress ?? "");
+        const result = checkRateLimit(ip, new Date());
+        if (!result.allowed) {
+          // SVG-typed paths get an SVG 429 so an img-tag embedder shows
+          // the throttle message inline (no broken-image icon). HTML
+          // and /share/ paths get an HTML 429.
+          const kind = path.endsWith(".svg") ? "svg" : "html";
+          const r429 = render429(kind, result.retryAfterSec ?? 1);
+          res.writeHead(r429.status, r429.headers);
+          return res.end(r429.body);
+        }
+      }
       // Ticket 0062: monthly fleet retro card dismissal. Sits BEFORE
       // the /api/control/<verb> dispatcher so the verb dispatcher's
       // doAction()-based handler doesn't 400 on an "unknown action"
@@ -5120,6 +5156,22 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         const rauth = requireAuth(db, req, "read", url);
         if (!rauth.ok) return json(res, { error: rauth.message }, rauth.status);
         maybeIngest(db, cfg);
+        // Ticket 0064: admin diagnostic endpoint for the rate-limit
+        // bucket state. AUTH-required already by virtue of sitting
+        // inside this branch (loopback bypasses; remote requires
+        // x-fleet-token with read scope). The JSON shape is
+        // value-redacted upstream in renderRateLimitState() per
+        // LESSONS 2026-06-10 - the IP STRING is the value-side
+        // surface that can carry a token; the documented top-level
+        // keys (buckets, config, version) are repo-authored.
+        if (path === "/api/admin/rate-limit-state" && req.method === "GET") {
+          const body = renderRateLimitState(resolveRateLimitOpts(cfg));
+          res.writeHead(200, {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+          });
+          return res.end(body);
+        }
         if (path === "/api/fleet") {
           // Ticket 0038: every authenticated GET to /api/fleet upserts a
           // home_last_seen_<actor> watermark row so the Monday catch-up

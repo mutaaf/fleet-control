@@ -62,6 +62,18 @@ export interface FleetConfig {
    *  The list is value-filtered downstream; passing junk leaves the
    *  default-safe headers in place. */
   embedOrigins?: string[];
+  /** Per-IP token-bucket rate-limit for the public /embed/*, /og/*,
+   *  /share/* routes (ticket 0064). When omitted both sub-fields fall
+   *  back to documented defaults (60 tokens per minute, burst of 60)
+   *  via resolveRateLimitOpts() in src/rate_limit.ts. Loopback callers
+   *  are exempt unconditionally - the operator's own portal never
+   *  throttles regardless of these values. Defaulting pattern matches
+   *  the embedOrigins field above: passing junk leaves the
+   *  default-safe values in place. */
+  embedRateLimit?: {
+    tokensPerMinute?: number;
+    burst?: number;
+  };
 }
 
 const DEFAULTS: FleetConfig = {

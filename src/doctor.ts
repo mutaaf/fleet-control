@@ -457,6 +457,46 @@ export async function checkGhAuth(deps: DoctorDeps): Promise<DoctorCheck> {
   };
 }
 
+/** Ticket 0064: verify the rate-limit middleware is wired by hitting
+ *  /embed/pulse.html 5 times from the loopback context via the
+ *  injected fetchUrl. Loopback callers are exempt - if any of the 5
+ *  responses is 429 the exemption is broken AND the operator's own
+ *  portal would be throttled by its own middleware. We require the
+ *  status to be a non-429 success-shaped value to pass. */
+export async function checkRateLimitWired(deps: DoctorDeps): Promise<DoctorCheck> {
+  const url = "http://127.0.0.1:7070/embed/pulse.html";
+  for (let i = 0; i < 5; i++) {
+    const r = await deps.fetchUrl(url);
+    if (r.status === 429) {
+      return {
+        category: CAT_CONTROL,
+        name: "rate-limit middleware wired",
+        status: "fail",
+        detail: `loopback /embed/pulse.html returned 429 on call ${i + 1} - exemption broken`,
+        fix: "check src/rate_limit.ts LOOPBACK_IPS matches the operator's portal host",
+      };
+    }
+    if (r.status === 0) {
+      // Transport-level failure - the server isn't reachable. Warn
+      // rather than fail because the operator may be running doctor
+      // without the daemon up.
+      return {
+        category: CAT_CONTROL,
+        name: "rate-limit middleware wired",
+        status: "warn",
+        detail: r.error ?? "no response from 127.0.0.1:7070/embed/pulse.html",
+        fix: "run `fleetctl serve` so the embed surface is reachable",
+      };
+    }
+  }
+  return {
+    category: CAT_CONTROL,
+    name: "rate-limit middleware wired",
+    status: "ok",
+    detail: "loopback /embed/pulse.html responded non-429 across 5 calls",
+  };
+}
+
 export async function checkNtfyReachable(deps: DoctorDeps): Promise<DoctorCheck> {
   if (!deps.ntfyTopicConfigured) {
     return {
@@ -505,6 +545,14 @@ export async function runDoctor(deps: DoctorDeps, opts: RunDoctorOptions = {}): 
     checks.push(await checkFleetdLoaded(deps));
     checks.push(await checkAdminSocket(deps));
   }
+  // Ticket 0064: rate-limit middleware wired check. Same opts.offline
+  // gate as the other loopback / network probes - the check hits
+  // /embed/pulse.html 5x via the injected fetchUrl dep, which in the
+  // offline CLI integration test (FLEET_DOCTOR_OFFLINE=1) would
+  // otherwise try a real connect to 127.0.0.1:7070. Unit tests drive
+  // this check directly via the helper (no offline gate needed on the
+  // direct call).
+  if (!opts.offline) checks.push(await checkRateLimitWired(deps));
   // Network
   if (!opts.offline) {
     checks.push(await checkGhAuth(deps));
