@@ -623,6 +623,62 @@ test("AC11: src/doctor.ts only uses execFile / spawn argv-array shell-outs (no s
     "src/doctor.ts must not call spawn with {shell:true}");
 });
 
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0064 AC9 — doctor surface advertises the rate-limit middleware
+// ────────────────────────────────────────────────────────────────────
+
+test("0064 AC9: rate-limit doctor check hits /embed/pulse.html 5x and reports ok when the response is non-429", async () => {
+  const { checkRateLimitWired } = await import("../src/doctor.ts");
+  const calls: string[] = [];
+  const { deps } = buildDeps({
+    fetchUrl: async (url) => { calls.push(url); return { ok: true, status: 200 }; },
+  });
+  const c = await checkRateLimitWired(deps);
+  assert.equal(c.status, "ok",
+    "loopback 200 responses 5x in a row must report ok");
+  // Five probes are documented in the AC.
+  assert.equal(calls.length, 5,
+    `expected exactly 5 probes, got ${calls.length}`);
+  for (const u of calls) {
+    assert.match(u, /\/embed\/pulse\.html$/,
+      "every probe must target /embed/pulse.html");
+  }
+});
+
+test("0064 AC9: rate-limit doctor check fails when the loopback /embed/pulse.html returns 429", async () => {
+  const { checkRateLimitWired } = await import("../src/doctor.ts");
+  const { deps } = buildDeps({
+    fetchUrl: async () => ({ ok: false, status: 429 }),
+  });
+  const c = await checkRateLimitWired(deps);
+  assert.equal(c.status, "fail",
+    "a 429 from the loopback context means the loopback exemption is broken");
+  assert.ok(c.fix, "fail must carry a fix line");
+});
+
+test("0064 AC9: new doctor check appears in BOTH human and JSON renderings of runDoctor", async () => {
+  const { runDoctor, renderHuman, renderJson } = await import("../src/doctor.ts");
+  const { deps } = buildDeps({
+    fetchUrl: async () => ({ ok: true, status: 200 }),
+    exec: async (cmd) => {
+      // Drive launchctl towards a happy "fleetd loaded" response so
+      // the suite stays green on the doctor-aggregate.
+      if (cmd === "launchctl") return { stdout: "12345 0 com.fleet.control.fleetd\n", code: 0 };
+      return { stdout: "", code: 0 };
+    },
+  });
+  // Run in ONLINE mode (offline: false) so the new check is included;
+  // every dep is stubbed via the injected surface so no real network
+  // / shell-out happens.
+  const r = await runDoctor(deps);
+  const human = renderHuman(r, { color: false });
+  const json = renderJson(r);
+  assert.match(human, /rate-limit/i,
+    "human output must surface the new check");
+  assert.match(json, /rate-limit/i,
+    "JSON output must surface the new check");
+});
+
 test("AC11: package.json `dependencies` stays empty", async () => {
   const { readFileSync } = await import("node:fs");
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));

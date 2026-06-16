@@ -913,3 +913,40 @@ phrase in this repo, and so is `requireAuth(`, `composeEmbedFrameHeaders(`,
 `globalThis.__fleet_*_invalidate__`. The fix is always to anchor on
 a token that ONLY appears at the actual statement site (the `if (`
 prefix here; a unique function-name like `serveX` elsewhere).
+
+## 2026-06-15 — a new doctor check that calls `deps.fetchUrl` MUST sit inside the `!opts.offline` branch
+
+Symptom: while shipping ticket 0064 I added `checkRateLimitWired(deps)`
+to `runDoctor()` and placed the `checks.push(await checkRateLimitWired
+(deps))` line OUTSIDE the existing `if (!opts.offline) { ... }` block
+that wraps `checkFleetdLoaded`, `checkAdminSocket`, `checkGhAuth`,
+`checkNtfyReachable`. Unit tests passed (every dep is stubbed via
+`buildDeps`), but the AC8 subprocess CLI test that drives
+`fleetctl doctor` with `FLEET_DOCTOR_OFFLINE=1` env var ran the new
+check anyway and got a real `127.0.0.1:7070/embed/pulse.html` connect
+attempt against a port nothing was listening on — surfacing a `warn`
+on a clean tmpdir doctor run that the AC8 test didn't expect (and
+that the operator would see as a phantom warning when running doctor
+before starting the daemon for the first time). Cause: the
+`opts.offline` flag is the contract between the CLI's hermetic test
+mode and `runDoctor()`; any check that performs ACTUAL I/O (network,
+launchctl, real fs probe) — even when routed through the injected
+dep surface — must sit inside the `!opts.offline` branch, because the
+PRODUCTION `defaultDeps()` wires the dep to a real binary / socket
+and the CLI test's only knob to disable that is the `offline` flag.
+The dep injection is for UNIT tests; the offline flag is for the
+SUBPROCESS test. Both are needed for different scenarios. Fix: move
+the new check inside the `if (!opts.offline) { ... }` block alongside
+its siblings. Direct unit tests that exercise the check call
+`checkRateLimitWired(deps)` straight (no opts.offline gate needed
+because the unit test owns the dep surface end-to-end); aggregate
+"new check appears in the rendering" tests pass `runDoctor(deps)`
+with `offline: undefined` (the default) so the check is included via
+the !offline branch. General rule for this repo: when adding a new
+doctor check, decide first whether it performs real I/O in
+production. If yes (any `deps.fetchUrl` / `deps.exec` against a real
+binary), wrap the `checks.push(...)` call in `if (!opts.offline)`.
+If no (a pure helper that reads injected state), put it outside.
+Same trap will bite any future doctor check that wraps a real
+socket / shell-out — the unit test will be green and the AC8
+subprocess test silently triggers a real network attempt in CI.

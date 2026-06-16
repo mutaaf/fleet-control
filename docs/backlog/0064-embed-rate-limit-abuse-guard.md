@@ -1,7 +1,7 @@
 ---
 id: 0064
 title: Embed rate-limit + abuse guard - per-IP token bucket on the public /embed/* and /og/* routes so a popular blog paste does not starve the operator's own loopback portal
-status: groomed
+status: in-progress
 priority: P2
 area: infra
 created: 2026-06-15
@@ -485,4 +485,51 @@ no cycle risk.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15 — implementation-dev: shipped on feat/0064.
+  - `src/rate_limit.ts` (new): pure module exporting `checkRateLimit
+    (ip, now)` + the renderer-direct `_checkRateLimitForTests(ip, now,
+    opts)` seam per LESSONS 2026-06-11. Bucket map lives on
+    `globalThis.__fleet_rate_limit_buckets__` per LESSONS 2026-06-05
+    (rationale here is test-seam stability across module re-imports,
+    NOT cache-invalidation cycle avoidance). Loopback IPs (`127.0.0.1`,
+    `::1`, `::ffff:127.0.0.1`) match `src/server.ts:isLoopback(req)`
+    byte-for-byte per PRODUCER-VS-SPEC. Default bucket: 60 tokens /
+    minute, burst 60. Stale-bucket sweep (>24h idle) runs inline on
+    every check - no timers. Reset / inspect / render seams follow
+    the `_xForTests` convention. The whole helper is pure on
+    `(ip, now, opts)` so the bucket refill math is driven by the
+    explicit `now` parameter, NEVER `Date.now()` per LESSONS
+    2026-05-29.
+  - `src/server.ts`: wired `checkRateLimit()` at the TOP of the request
+    handler, gated on `isRateLimitedPath(path)` (covers `/embed/`,
+    `/og/`, `/share/` prefixes from the helper module so server.ts
+    stays free of duplicated literals). The middleware sits BEFORE
+    the `if (path.startsWith("/api/"))` auth gate; 429s short-circuit
+    to `render429("html"|"svg", retryAfterSec)`. New
+    `GET /api/admin/rate-limit-state` route mounted INSIDE the
+    `/api/` block (auth-required for non-loopback; the diagnostic
+    JSON is value-side redacted per LESSONS 2026-06-10).
+  - `src/config.ts`: new optional `embedRateLimit:
+    { tokensPerMinute?: number, burst?: number }` matches the
+    `embedOrigins` defaulting pattern (omitted = defaults; junk
+    values leave defaults in place via `resolveRateLimitOpts`).
+  - `src/doctor.ts`: new `checkRateLimitWired(deps)` hits
+    `/embed/pulse.html` 5x via `deps.fetchUrl`. Placed INSIDE the
+    `if (!opts.offline)` branch alongside the other I/O checks (see
+    new LESSONS entry "a new doctor check that calls deps.fetchUrl
+    MUST sit inside the !opts.offline branch" - CLI subprocess test
+    with `FLEET_DOCTOR_OFFLINE=1` would otherwise trigger a real
+    socket connect).
+  - `tests/rate-limit.test.ts` (new): 18 tests covering AC1-AC8 +
+    AC10. The boot tests use the empty-roots config + savedConfigText
+    snapshot per LESSONS 2026-05-26 "in-process startServer() tests
+    need an empty-roots config". The character-window source greps
+    strip comments first per LESSONS 2026-06-11 so a documentation
+    reference to `Date.now()` (allowed) doesn't false-positive as
+    an actual call site (forbidden).
+  - `tests/doctor.test.ts`: 3 new tests for the new check (ok-path,
+    fail-path, "appears in runDoctor output").
+  - `docs/LESSONS.md`: appended novel lesson on the offline-gate
+    discipline for new doctor checks.
+  Status: shipping via squash merge; ticket will be marked shipped in
+  a follow-up commit per the established cadence (see cf5b80e).
