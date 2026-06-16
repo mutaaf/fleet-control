@@ -1,7 +1,7 @@
 ---
 id: 0064
 title: Embed rate-limit + abuse guard - per-IP token bucket on the public /embed/* and /og/* routes so a popular blog paste does not starve the operator's own loopback portal
-status: in-progress
+status: shipped
 priority: P2
 area: infra
 created: 2026-06-15
