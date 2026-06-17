@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -35,7 +35,7 @@ import {
   type LessonsPublicArchiveRow,
 } from "./lessons.ts";
 import { statSync } from "node:fs";
-import { serveShare } from "./snapshot.ts";
+import { serveShare, getStakeholderSnapshot } from "./snapshot.ts";
 import {
   serveReceipts, computeReceipts, persistReceipts, unpublishReceipts,
   isValidMonthIso, type ReceiptsPayload, type ServeReceiptsResult,
@@ -1041,6 +1041,92 @@ function _invalidateMonthlyRetroCacheAfterIngest(): void {
 }
 (globalThis as { __fleet_monthly_retro_invalidate__?: () => void })
   .__fleet_monthly_retro_invalidate__ = _invalidateMonthlyRetroCacheAfterIngest;
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0066 - Stakeholder summary 5-minute memo cache.
+//
+// The stakeholder visits less often than the operator so a slightly
+// longer cache than the 10-min monthly retro is fine; 5 minutes
+// matches the spec. The cache key is the token (stakeholder URL is
+// per-recipient even though v1 issues one per operator); the
+// invalidation tuple is the LESSONS 2026-06-07 canonical pair
+// (MAX(pr.fetched_at), COUNT(*) FROM pr) so a fresh merged PR busts
+// the cache the same way every other pr-derived cache does. Tests
+// exercise the seam via _resetStakeholderSummaryCacheForTests and
+// _getStakeholderSummaryCacheBuildsForTests.
+// ────────────────────────────────────────────────────────────────────
+
+const STAKEHOLDER_SUMMARY_TTL_MS = 5 * 60_000;
+
+interface StakeholderSummaryCacheEntry {
+  tuple: string;
+  summary: StakeholderSummary;
+  html: string;
+  expires_at: number;
+}
+const stakeholderSummaryCache = new Map<string, StakeholderSummaryCacheEntry>();
+let stakeholderSummaryBuildCounter = 0;
+
+export function _resetStakeholderSummaryCacheForTests(): void {
+  stakeholderSummaryCache.clear();
+  stakeholderSummaryBuildCounter = 0;
+}
+
+export function _getStakeholderSummaryCacheBuildsForTests(): number {
+  return stakeholderSummaryBuildCounter;
+}
+
+interface StakeholderTupleRow {
+  max_fetched_at: string | null;
+  pr_count: number | null;
+}
+
+/** (MAX(pr.fetched_at), COUNT(*) FROM pr) per LESSONS 2026-06-07.
+ *  The pr table has no surrogate id; this pair is the canonical
+ *  "fresh row landed OR a row's sync timestamp advanced" proxy. */
+function stakeholderSummaryInvalidationTuple(db: DB): string {
+  const row = db.prepare(
+    "SELECT MAX(fetched_at) AS max_fetched_at, COUNT(*) AS pr_count FROM pr",
+  ).get() as unknown as StakeholderTupleRow | undefined;
+  return String(row?.max_fetched_at ?? "") + "|" + String(row?.pr_count ?? "0");
+}
+
+/** Memoised wrapper: compose + render the stakeholder summary, cached
+ *  for STAKEHOLDER_SUMMARY_TTL_MS. Returns the SAME { summary, html }
+ *  pair on a hit; busts on a tuple mismatch OR a TTL drain. */
+function getStakeholderSummaryCached(
+  db: DB, cfg: FleetConfig, now: Date, token: string,
+): { summary: StakeholderSummary; html: string } {
+  const tuple = stakeholderSummaryInvalidationTuple(db);
+  const hit = stakeholderSummaryCache.get(token);
+  if (hit && hit.tuple === tuple && hit.expires_at > now.getTime()) {
+    return { summary: hit.summary, html: hit.html };
+  }
+  stakeholderSummaryBuildCounter += 1;
+  const fresh = renderStakeholderSummaryFromDb(db, cfg, now);
+  stakeholderSummaryCache.set(token, {
+    tuple,
+    summary: fresh.summary,
+    html: fresh.html,
+    expires_at: now.getTime() + STAKEHOLDER_SUMMARY_TTL_MS,
+  });
+  return fresh;
+}
+
+/** Test-only wrapper used by tests/stakeholder-summary.test.ts AC10
+ *  to exercise the cached path against a tmpdir DB without booting
+ *  startServer. */
+export function _stakeholderSummaryCachedForTests(
+  db: DB, cfg: FleetConfig, now: Date, token: string,
+): { summary: StakeholderSummary; html: string } {
+  return getStakeholderSummaryCached(db, cfg, now, token);
+}
+
+function _invalidateStakeholderSummaryCacheAfterIngest(): void {
+  stakeholderSummaryCache.clear();
+}
+(globalThis as { __fleet_stakeholder_summary_invalidate__?: () => void })
+  .__fleet_stakeholder_summary_invalidate__ = _invalidateStakeholderSummaryCacheAfterIngest;
 
 /** Has the operator dismissed this month's retro card? Lookup keyed
  *  by (kind='monthly_retro', project_slug='fleet',
@@ -5338,6 +5424,35 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         const result = serveFailureModesJson(db, new Date());
         res.writeHead(200, result.headers);
         return res.end(result.body);
+      }
+      // Ticket 0066: stakeholder monthly summary at /share/stakeholder/<token>.
+      // PUBLIC route mounted BEFORE the if (path.startsWith api auth
+      // gate so a stakeholder visiting the URL without an auth token
+      // reaches the renderer. The token IS the auth - 404 on unknown
+      // OR revoked OR expired OR wrong-kind tokens via the
+      // getStakeholderSnapshot helper. The route MUST sit before the
+      // legacy /share/(token) regex below so the longer prefix wins
+      // (an alphabetic prefix like "stakeholder" never matches the
+      // hex-only regex anyway, but order makes the intent obvious).
+      // 5-minute memo cache via getStakeholderSummaryCached so the
+      // same token returns the same payload between renders without
+      // re-querying the DB - key = token, bust = (MAX(pr.fetched_at),
+      // COUNT(*)) tuple per LESSONS 2026-06-07.
+      const stm = path.match(/^\/share\/stakeholder\/([0-9a-fA-F]+)$/);
+      if (stm && req.method === "GET") {
+        const token = stm[1];
+        const live = getStakeholderSnapshot(db, token);
+        if (!live) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const cached = getStakeholderSummaryCached(db, cfg, new Date(), token);
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "public, max-age=300",
+          "x-robots-tag": "noindex, nofollow",
+        });
+        return res.end(cached.html);
       }
       if (path.startsWith("/api/")) {
         // All read endpoints require the `read` scope (loopback bypasses).

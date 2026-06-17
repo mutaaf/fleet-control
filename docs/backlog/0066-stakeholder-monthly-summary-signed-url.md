@@ -513,3 +513,39 @@ body.
     is mounted BEFORE the existing matcher.
   - `cfg.operator.displayName` is the field the headline reads per
     AC6 (the 0065 config field).
+- 2026-06-17 impl-dev: shipped behind 17 tests (one per AC + AC9
+  fan-out into three branches + AC11 fan-out across deps / schema).
+  Implementation summary:
+  - `src/db.ts`: ALTER TABLE snapshot ADD COLUMN kind TEXT.
+  - `src/snapshot.ts`: SnapshotCreateOpts grows an optional
+    `kind: "stakeholder_monthly"` field; the writer persists it and
+    emits a `/share/stakeholder/<token>` URL when set. New
+    `getStakeholderSnapshot()` helper filters by kind so a legacy
+    /share/<token> route 404s on a stakeholder token (and vice
+    versa).
+  - `src/views.ts`: new `stakeholderMonthlySummary(db, cfg, now)` +
+    `composeStakeholderProse(payload, name, opts)` +
+    `renderStakeholderSummaryPage` + the
+    `_renderStakeholderSummaryForTests` seam + the
+    `stakeholderInviteCard` helper for the home-page one-time card.
+    All pure on inputs; LESSONS 2026-05-29 time-pinned discipline
+    honoured.
+  - `src/server.ts`: GET /share/stakeholder/<token> mounted BEFORE
+    the `if (path.startsWith("/api/"))` auth gate. 5-min memo cache
+    keyed by token, bust tuple = `(MAX(pr.fetched_at), COUNT(*) FROM
+    pr)` per LESSONS 2026-06-07. globalThis-slot invalidation hook
+    (`__fleet_stakeholder_summary_invalidate__`) per LESSONS
+    2026-06-05.
+  - `bin/fleetctl.ts`: existing `snapshot create` subcommand grows
+    a `--kind=stakeholder-monthly` argv flag (translated to the
+    schema's `stakeholder_monthly` enum). NO parallel subcommand.
+  - `src/control.ts`: the existing `snapshot-create` action passes
+    `kind` through to createSnapshot.
+- 2026-06-17 impl-dev: full local gate green
+  (npx tsc --noEmit clean; node scripts/check-backlog.mjs clean;
+  17/17 new tests pass; full `node --test tests/*.test.ts` only
+  carries pre-existing fails on `main` - streak + welcome subprocess
+  timeouts under parallel load + operator-profile boot races per
+  LESSONS 2026-06-11). Per LESSONS 2026-05-29: pre-existing fails
+  that are NOT in the gating typecheck/validate set are documented
+  and left alone.

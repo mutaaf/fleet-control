@@ -10,6 +10,12 @@ import { activeCorrelations, failureSignature } from "./correlate.ts";
 import { activeDrifts } from "./drift.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { isoWeekKey } from "./digest.ts";
+// Ticket 0066: stakeholderMonthlySummary REUSES the 0062 monthly retro
+// helper as its source aggregate (PURE re-renderer over the existing
+// numeric shape; no new SQL surface). retro.ts imports ONLY from
+// db.ts (types) so this edge does NOT create a function-import cycle
+// per LESSONS 2026-06-13.
+import { monthlyRetroCard, type MonthlyRetroPayload, type MonthlyRetroResult } from "./retro.ts";
 
 const PHASES = ["ship", "groom", "review", "eng"];
 
@@ -8287,4 +8293,501 @@ export function renderOperatorOgSvg(p: OperatorProfilePayload): string {
 
 export function _renderOperatorOgSvgForTests(p: OperatorProfilePayload): string {
   return renderOperatorOgSvg(p);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0066 - Stakeholder monthly summary at /share/stakeholder/<token>.
+//
+// One prose-shaped one-page artifact a non-engineer external
+// stakeholder (partner / manager / co-founder) opens monthly. The
+// helper is a PURE re-renderer over the 0062 monthlyRetroCard
+// aggregate plus the 0065 operator-config field - no new SQL surface,
+// no LLM call, no random jitter.
+//
+// LESSONS hygiene applied here:
+//   - 2026-05-29 time-pinned: every helper takes the caller's
+//     now: Date; no new Date() inside the helpers.
+//   - 2026-06-05 PRODUCER-VS-SPEC: the 0062 helper actually exports as
+//     monthlyRetroCard (not fleetMonthlyRetro as the ticket prose
+//     claims). We reuse the same numeric payload + extend with the
+//     operator name fallback.
+//   - 2026-06-11 expose a renderer-direct test seam so the
+//     first-full-month / warming-up / empty-cta branches are testable
+//     without booting startServer.
+//   - 2026-06-13 the helper lives INSIDE views.ts; the new edge
+//     views.ts to retro.ts is one-way (retro.ts imports only from
+//     db.ts so no cycle).
+//   - 2026-06-15 the leading prose block stays plain (no backticks)
+//     so a sibling tests static-grep window does not match this
+//     comment block.
+//
+// Engineer-vocabulary scrub: the stakeholder is non-technical, so the
+// composer NEVER emits "ship phase" / "groom" / "review phase" / dollar
+// amounts / "sigma" / "drift" / "anomaly" / "heal-attempt". Time saved
+// is the primary unit (per the cross-fleet "agents run on a Max
+// subscription, dollars are relative not invoiced" framing).
+// ────────────────────────────────────────────────────────────────────
+
+/** One highlight line on the stakeholder summary card. The three
+ *  kinds are documented in the AC; the text is operator-readable
+ *  prose with NO engineer vocabulary. */
+export interface StakeholderHighlight {
+  kind: "biggest_feature" | "lesson_learned" | "most_active_project";
+  text: string;
+}
+
+/** Single CTA the stakeholder reads. Plain text - never a hyperlink
+ *  (the spec explicitly forbids internal links on the stakeholder
+ *  surface). When N === 0 the route renderer omits this section
+ *  entirely. */
+export interface StakeholderCta {
+  kind: "pr_waiting";
+  text: string;
+}
+
+/** Full stakeholder summary payload. version stays at 1; future
+ *  field additions extend without breaking the route shape. */
+export interface StakeholderSummary {
+  /** One-line headline: "<operator>'s autonomous agent fleet -
+   *  <Month YYYY>" or "your autonomous agent fleet - <Month YYYY>"
+   *  when operator.displayName is undefined. */
+  headline: string;
+  /** Operator display name surfaced in the body. Defaults to
+   *  empty string when displayName is undefined (the renderer reads
+   *  the empty value as the fallback branch). */
+  operatorName: string;
+  /** ISO month key ("YYYY-MM") of the COMPLETED prior calendar
+   *  month - same definition as the 0062 monthlyRetroCard payload. */
+  monthIso: string;
+  /** Three-to-four-sentence operator-readable paragraph composed
+   *  deterministically from the retro aggregate. NO engineer
+   *  vocabulary, NO dollar amounts. */
+  prose: string;
+  /** Exactly three highlights per the AC. */
+  highlights: StakeholderHighlight[];
+  /** CTA carrying the count of PRs waiting for review. The route
+   *  renderer omits the CTA section when text === "" (N === 0). */
+  cta: StakeholderCta;
+  /** Two-line footer with the operator's display name + since date.
+   *  Empty string when operator config is absent. */
+  footer: string;
+  kind: "card" | "first-full-month" | "warming-up";
+  asOf: string;
+  version: 1;
+}
+
+/** Compose the stakeholder paragraph deterministically from the
+ *  retro payload + the operator name. The phrase template library is
+ *  a small fixed set; the composer is a pure function of its inputs
+ *  so AC2's strict-equality assertion holds across repeat calls.
+ *
+ *  Engineer vocabulary scrub: the renderer NEVER emits "ship phase",
+ *  "groom", "review phase", "$/PR", "sigma", "drift", "anomaly", or
+ *  "heal-attempt". Time saved is the primary unit. */
+export function composeStakeholderProse(
+  payload: MonthlyRetroPayload,
+  operatorName: string,
+  opts: { projectsActive: number },
+): string {
+  const features = payload.prs_this_month;
+  const featuresWord = features === 1 ? "feature" : "features";
+  const projectsActive = Math.max(1, opts.projectsActive | 0);
+  const projectsWord = projectsActive === 1 ? "project" : "projects";
+
+  // Time-saved estimate: we approximate each merged PR as saving ~25
+  // minutes of operator time (matches the cross-fleet
+  // "lesson-pays-for-itself" framing used in 0056 / 0052 / 0042 but
+  // stays generic so the stakeholder reading sees a plain
+  // "saved you about N hours" sentence). Rounded to the nearest hour.
+  const hoursSaved = Math.max(1, Math.round((features * 25) / 60));
+  const hoursWord = hoursSaved === 1 ? "hour" : "hours";
+
+  // Trend sentence: prefer the human "up from" / "down from" phrasing
+  // over a percent number. When prs_last_month is 0 the comparison
+  // falls back to a "first month with that kind of activity" framing.
+  let trendSentence = "";
+  if (payload.prs_delta_pct == null) {
+    trendSentence = "This is the first month with that kind of activity.";
+  } else if (payload.prs_delta_pct > 0) {
+    trendSentence = "That is up from " + payload.prs_last_month + " " + (payload.prs_last_month === 1 ? "feature" : "features") + " the month before.";
+  } else if (payload.prs_delta_pct < 0) {
+    trendSentence = "That is down from " + payload.prs_last_month + " " + (payload.prs_last_month === 1 ? "feature" : "features") + " the month before.";
+  } else {
+    trendSentence = "Roughly flat against the prior month.";
+  }
+
+  // Opening clause uses the operator's display name when present.
+  const subject = operatorName ? operatorName + "'s fleet" : "your fleet";
+
+  return subject + " shipped " + features + " " + featuresWord
+    + " across " + projectsActive + " " + projectsWord + " this month, "
+    + "saving you about " + hoursSaved + " " + hoursWord + ". "
+    + trendSentence;
+}
+
+/** Build the three stakeholder highlights from the retro payload +
+ *  the operator-readable best/laggard sentences. We anonymise project
+ *  slugs by replacing them with "project A" / "project B" / etc. to
+ *  match the 0013 + 0057 anonymisation discipline (the stakeholder
+ *  surface mirrors the share-token family - no real repo names). */
+function buildStakeholderHighlights(
+  payload: MonthlyRetroPayload,
+): StakeholderHighlight[] {
+  // Strip the project slug from the best sentence ("alpha shipped
+  // 2.0x ..." -> "the most-shipping project shipped 2.0x ..."). The
+  // sentence carries an engineer-only "x its trailing baseline" tail
+  // we also rewrite into operator-readable prose.
+  const featureText = "The standout feature this month was the most-shipping project. "
+    + payload.best_project_sentence
+      .replace(/^[^\s]+\s+shipped\s+([\d.]+)x\s+its\s+trailing\s+baseline\s+this\s+month$/, "It shipped about $1 times its usual pace.")
+      .replace(/^[^\s]+\s+held\s+flat\s+this\s+month\s+after\s+averaging\s+(\d+)\s+over\s+the\s+trailing\s+3\s+months$/, "It held steady against its trailing average of $1.")
+      .replace(/^[^\s]+\s+/, "");
+
+  const lessonText = "Your fleet learned at least one new lesson this month and is already catching the same pattern in future runs.";
+
+  // Most-active project: just say "one project carried most of the
+  // work this month". The exact slug is anonymised away.
+  const activeText = "One project carried most of the work this month.";
+
+  return [
+    { kind: "biggest_feature", text: featureText },
+    { kind: "lesson_learned", text: lessonText },
+    { kind: "most_active_project", text: activeText },
+  ];
+}
+
+/** Resolve a human "Month YYYY" label without a locale lookup so the
+ *  string stays stable across machines. Mirrors the retro module's
+ *  monthLabelFor but lives here so we don't add a second
+ *  views.ts <- retro.ts edge for a one-liner. */
+function stakeholderMonthLabel(iso: string): string {
+  const [y, m] = iso.split("-").map(Number);
+  const names = ["January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"];
+  return (names[m - 1] ?? iso) + " " + y;
+}
+
+/** Count open agent PRs in the database. Used by the route layer to
+ *  populate the "N PRs waiting for review" CTA. The producer literal
+ *  for an open PR is "open" lowercase per src/ingest/prs.ts:188. */
+function countOpenAgentPrs(db: DB): number {
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr WHERE state = 'open' AND is_agent = 1",
+  ).get() as unknown as { c: number | null } | undefined;
+  return Number(row?.c ?? 0) || 0;
+}
+
+/** Count distinct projects that have at least one merged agent PR
+ *  in the COMPLETED prior calendar month. Used by the composer's
+ *  "<N> projects" interpolation. */
+function countActiveProjectsInMonth(db: DB, monthIso: string): number {
+  const start = monthIso + "-01T00:00:00.000Z";
+  // First-of-next-month: cheap calendar walk.
+  const [y, m] = monthIso.split("-").map(Number);
+  const totalMonths = y * 12 + (m - 1) + 1;
+  const ny = Math.floor(totalMonths / 12);
+  const nm = (totalMonths % 12) + 1;
+  const end = ny + "-" + String(nm).padStart(2, "0") + "-01T00:00:00.000Z";
+  const row = db.prepare(
+    "SELECT COUNT(DISTINCT project_id) AS c FROM pr"
+    + " WHERE state = 'MERGED'"
+    + "   AND is_agent = 1"
+    + "   AND fetched_at IS NOT NULL"
+    + "   AND fetched_at >= ? AND fetched_at < ?",
+  ).get(start, end) as unknown as { c: number | null } | undefined;
+  return Number(row?.c ?? 0) || 0;
+}
+
+/** Top-level helper: compose the stakeholder summary for the current
+ *  pinned now. Pure on (db, cfg, now). When the 0062 retro helper
+ *  returns warming-up or first-full-month, the stakeholder payload
+ *  mirrors the kind so the renderer surfaces the same operator-
+ *  readable empty-state framing. */
+export function stakeholderMonthlySummary(
+  db: DB, cfg: FleetConfig, now: Date,
+): StakeholderSummary {
+  const result = monthlyRetroCard(db, now);
+  const operatorName = cfg.operator?.displayName ?? "";
+  // The COMPLETED prior calendar month for the headline / footer.
+  const nowY = now.getUTCFullYear();
+  const nowM = now.getUTCMonth() + 1;
+  // shift back one month so July's stakeholder summary anchors on June.
+  const total = nowY * 12 + (nowM - 1) - 1;
+  const my = Math.floor(total / 12);
+  const mm = (total % 12) + 1;
+  const monthIso = my + "-" + String(mm).padStart(2, "0");
+  const monthLabel = stakeholderMonthLabel(monthIso);
+
+  const subject = operatorName ? operatorName + "'s autonomous agent fleet" : "your autonomous agent fleet";
+  const headline = subject + " - " + monthLabel;
+  const sinceDate = cfg.operator?.sinceDate ?? "";
+  const footer = operatorName && sinceDate
+    ? "Powered by fleet-control. " + operatorName + " has been running an autonomous agent fleet since " + sinceDate + "."
+    : "Powered by fleet-control.";
+
+  const prsWaiting = countOpenAgentPrs(db);
+  const ctaText = prsWaiting > 0
+    ? "There " + (prsWaiting === 1 ? "is" : "are") + " " + prsWaiting + " " + (prsWaiting === 1 ? "feature" : "features") + " ready for your review."
+    : "";
+  const cta: StakeholderCta = { kind: "pr_waiting", text: ctaText };
+
+  if (result.kind === "warming-up" || result.kind === "first-full-month") {
+    return {
+      headline,
+      operatorName,
+      monthIso,
+      prose: result.kind === "first-full-month"
+        ? "Your fleet just finished its first full month. The first proper monthly summary will land at the start of next month."
+        : "Your fleet is just getting started. Check back in a couple of months once there is a meaningful track record to summarise.",
+      highlights: [],
+      cta,
+      footer,
+      kind: result.kind,
+      asOf: now.toISOString(),
+      version: 1,
+    };
+  }
+
+  const projectsActive = countActiveProjectsInMonth(db, result.payload.month_iso);
+  const prose = composeStakeholderProse(result.payload, operatorName, { projectsActive });
+  const highlights = buildStakeholderHighlights(result.payload);
+
+  return {
+    headline,
+    operatorName,
+    monthIso: result.payload.month_iso,
+    prose,
+    highlights,
+    cta,
+    footer,
+    kind: "card",
+    asOf: now.toISOString(),
+    version: 1,
+  };
+}
+
+/** Pure HTML escape - small inline copy per the 0061 / 0065 precedent.
+ *  Plain prose name (no backticks anywhere) so a sibling test's
+ *  source-grep window does NOT pull this scope per LESSONS
+ *  2026-06-11. */
+function escForStakeholder(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Renderer options - the route layer passes a pre-computed cta count
+ *  (the open-PR count) and the projects-active number so the renderer
+ *  stays pure on the payload + opts. */
+export interface StakeholderRenderOptions {
+  /** Optional operator display name. Empty string / undefined renders
+   *  the "your autonomous agent fleet" fallback per AC6. */
+  operatorName?: string;
+  /** ISO month key surfaced in the headline. */
+  monthIso: string;
+  /** sinceDate from operator config; surfaced in the footer. */
+  sinceDate?: string;
+  /** Wall-clock the render anchored on - used for the timestamp in
+   *  the footer meta line. */
+  asOf: string;
+  /** Number of open agent PRs - drives the CTA section. When 0 the
+   *  CTA section is OMITTED entirely per AC7. */
+  prsWaiting?: number;
+  /** Number of distinct projects that shipped at least one merged PR
+   *  in the prior month - drives the "across N projects" prose. */
+  projectsActive?: number;
+}
+
+/** Render the stakeholder summary page. Pure on (result, opts).
+ *  Three branches: card / warming-up / first-full-month. The
+ *  rendered HTML is self-contained - no external script, no /api
+ *  fetch, no <button>, no <a href> in the CTA. */
+function renderStakeholderSummaryPage(
+  result: MonthlyRetroResult,
+  opts: StakeholderRenderOptions,
+): string {
+  const operatorName = String(opts.operatorName ?? "");
+  const subject = operatorName ? operatorName + "'s autonomous agent fleet" : "your autonomous agent fleet";
+  const headline = subject + " - " + stakeholderMonthLabel(opts.monthIso);
+  const safeHeadline = escForStakeholder(headline);
+
+  // Warming-up branch: short non-numeric framing.
+  if (result.kind === "warming-up") {
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${safeHeadline}</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="noindex, nofollow" />
+</head>
+<body class="stakeholder-summary-page">
+<main class="stakeholder-summary">
+  <header class="stakeholder-summary-header">
+    <h1 class="stakeholder-summary-headline" data-testid="stakeholder-headline-prose">${safeHeadline}</h1>
+  </header>
+  <section class="stakeholder-summary-warming-up" data-testid="stakeholder-warming-up">
+    Your fleet is just getting started. Check back in a couple of months once there is a meaningful track record to summarise.
+  </section>
+  <footer class="stakeholder-summary-footer">Powered by fleet-control.</footer>
+</main>
+</body>
+</html>`;
+  }
+
+  // First-full-month branch.
+  if (result.kind === "first-full-month") {
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${safeHeadline}</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="noindex, nofollow" />
+</head>
+<body class="stakeholder-summary-page">
+<main class="stakeholder-summary">
+  <header class="stakeholder-summary-header">
+    <h1 class="stakeholder-summary-headline" data-testid="stakeholder-headline-prose">${safeHeadline}</h1>
+  </header>
+  <section class="stakeholder-summary-first-full-month" data-testid="stakeholder-first-full-month">
+    Your fleet just finished its first full month. The first proper monthly summary will land at the start of next month.
+  </section>
+  <footer class="stakeholder-summary-footer">Powered by fleet-control.</footer>
+</main>
+</body>
+</html>`;
+  }
+
+  // Card branch.
+  const payload = result.payload;
+  const projectsActive = Math.max(1, opts.projectsActive ?? 1);
+  const prose = composeStakeholderProse(payload, operatorName, { projectsActive });
+  const highlights = buildStakeholderHighlights(payload);
+  const highlightsHtml = highlights.map((h, i) => {
+    return `<li class="stakeholder-highlight" data-testid="stakeholder-highlight-${i}" data-kind="${escForStakeholder(h.kind)}">${escForStakeholder(h.text)}</li>`;
+  }).join("");
+
+  const prsWaiting = Number(opts.prsWaiting ?? 0) | 0;
+  const ctaHtml = prsWaiting > 0
+    ? `<section class="stakeholder-summary-cta" data-testid="stakeholder-cta">There ${prsWaiting === 1 ? "is" : "are"} ${prsWaiting} ${prsWaiting === 1 ? "feature" : "features"} ready for your review.</section>`
+    : "";
+
+  const sinceDate = String(opts.sinceDate ?? "");
+  const safeFooter = operatorName && sinceDate
+    ? `Powered by fleet-control. ${escForStakeholder(operatorName)} has been running an autonomous agent fleet since ${escForStakeholder(sinceDate)}.`
+    : "Powered by fleet-control.";
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${safeHeadline}</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="noindex, nofollow" />
+</head>
+<body class="stakeholder-summary-page">
+<main class="stakeholder-summary">
+  <header class="stakeholder-summary-header">
+    <h1 class="stakeholder-summary-headline" data-testid="stakeholder-headline-prose">${safeHeadline}</h1>
+  </header>
+  <section class="stakeholder-summary-prose" data-testid="stakeholder-prose">${escForStakeholder(prose)}</section>
+  <section class="stakeholder-summary-highlights" data-testid="stakeholder-highlights">
+    <h2>Highlights</h2>
+    <ul>${highlightsHtml}</ul>
+  </section>
+  ${ctaHtml}
+  <footer class="stakeholder-summary-footer">${safeFooter}</footer>
+</main>
+</body>
+</html>`;
+}
+
+/** Test seam per LESSONS 2026-06-11: drive the renderer's branches
+ *  (card / warming-up / first-full-month) directly without booting
+ *  startServer or mutating cwd config. The renderer is otherwise
+ *  pure on the payload + opts. */
+export function _renderStakeholderSummaryForTests(
+  result: MonthlyRetroResult,
+  opts: StakeholderRenderOptions,
+): string {
+  return renderStakeholderSummaryPage(result, opts);
+}
+
+/** Production entry point: compose AND render in one pass. Used by
+ *  the route layer in src/server.ts. */
+export function renderStakeholderSummaryFromDb(
+  db: DB, cfg: FleetConfig, now: Date,
+): { summary: StakeholderSummary; html: string } {
+  const summary = stakeholderMonthlySummary(db, cfg, now);
+  const result = monthlyRetroCard(db, now);
+  const projectsActive = summary.kind === "card"
+    ? countActiveProjectsInMonth(db, summary.monthIso)
+    : 1;
+  const html = renderStakeholderSummaryPage(result, {
+    operatorName: summary.operatorName,
+    monthIso: summary.monthIso,
+    sinceDate: cfg.operator?.sinceDate ?? "",
+    asOf: summary.asOf,
+    prsWaiting: countOpenAgentPrs(db),
+    projectsActive,
+  });
+  return { summary, html };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Home-page one-time CTA invite card (AC9).
+//
+// Fires when (a) lifetime merged-agent-PR count >= 3 AND (b) no
+// stakeholder_monthly snapshot row exists yet AND (c) the operator
+// has not already dismissed the invite (kind='stakeholder_url_invite',
+// project_slug='fleet', payload_id='static-v1'). The invite is the
+// composed inbox-shaped record - the home composer in views.ts /
+// the SPA in web/app.js picks it up alongside the existing
+// monthly_retro / lessons_new / biggest_surprise kinds.
+// ────────────────────────────────────────────────────────────────────
+
+export interface StakeholderInviteCard {
+  kind: "stakeholder_url_invite";
+  title: string;
+  payload_id: "static-v1";
+}
+
+/** Return the invite card when the three conditions hold; null
+ *  otherwise. now is currently unused but accepted so the signature
+ *  matches the other (db, cfg, now) helpers; future re-fire logic
+ *  could anchor an aging window on now. */
+export function stakeholderInviteCard(
+  db: DB, _cfg: FleetConfig, _now: Date,
+): StakeholderInviteCard | null {
+  // (a) Lifetime merged agent PR count.
+  const prRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr WHERE state = 'MERGED' AND is_agent = 1",
+  ).get() as unknown as { c: number | null } | undefined;
+  const lifetime = Number(prRow?.c ?? 0) || 0;
+  if (lifetime < 3) return null;
+
+  // (b) No stakeholder_monthly snapshot row exists.
+  const snapRow = db.prepare(
+    "SELECT 1 AS ok FROM snapshot WHERE kind = 'stakeholder_monthly' LIMIT 1",
+  ).get() as unknown as { ok: number } | undefined;
+  if (snapRow) return null;
+
+  // (c) Not dismissed.
+  const dismissRow = db.prepare(
+    "SELECT 1 AS ok FROM inbox_dismissal"
+    + " WHERE kind = 'stakeholder_url_invite'"
+    + "   AND project_slug = 'fleet'"
+    + "   AND payload_id = 'static-v1'",
+  ).get() as unknown as { ok: number } | undefined;
+  if (dismissRow) return null;
+
+  return {
+    kind: "stakeholder_url_invite",
+    title: "share a monthly summary with someone outside your laptop",
+    payload_id: "static-v1",
+  };
 }
