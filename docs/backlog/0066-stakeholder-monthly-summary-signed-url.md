@@ -1,7 +1,7 @@
 ---
 id: 0066
 title: Monthly stakeholder summary at a signed share URL - one prose-shaped non-engineer-readable page the operator emails to a partner / manager / co-founder once a month so an external stakeholder expects the artifact and locks in retention
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-17
