@@ -20,7 +20,7 @@ proposes new ones, `review` grades them.
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
 | 0065 | Public operator-attributed profile page - one stable signed URL the operator pastes into a CV / LinkedIn / portfolio so each share converts cold readers into fleet-control prospects | P1 | shipped | portal |
-| 0066 | Monthly stakeholder summary at a signed share URL - one prose-shaped non-engineer-readable page the operator emails to a partner / manager / co-founder once a month so an external stakeholder expects the artifact and locks in retention | P1 | in-progress | observability |
+| 0066 | Monthly stakeholder summary at a signed share URL - one prose-shaped non-engineer-readable page the operator emails to a partner / manager / co-founder once a month so an external stakeholder expects the artifact and locks in retention | P1 | shipped | observability |
 | 0067 | fleetctl share CLI subcommand - one command snapshots the current state signs a token and prints a paste-ready multi-line blurb plus copies it to the clipboard so the operator's "look what shipped" moment lands on LinkedIn or Slack in under 5 seconds | P2 | groomed | infra |
 | 0064 | Embed rate-limit + abuse guard - per-IP token bucket on the public /embed/* and /og/* routes so a popular blog paste does not starve the operator's own loopback portal | P2 | shipped | infra |
 | 0063 | Embeddable lesson-of-the-day widget - paste-one-line snippet that rotates a cross-fleet operational lesson into any blog or README so every reader sees a real fleet insight | P2 | shipped | portal |
