@@ -97,6 +97,15 @@ export interface SnapshotCreateOpts {
    *  `include_changelog: true`. Caller pre-computes via
    *  `fleetChangelog(db, opts)` — same shape the route returns. */
   changelog?: unknown;
+  /** Ticket 0066: token kind discriminator. When omitted (or set to
+   *  the legacy default) the mint behaves exactly as today and the
+   *  returned share_url targets /share/<token>. When set to
+   *  "stakeholder_monthly" the row carries kind='stakeholder_monthly'
+   *  AND the returned share_url targets /share/stakeholder/<token>
+   *  - the new stakeholder-monthly route. The snapshot.kind column
+   *  is TEXT with no CHECK constraint so future kinds extend cleanly
+   *  without a schema migration. */
+  kind?: "stakeholder_monthly" | "fleet_view";
 }
 
 export interface ServeShareResult {
@@ -328,18 +337,72 @@ export function createSnapshot(db: DB, opts: SnapshotCreateOpts): MintedSnapshot
     envelope = cloned;
   }
   const payload_json = JSON.stringify(envelope);
+  // Ticket 0066: snapshot.kind discriminator. Legacy callers omit the
+  // field; we persist NULL so the route dispatcher reads NULL as the
+  // default fleet-view kind. The stakeholder route only matches rows
+  // where kind = 'stakeholder_monthly'.
+  const kind: string | null = opts.kind === "stakeholder_monthly"
+    ? "stakeholder_monthly"
+    : null;
 
   db.prepare(
-    "INSERT INTO snapshot(id,name,created_at,expires_at,revoked_at,payload_json) VALUES(?,?,?,?,?,?)",
-  ).run(id, name, created_at, expires_at, null, payload_json);
+    "INSERT INTO snapshot(id,name,created_at,expires_at,revoked_at,payload_json,kind) VALUES(?,?,?,?,?,?,?)",
+  ).run(id, name, created_at, expires_at, null, payload_json, kind);
 
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+  // Ticket 0066: stakeholder-monthly tokens get the dedicated
+  // /share/stakeholder/<token> route so the stakeholder URL is
+  // distinguishable at a glance from a legacy fleet-view share. Every
+  // other kind keeps the legacy /share/<token> shape so existing
+  // share URLs continue to resolve byte-for-byte.
+  const pathSegment = kind === "stakeholder_monthly"
+    ? "stakeholder/" + token
+    : token;
   return {
     id_prefix: id.slice(0, 8),
     token,
-    share_url: `${baseUrl}/share/${token}`,
+    share_url: `${baseUrl}/share/${pathSegment}`,
     name,
     expires_at,
+  };
+}
+
+/** Ticket 0066: resolve a presented token to a STAKEHOLDER-monthly
+ *  snapshot row. Returns null when:
+ *    - the token is empty / non-hex,
+ *    - no row matches the hash (unknown token),
+ *    - the matching row's kind is NOT 'stakeholder_monthly' (the
+ *      caller passed a legacy fleet-view token to the stakeholder
+ *      route - the dispatcher 404s instead of leaking the wrong
+ *      renderer),
+ *    - the row is revoked,
+ *    - the row is expired.
+ *  When the row IS a live stakeholder_monthly token the helper
+ *  returns the resolved fields the route renders against. The
+ *  token's plaintext is the auth - 404 on any failure mode (we do
+ *  NOT distinguish revoked vs expired vs wrong-kind in the response
+ *  so a guesser can't fingerprint which tokens used to exist). */
+export function getStakeholderSnapshot(db: DB, token: string): {
+  name: string; created_at: string; expires_at: string;
+} | null {
+  if (!token || typeof token !== "string") return null;
+  if (!/^[0-9a-f]+$/i.test(token)) return null;
+  const id = hash(token);
+  const row = db.prepare(
+    "SELECT name,created_at,expires_at,revoked_at,kind FROM snapshot WHERE id=?",
+  ).get(id) as {
+    name: string; created_at: string; expires_at: string;
+    revoked_at: string | null; kind: string | null;
+  } | undefined;
+  if (!row) return null;
+  if (row.kind !== "stakeholder_monthly") return null;
+  if (row.revoked_at) return null;
+  const now = Date.now();
+  if (new Date(row.expires_at).getTime() <= now) return null;
+  return {
+    name: row.name,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
   };
 }
 
@@ -357,12 +420,18 @@ export function getSnapshot(db: DB, token: string): SnapshotResolved | null {
   if (!/^[0-9a-f]+$/i.test(token)) return null;
   const id = hash(token);
   const row = db.prepare(
-    "SELECT name,created_at,expires_at,revoked_at,payload_json FROM snapshot WHERE id=?",
+    "SELECT name,created_at,expires_at,revoked_at,payload_json,kind FROM snapshot WHERE id=?",
   ).get(id) as {
     name: string; created_at: string; expires_at: string;
-    revoked_at: string | null; payload_json: string;
+    revoked_at: string | null; payload_json: string; kind: string | null;
   } | undefined;
   if (!row) return null;
+  // Ticket 0066: legacy /share/<token> renders ONLY fleet-view
+  // snapshots; a stakeholder-monthly token presented here is
+  // a routing error (the operator pasted the wrong URL shape).
+  // Return null so the route 404s instead of leaking the wrong
+  // renderer over the token's frozen payload.
+  if (row.kind === "stakeholder_monthly") return null;
   let payload: unknown = null;
   try { payload = JSON.parse(row.payload_json); } catch { payload = null; }
   const now = Date.now();

@@ -268,9 +268,34 @@ function digest() {
 async function snapshot() {
   const sub = arg;
   if (sub === "create") {
-    const name = argv.slice(2).join(" ").trim();
+    // Ticket 0066: extend the EXISTING `snapshot create` argv with a
+    // --kind=<value> flag (default: fleet-view shape per ticket 0013).
+    // When the operator passes --kind=stakeholder-monthly the writer
+    // persists snapshot.kind='stakeholder_monthly' and the returned
+    // share_url targets the new /share/stakeholder/<token> route. NO
+    // parallel subcommand - we filter the rest-of-argv before joining
+    // into the name string so existing `snapshot create <name>` calls
+    // stay byte-identical. Per LESSONS 2026-06-15 PRODUCER-VS-SPEC
+    // the underlying snapshot writer uses the enum value
+    // 'stakeholder_monthly' (underscore) per the snapshot.kind TEXT
+    // column - we translate the CLI's hyphenated argv shape into the
+    // schema's underscore form here.
+    const positional: string[] = [];
+    let kindArg: "stakeholder_monthly" | undefined;
+    for (const tok of argv.slice(2)) {
+      if (tok === "--kind=stakeholder-monthly" || tok === "--kind=stakeholder_monthly") {
+        kindArg = "stakeholder_monthly";
+        continue;
+      }
+      if (tok.startsWith("--kind=")) {
+        console.error(`${c.red}error:${c.rst} unknown --kind value '${tok.slice("--kind=".length)}'`);
+        process.exitCode = 1; return;
+      }
+      positional.push(tok);
+    }
+    const name = positional.join(" ").trim();
     if (!name) {
-      console.log("usage: fleetctl snapshot create <name>");
+      console.log("usage: fleetctl snapshot create [--kind=stakeholder-monthly] <name>");
       process.exitCode = 1; return;
     }
     try {
@@ -279,9 +304,9 @@ async function snapshot() {
       // actually reach. Default 127.0.0.1:7070 matches the loopback
       // SPA's footer assumption.
       const baseUrl = process.env.FLEET_BASE_URL;
-      const r = await doAction(db, "local", "snapshot-create",
-        baseUrl ? { name, base_url: baseUrl } : { name },
-        "local");
+      const body: Record<string, unknown> = baseUrl ? { name, base_url: baseUrl } : { name };
+      if (kindArg) body.kind = kindArg;
+      const r = await doAction(db, "local", "snapshot-create", body, "local");
       if (!r.ok) {
         console.error(`${c.red}error:${c.rst} ${r.message}`);
         process.exitCode = 1; return;

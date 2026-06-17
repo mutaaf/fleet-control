@@ -375,6 +375,20 @@ export function openDb(path: string): DB {
     // dedup key is correlation_signature alone, so the union with
     // the legacy kind-space is harmless.
     "ALTER TABLE anomaly ADD COLUMN correlation_signature TEXT",
+    // ticket 0066: snapshot.kind discriminator. The original 0013
+    // snapshot table only carried the four read-only fleet-view
+    // fields (id, name, created_at, expires_at, revoked_at,
+    // payload_json) - one kind of share, no enum needed. Ticket 0066
+    // introduces a second kind (stakeholder_monthly) that drives a
+    // DIFFERENT renderer at GET /share/stakeholder/<token>, so we
+    // grow a single TEXT column that legacy rows tolerate as NULL
+    // (treated as the default fleet-view kind by the dispatcher in
+    // src/server.ts). NO CHECK constraint - lessons elsewhere in this
+    // file note that a hard CHECK on an evolving enum is a footgun,
+    // and the consumer code already validates the kind string before
+    // dispatching. Plain double-quoted SQL per LESSONS § no backticks
+    // inside template-literal SQL strings.
+    "ALTER TABLE snapshot ADD COLUMN kind TEXT",
   ]) { try { db.exec(ddl); } catch { /* already there */ } }
   // Ticket 0027: a regular (non-unique) index on
   // (correlation_signature, created_at) makes the daemon hook's

@@ -477,6 +477,12 @@ function snapshotAction(db: DB, action: string, body: any, actor: string, actorN
       const changelog = includeChangelog
         ? fleetChangelog(db, { limit: 50 })
         : undefined;
+      // Ticket 0066: pass the optional kind through so the writer
+      // persists snapshot.kind and emits the right share_url shape.
+      // Only the documented enum value is accepted - any other value
+      // falls back to the legacy default (snapshot.kind=NULL).
+      const kind: "stakeholder_monthly" | undefined =
+        body?.kind === "stakeholder_monthly" ? "stakeholder_monthly" : undefined;
       const m = createSnapshot(db, {
         name,
         fleetView: view,
@@ -484,6 +490,7 @@ function snapshotAction(db: DB, action: string, body: any, actor: string, actorN
         baseUrl,
         include_changelog: includeChangelog,
         changelog,
+        kind,
       });
       // Audit args carry the id_prefix + name + ttl — NEVER the plaintext
       // token. We construct the audit args explicitly so a careless
