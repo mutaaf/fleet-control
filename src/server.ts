@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -3826,6 +3826,165 @@ function serveOgCalculatorSvg(db: DB, now: Date): {
   };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0065: operator-attributed profile page.
+//
+// Two PUBLIC routes (no auth, no loopback gate; both inherit the 0064
+// rate-limit via isRateLimitedPath() in src/rate_limit.ts and mount
+// BEFORE the if path startsWith api auth gate further down):
+//   GET /operator/<handle>          - self-contained HTML page
+//   GET /og/operator/<handle>.svg   - hand-rolled 1200x630 OG card
+//
+// Both share a per-handle memo cache. The cache invalidation tuple is
+// (MAX pr fetched_at, COUNT pr, MAX lesson_credit created_at,
+// COUNT lesson_credit) per LESSONS 2026-06-07 the pr table has no
+// surrogate id. Per LESSONS section in-process dedup sets need an
+// explicit reset hook for tests we expose
+// _resetOperatorProfileCacheForTests; per LESSONS section expose a
+// build counter for cache-hit tests we expose
+// _getOperatorProfileCacheBuildsForTests; per LESSONS 2026-06-05 we
+// register the ingest invalidation function on globalThis under the
+// double-underscore-prefix-and-suffix slot.
+//
+// Per LESSONS 2026-06-11 the cfg-dependent quietHours branch is
+// driven via _renderOperatorProfileForTests in views.ts, NOT cwd
+// config mutation.
+const OPERATOR_PROFILE_TTL_MS = 60_000; // 60s per the ticket cadence
+interface OperatorProfileCacheEntry {
+  tuple: string;
+  value: OperatorProfilePayload;
+  expires_at: number;
+}
+const operatorProfileCache = new Map<string, OperatorProfileCacheEntry>();
+let operatorProfileBuildCounter = 0;
+
+export function _resetOperatorProfileCacheForTests(): void {
+  operatorProfileCache.clear();
+  operatorProfileBuildCounter = 0;
+}
+
+export function _getOperatorProfileCacheBuildsForTests(): number {
+  return operatorProfileBuildCounter;
+}
+
+interface OperatorProfilePrTupleRow { mx: string | null; c: number | null; }
+interface OperatorProfileLessonTupleRow { mx: string | null; c: number | null; }
+
+function operatorProfileInvalidationTuple(db: DB, handle: string, attribution: string): string {
+  // Per LESSONS 2026-06-07 the pr table has no surrogate id; we proxy
+  // latest landed via (MAX fetched_at, COUNT *).
+  const prRow = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr",
+  ).get() as unknown as OperatorProfilePrTupleRow | undefined;
+  const lessonRow = db.prepare(
+    "SELECT MAX(created_at) AS mx, COUNT(*) AS c FROM lesson_credit",
+  ).get() as unknown as OperatorProfileLessonTupleRow | undefined;
+  const prMx = prRow?.mx ?? "";
+  const prC = Number(prRow?.c ?? 0);
+  const lMx = lessonRow?.mx ?? "";
+  const lC = Number(lessonRow?.c ?? 0);
+  return `${handle}|${attribution}|${prMx}|${prC}|${lMx}|${lC}`;
+}
+
+export function _invalidateOperatorProfileCacheAfterIngest(): void {
+  operatorProfileCache.clear();
+}
+
+(globalThis as { __fleet_operator_profile_invalidate__?: () => void })
+  .__fleet_operator_profile_invalidate__ = _invalidateOperatorProfileCacheAfterIngest;
+
+/** Cached chokepoint for the operator profile payload. Returns null
+ *  when the config has no operator field - the route layer 404s on
+ *  null. */
+function getOperatorProfileCached(
+  db: DB, cfg: FleetConfig, now: Date,
+): OperatorProfilePayload | null {
+  if (!cfg.operator?.handle) return null;
+  const handle = cfg.operator.handle;
+  const attribution = cfg.operator.attribution === "attributed" ? "attributed" : "anonymised";
+  const tuple = operatorProfileInvalidationTuple(db, handle, attribution);
+  const hit = operatorProfileCache.get(handle);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  const value = operatorProfilePayload(db, cfg, now);
+  if (!value) return null;
+  operatorProfileBuildCounter += 1;
+  operatorProfileCache.set(handle, {
+    tuple, value, expires_at: Date.now() + OPERATOR_PROFILE_TTL_MS,
+  });
+  return value;
+}
+
+/** Test seam: drive the cached layer directly. */
+export function _operatorProfileCachedForTests(
+  db: DB, cfg: FleetConfig, now: Date,
+): OperatorProfilePayload | null {
+  return getOperatorProfileCached(db, cfg, now);
+}
+
+/** Single chokepoint for GET /operator/<handle>. */
+function serveOperatorProfile(
+  db: DB, cfg: FleetConfig, handle: string, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const opCfg = cfg.operator;
+  // Case-sensitive handle match; the route 404s otherwise.
+  if (!opCfg?.handle || opCfg.handle !== handle) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "not found",
+    };
+  }
+  const payload = getOperatorProfileCached(db, cfg, now);
+  if (!payload) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "not found",
+    };
+  }
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const body = renderOperatorProfilePage(payload, { quietHoursActive: quiet });
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=60",
+    },
+    body,
+  };
+}
+
+/** Single chokepoint for GET /og/operator/<handle>.svg. */
+function serveOperatorOgSvg(
+  db: DB, cfg: FleetConfig, handle: string, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const opCfg = cfg.operator;
+  if (!opCfg?.handle || opCfg.handle !== handle) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "not found",
+    };
+  }
+  const payload = getOperatorProfileCached(db, cfg, now);
+  if (!payload) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "not found",
+    };
+  }
+  const body = renderOperatorOgSvg(payload);
+  return {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=60",
+    },
+    body,
+  };
+}
+
 /** Per LESSONS 2026-06-12 "greedy [^>]+id= regex over a <h2 id=...
  *  data-testid=...>" - every meta tag carries a data-testid so the
  *  test assertions anchor on it (no greedy `property=` match). */
@@ -5128,6 +5287,35 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       }
       if (path === "/og/calculator.svg" && req.method === "GET") {
         const result = serveOgCalculatorSvg(db, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0065: operator-attributed profile page. Two PUBLIC
+      // routes mounted BEFORE the path.startsWith api auth gate
+      // further down so a remote LinkedIn / Twitter / Bluesky reader
+      // can fetch them without a token. The /operator/ prefix is
+      // covered by isRateLimitedPath in src/rate_limit.ts so the
+      // 0064 throttle catches a misbehaving crawler. When the
+      // operator config field is absent (default) BOTH routes 404.
+      if (path.startsWith("/operator/") && req.method === "GET") {
+        const handle = path.slice("/operator/".length);
+        // Reject paths with sub-segments / suffixes - the route
+        // takes a single handle component only.
+        if (!handle || handle.includes("/") || !/^[A-Za-z0-9._-]+$/.test(handle)) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const result = serveOperatorProfile(db, cfg, handle, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      if (path.startsWith("/og/operator/") && path.endsWith(".svg") && req.method === "GET") {
+        const slug = path.slice("/og/operator/".length, path.length - ".svg".length);
+        if (!slug || slug.includes("/") || !/^[A-Za-z0-9._-]+$/.test(slug)) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const result = serveOperatorOgSvg(db, cfg, slug, new Date());
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }

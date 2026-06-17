@@ -1,7 +1,7 @@
 ---
 id: 0065
 title: Public operator-attributed profile page - one stable signed URL the operator pastes into a CV / LinkedIn / portfolio so each share converts cold readers into fleet-control prospects
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-17
@@ -488,3 +488,5 @@ would create a cycle.
 - 2026-06-17 (implementation-dev): branch feat/0065-operator-profile-public-page opened; status flipped to in-progress.
 - 2026-06-17: per LESSONS 2026-06-13, views.ts does NOT import lessons.ts today
   (lessons.ts → views.ts is the existing direction). The ticket's "anonymiseLessonBody is REUSED" note would create the cycle the LESSON warns against. Instead I reuse the EXISTING private `anonymiseExcerpt` already living next to `fleetFailureModes` in views.ts (added in 0058) - same shape, identical rules - so no new import edge is added.
+- 2026-06-17: implementation landed. operatorProfilePayload + renderOperatorProfilePage + renderOperatorOgSvg live in src/views.ts; the two public routes (/operator/<handle> and /og/operator/<handle>.svg) live in src/server.ts mounted BEFORE the path.startsWith("/api/") auth gate. The /operator/ prefix is added to isRateLimitedPath in src/rate_limit.ts so the 0064 throttle catches both new surfaces. The operator config field is OPTIONAL on FleetConfig - both routes 404 when omitted. Cache: 60s memo per handle, invalidation tuple (MAX(pr.fetched_at), COUNT(*) FROM pr, MAX(lesson_credit.created_at), COUNT(*) FROM lesson_credit) per LESSONS 2026-06-07; ingest invalidation hook on globalThis.__fleet_operator_profile_invalidate__ per LESSONS 2026-06-05. Renderer-direct seam (_renderOperatorProfileForTests) drives the attribution + quiet-hours branches without cwd config mutation per LESSONS 2026-06-11. Empty-state branch (0 PRs) renders the warming-up sentence with its own testid; attribution branch maps real slugs to project-a/project-b aliases per the 0013 anonymisation discipline. The publicHost field on operator config drives the absolute og:image URL; falls back to relative when omitted. 15 new tests in tests/operator-profile.test.ts (one per AC + extras). Local gate green. Pre-existing failures on main (prs-merged, digest, embed-pulse, og-images AC10 ordering test, pulse AC5) are NOT mine - confirmed by git-stash compare.
+- 2026-06-17: status flipped to shipped after local green.

@@ -74,6 +74,35 @@ export interface FleetConfig {
     tokensPerMinute?: number;
     burst?: number;
   };
+  /** Operator-attributed profile page (ticket 0065). Opt-in: when the
+   *  operator field is OMITTED the /operator/<handle> and
+   *  /og/operator/<handle>.svg routes both 404 (and the home page is
+   *  unchanged). When present the routes render a tasteful one-page
+   *  portfolio at /operator/<handle> for the operator to paste into
+   *  a LinkedIn / CV / portfolio. handle and sinceDate are the only
+   *  required fields; displayName / headline default to documented
+   *  fallbacks inside the renderer. attribution defaults to
+   *  "anonymised" - the operator OPTS IN to attribution by name. */
+  operator?: {
+    /** The URL-safe handle the route slug matches against. */
+    handle: string;
+    /** Human-readable display name (defaults to handle). */
+    displayName?: string;
+    /** One-line headline rendered under the handle. */
+    headline?: string;
+    /** ISO date string the operator started running the fleet
+     *  (used to compute monthsRunning). */
+    sinceDate: string;
+    /** Whether recent ships render the real project slug
+     *  ("attributed") or the anonymised "project-N" alias
+     *  ("anonymised", default). */
+    attribution?: "anonymised" | "attributed";
+    /** Absolute host URL (e.g. https://fleet.example.com) used to
+     *  compose the absolute og:image URL on the rendered profile
+     *  page. When omitted the og:image falls back to the request
+     *  Host header (per the 0061 composeOgMetaTags pattern). */
+    publicHost?: string;
+  };
 }
 
 const DEFAULTS: FleetConfig = {

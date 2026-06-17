@@ -7843,3 +7843,448 @@ export function fleetBiggestSurprise(
 
   return NONE;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0065: Operator-attributed profile page.
+//
+// Pure helper that composes the operator's career-shaped portfolio
+// payload: handle plus four lifetime totals (PRs shipped, lessons
+// authored, projects active, months running), the three most recent
+// merged agent PRs, and the top three cited lessons.
+//
+// Source-of-truth reconciliation (per LESSONS 2026-06-05 producer-vs-
+// spec note): lifetime merged-PR count uses state = 'MERGED' uppercase
+// AND is_agent = 1 (matches the existing fleetYearInReview helper +
+// the ingest producer in src/ingest/prs.ts:235). The lessonsAuthored
+// total counts DISTINCT (lesson_slug, lesson_date) across the
+// lesson_credit table per the 0042 / 0052 attribution ledger.
+// Projects-active counts every project row with NO project_pause
+// sibling (the mere presence of a project_pause row means paused per
+// src/db.ts:189). monthsRunning anchors on the operator-supplied
+// sinceDate, NOT a derived first-PR-ever anchor (per LESSONS
+// 2026-06-15 first-month-meaningfully-crossed pivot - a fresh-install
+// operator with imported history would otherwise lose months).
+//
+// Per LESSONS 2026-06-13 function-import cycles: views.ts MUST NOT
+// import from lessons.ts (lessons.ts already imports from views.ts).
+// The anonymisation pass is the existing private anonymiseExcerpt
+// already inlined next to fleetFailureModes above.
+//
+// Per LESSONS 2026-05-29 the helper is pure on (db, cfg, now): now
+// passes through, never new Date() inside.
+// Per LESSONS node:sqlite all() needs as unknown as T[]: every row
+// narrowing uses the double-cast.
+
+/** Recent-ship row on the operator profile payload. */
+export interface OperatorProfileShipRow {
+  title: string;
+  projectAlias: string;
+  mergedAt: string;
+}
+
+/** Top-cited lesson row on the operator profile payload. The slug is
+ *  the anonymised public slug (per the 0057 / 0058 convention); the
+ *  excerpt is anonymised via the existing anonymiseExcerpt pass. */
+export interface OperatorProfileLessonRow {
+  slugAnon: string;
+  excerpt: string;
+  healCredits: number;
+  lastCreditedAt: string;
+}
+
+/** Career-shaped totals - four numbers on the hero card. */
+export interface OperatorProfileTotals {
+  lifetimePrsShipped: number;
+  lessonsAuthored: number;
+  projectsActive: number;
+  monthsRunning: number;
+}
+
+/** Full payload returned by operatorProfilePayload. Null when the
+ *  config lacks an operator field - the route layer 404s on null. */
+export interface OperatorProfilePayload {
+  handle: string;
+  displayName: string;
+  headline: string;
+  sinceDate: string;
+  /** Absolute host URL for og:image composition. Empty string when
+   *  the operator did not configure publicHost - the renderer falls
+   *  back to a relative og:image URL. */
+  publicHost: string;
+  totals: OperatorProfileTotals;
+  recentShips: OperatorProfileShipRow[];
+  topLessons: OperatorProfileLessonRow[];
+  attribution: "anonymised" | "attributed";
+  quietHoursActive: boolean;
+  asOf: string;
+  version: 1;
+}
+
+interface OperatorProfilePrRow {
+  number: number;
+  title: string | null;
+  slug: string;
+  fetched_at: string | null;
+}
+
+interface OperatorProfileLessonCreditRow {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+  saves: number;
+  last_credited_at: string;
+}
+
+interface OperatorProfileLessonCountRow {
+  n: number | null;
+}
+
+interface OperatorProfileCountRow { c: number | null; }
+
+/** Months elapsed between two ISO date strings, floor(). Returns 0
+ *  when sinceDate is malformed or after now. Pure arithmetic on
+ *  UTC date parts so a daylight-savings shift does not nudge a
+ *  month-boundary by one. */
+function monthsBetween(sinceIso: string, now: Date): number {
+  const m = String(sinceIso ?? "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return 0;
+  const sy = Number(m[1]);
+  const sm = Number(m[2]);
+  const sd = Number(m[3]);
+  const ny = now.getUTCFullYear();
+  const nm = now.getUTCMonth() + 1;
+  const nd = now.getUTCDate();
+  let months = (ny - sy) * 12 + (nm - sm);
+  // If the day-of-month has not yet rolled over, subtract one.
+  if (nd < sd) months -= 1;
+  return Math.max(0, months);
+}
+
+/** Compose the operator profile payload. Returns null when
+ *  cfg.operator is absent (the route layer 404s on null). The four
+ *  career totals are derived from existing tables - no schema work,
+ *  no new ingest path. */
+export function operatorProfilePayload(
+  db: DB, cfg: FleetConfig, now: Date,
+): OperatorProfilePayload | null {
+  const op = cfg.operator;
+  if (!op || !op.handle || !op.sinceDate) return null;
+
+  const attribution: "anonymised" | "attributed" =
+    op.attribution === "attributed" ? "attributed" : "anonymised";
+
+  // ── Lifetime merged-PR count - state = 'MERGED' uppercase per
+  //    producer (src/ingest/prs.ts:235 + views.ts fleetYearInReview).
+  const lifetimePrsRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr WHERE state = 'MERGED' AND is_agent = 1",
+  ).get() as unknown as OperatorProfileCountRow | undefined;
+  const lifetimePrsShipped = Number(lifetimePrsRow?.c ?? 0) || 0;
+
+  // ── Lessons authored - DISTINCT (lesson_slug, lesson_date) across
+  //    the lesson_credit table (the 0042 / 0052 attribution ledger).
+  const lessonsAuthoredRow = db.prepare(
+    "SELECT COUNT(DISTINCT lesson_slug || '|' || lesson_date) AS n FROM lesson_credit",
+  ).get() as unknown as OperatorProfileLessonCountRow | undefined;
+  const lessonsAuthored = Number(lessonsAuthoredRow?.n ?? 0) || 0;
+
+  // ── Projects active - every project row that has NO project_pause
+  //    sibling. The mere presence of a project_pause row means paused
+  //    per src/db.ts:189.
+  const projectsActiveRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM project p "
+    + "LEFT JOIN project_pause pp ON pp.project_id = p.id "
+    + "WHERE pp.project_id IS NULL",
+  ).get() as unknown as OperatorProfileCountRow | undefined;
+  const projectsActive = Number(projectsActiveRow?.c ?? 0) || 0;
+
+  const monthsRunning = monthsBetween(op.sinceDate, now);
+
+  // ── Recent ships - the three most recent merged agent PRs.
+  //    Attribution branch is honoured at row-mapping time so the
+  //    payload reflects the operator's setting without a second pass.
+  const recentRows = db.prepare(
+    "SELECT pr.number AS number, pr.title AS title, p.slug AS slug, "
+    + "       pr.fetched_at AS fetched_at "
+    + "FROM pr "
+    + "JOIN project p ON p.id = pr.project_id "
+    + "WHERE pr.state = 'MERGED' AND pr.is_agent = 1 "
+    + "  AND pr.fetched_at IS NOT NULL "
+    + "ORDER BY pr.fetched_at DESC, pr.number DESC "
+    + "LIMIT 3",
+  ).all() as unknown as OperatorProfilePrRow[];
+
+  // Build a stable anonymised alias map from the project rows so
+  // project-a / project-b / ... assignment is deterministic across
+  // calls (sorted by slug ASC).
+  const aliasMap: Record<string, string> = {};
+  if (attribution === "anonymised") {
+    const slugRows = db.prepare(
+      "SELECT DISTINCT p.slug AS slug FROM project p ORDER BY p.slug ASC",
+    ).all() as unknown as { slug: string }[];
+    let n = 0;
+    for (const r of slugRows) {
+      const slug = String(r.slug ?? "");
+      if (!slug) continue;
+      aliasMap[slug] = "project-" + String.fromCharCode(97 + n); // a, b, c, ...
+      n += 1;
+    }
+  }
+
+  const recentShips: OperatorProfileShipRow[] = recentRows.map((r) => {
+    const realSlug = String(r.slug ?? "");
+    if (attribution === "attributed") {
+      return {
+        title: String(r.title ?? "shipped a feature"),
+        projectAlias: realSlug,
+        mergedAt: String(r.fetched_at ?? ""),
+      };
+    }
+    return {
+      title: "shipped a feature",
+      projectAlias: aliasMap[realSlug] ?? "project-a",
+      mergedAt: String(r.fetched_at ?? ""),
+    };
+  });
+
+  // ── Top lessons - three highest heal_credit rows from lesson_credit.
+  //    Slug is anonymised via the same kebab-case pass already used by
+  //    the 0057 lesson archive (we keep the public slug verbatim - it
+  //    is already operator-derived not project-derived). Excerpt is
+  //    the lesson_title scrubbed via the local anonymiseExcerpt pass.
+  const topLessonRows = db.prepare(
+    "SELECT lesson_slug, lesson_date, lesson_title, "
+    + "       COUNT(DISTINCT heal_audit_id) AS saves, "
+    + "       MAX(created_at) AS last_credited_at "
+    + "FROM lesson_credit "
+    + "GROUP BY lesson_slug, lesson_date, lesson_title "
+    + "ORDER BY saves DESC, last_credited_at DESC "
+    + "LIMIT 3",
+  ).all() as unknown as OperatorProfileLessonCreditRow[];
+
+  // Build a project-only alias map for the excerpt anonymiser (we want
+  // operator slugs in lesson bodies to collapse to project-N even
+  // when attribution is 'attributed' on the ships - the lesson
+  // excerpts are cross-fleet artifacts and stay anonymised regardless).
+  const excerptAliasMap: Record<string, string> = {};
+  const allSlugRows = db.prepare(
+    "SELECT DISTINCT p.slug AS slug FROM project p ORDER BY p.slug ASC",
+  ).all() as unknown as { slug: string }[];
+  let an = 0;
+  for (const r of allSlugRows) {
+    const slug = String(r.slug ?? "");
+    if (!slug) continue;
+    excerptAliasMap[slug] = "project-" + String.fromCharCode(97 + an);
+    an += 1;
+  }
+
+  const topLessons: OperatorProfileLessonRow[] = topLessonRows.map((r) => {
+    const title = String(r.lesson_title ?? "");
+    const excerpt = anonymiseExcerpt(title, excerptAliasMap).slice(0, 160);
+    return {
+      slugAnon: String(r.lesson_slug ?? ""),
+      excerpt,
+      healCredits: Number(r.saves) || 0,
+      lastCreditedAt: String(r.last_credited_at ?? ""),
+    };
+  });
+
+  return {
+    handle: op.handle,
+    displayName: op.displayName ?? op.handle,
+    headline: op.headline ?? "running an autonomous agent fleet",
+    sinceDate: op.sinceDate,
+    publicHost: op.publicHost ?? "",
+    totals: {
+      lifetimePrsShipped,
+      lessonsAuthored,
+      projectsActive,
+      monthsRunning,
+    },
+    recentShips,
+    topLessons,
+    attribution,
+    quietHoursActive: false, // filled in by the route layer
+    asOf: now.toISOString(),
+    version: 1,
+  };
+}
+
+// HTML escape helper - small inline copy per the pattern already used
+// by renderOgPulseSvg / renderPulsePage. Avoids any import edge to a
+// shared escaper module which does not exist in this codebase today.
+function escForOperatorProfile(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Render the self-contained operator profile HTML page. Pure on the
+ *  payload + the opts surface (quiet-hours flag drives the install
+ *  CTA branch). Empty-state branch (zero PRs shipped) renders the
+ *  warming-up sentence with its own testid. */
+export function renderOperatorProfilePage(
+  p: OperatorProfilePayload,
+  opts: { quietHoursActive: boolean },
+): string {
+  const handle = escForOperatorProfile(p.handle);
+  const displayName = escForOperatorProfile(p.displayName);
+  const headline = escForOperatorProfile(p.headline);
+  const sinceDate = escForOperatorProfile(p.sinceDate);
+  const hostBase = p.publicHost ? p.publicHost.replace(/\/+$/, "") : "";
+  const ogImageUrl = hostBase
+    ? hostBase + "/og/operator/" + handle + ".svg"
+    : "/og/operator/" + handle + ".svg";
+  const safeOgImageUrl = escForOperatorProfile(ogImageUrl);
+
+  // Empty-state branch - operator has shipped 0 PRs total.
+  if (p.totals.lifetimePrsShipped === 0) {
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${displayName} - operator profile</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+<meta property="og:type" content="profile" />
+<meta property="og:title" content="${displayName} - fleet operator" />
+<meta property="og:description" content="${headline}" />
+<meta property="og:image" content="${safeOgImageUrl}" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="${safeOgImageUrl}" />
+</head>
+<body class="operator-profile-page">
+<main class="operator-profile">
+  <header class="operator-profile-header">
+    <h1 class="operator-profile-handle" data-testid="operator-profile-handle">${handle}</h1>
+    <div class="operator-profile-display-name">${displayName}</div>
+    <div class="operator-profile-headline">${headline}</div>
+    <div class="operator-profile-since">fleet operator since ${sinceDate}</div>
+  </header>
+  <section class="operator-profile-warming" data-testid="operator-profile-warming-up">
+    your fleet is still warming up - check back after your first 3 ships.
+  </section>
+  <footer class="operator-profile-footer">
+    powered by fleet-control
+  </footer>
+</main>
+</body>
+</html>`;
+  }
+
+  const totals = p.totals;
+  const recentShipsHtml = p.recentShips.map((s, i) => {
+    const titleSafe = escForOperatorProfile(s.title);
+    const aliasSafe = escForOperatorProfile(s.projectAlias);
+    const mergedSafe = escForOperatorProfile(s.mergedAt.slice(0, 10));
+    return `<li class="recent-ship" data-testid="recent-ship-${i}">`
+      + `<span class="recent-ship-title">${titleSafe}</span> `
+      + `<span class="recent-ship-alias">${aliasSafe}</span> `
+      + `<span class="recent-ship-date">${mergedSafe}</span>`
+      + `</li>`;
+  }).join("");
+
+  const topLessonsHtml = p.topLessons.map((L, i) => {
+    const slugSafe = escForOperatorProfile(L.slugAnon);
+    const excerptSafe = escForOperatorProfile(L.excerpt);
+    const creditsSafe = escForOperatorProfile(String(L.healCredits));
+    return `<li class="top-lesson" data-testid="top-lesson-${i}">`
+      + `<span class="top-lesson-slug">${slugSafe}</span> `
+      + `<span class="top-lesson-excerpt">${excerptSafe}</span> `
+      + `<span class="top-lesson-credits">${creditsSafe} saves</span>`
+      + `</li>`;
+  }).join("");
+
+  const installCta = opts.quietHoursActive
+    ? `<div class="operator-profile-quiet" data-testid="operator-profile-quiet-caption">fleet operator since ${sinceDate}</div>`
+    : `<a class="operator-profile-install-cta" data-testid="install-cta" href="https://github.com/mutaaf/fleet-control">install fleet-control</a>`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${displayName} - operator profile</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+<meta property="og:type" content="profile" />
+<meta property="og:title" content="${displayName} - fleet operator" />
+<meta property="og:description" content="${headline}" />
+<meta property="og:image" content="${safeOgImageUrl}" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="${safeOgImageUrl}" />
+</head>
+<body class="operator-profile-page">
+<main class="operator-profile">
+  <header class="operator-profile-header">
+    <h1 class="operator-profile-handle" data-testid="operator-profile-handle">${handle}</h1>
+    <div class="operator-profile-display-name">${displayName}</div>
+    <div class="operator-profile-headline">${headline}</div>
+    <div class="operator-profile-since">running an autonomous agent fleet since ${sinceDate}</div>
+  </header>
+  <section class="operator-profile-totals">
+    <div class="operator-profile-stat" data-testid="operator-profile-prs-shipped"><span class="operator-profile-stat-value">${totals.lifetimePrsShipped}</span><span class="operator-profile-stat-label">PRs shipped</span></div>
+    <div class="operator-profile-stat" data-testid="operator-profile-lessons-authored"><span class="operator-profile-stat-value">${totals.lessonsAuthored}</span><span class="operator-profile-stat-label">lessons authored</span></div>
+    <div class="operator-profile-stat" data-testid="operator-profile-projects-active"><span class="operator-profile-stat-value">${totals.projectsActive}</span><span class="operator-profile-stat-label">projects active</span></div>
+    <div class="operator-profile-stat" data-testid="operator-profile-months-running"><span class="operator-profile-stat-value">${totals.monthsRunning}</span><span class="operator-profile-stat-label">months running</span></div>
+  </section>
+  <section class="operator-profile-recent">
+    <h2>recent ships</h2>
+    <ul class="recent-ships">${recentShipsHtml}</ul>
+  </section>
+  <section class="operator-profile-lessons">
+    <h2>top cited lessons</h2>
+    <ul class="top-lessons">${topLessonsHtml}</ul>
+  </section>
+  <footer class="operator-profile-footer">
+    ${installCta}
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+/** Test seam: drive the renderer's attribution + quiet-hours branches
+ *  directly without booting startServer or mutating cwd config. Per
+ *  LESSONS 2026-06-11. */
+export function _renderOperatorProfileForTests(
+  p: OperatorProfilePayload,
+  opts: { quietHoursActive: boolean },
+): string {
+  return renderOperatorProfilePage(p, opts);
+}
+
+/** Render the hand-rolled 1200x630 SVG sibling for the operator
+ *  profile (the LinkedIn / Twitter OG card). Four stat blocks, the
+ *  handle, the footer with the install hint. The testid anchors the
+ *  handle field per LESSONS 2026-06-12 (non-greedy attribute match).
+ *  Hand-rolled string concatenation per the 0061 OG precedent. */
+export function renderOperatorOgSvg(p: OperatorProfilePayload): string {
+  const w = 1200;
+  const h = 630;
+  const handle = escForOperatorProfile(p.handle);
+  const headline = escForOperatorProfile(p.headline);
+  const totals = p.totals;
+  return `<?xml version="1.0" encoding="UTF-8"?>`
+    + `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="operator profile">`
+    + `<rect width="100%" height="100%" fill="#0E0F0D"></rect>`
+    + `<text x="60" y="110" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="32">fleet operator profile</text>`
+    + `<text x="60" y="180" fill="#E8E2D4" font-family="ui-monospace,Menlo,monospace" font-size="64" font-weight="700" data-testid="operator-og-handle">${handle}</text>`
+    + `<text x="60" y="230" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="24">${headline}</text>`
+    + `<g data-testid="operator-og-totals">`
+    + `<text x="60" y="380" fill="#E8E2D4" font-family="ui-monospace,Menlo,monospace" font-size="80" font-weight="700">${totals.lifetimePrsShipped}</text>`
+    + `<text x="60" y="420" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="22">PRs shipped</text>`
+    + `<text x="360" y="380" fill="#E8E2D4" font-family="ui-monospace,Menlo,monospace" font-size="80" font-weight="700">${totals.lessonsAuthored}</text>`
+    + `<text x="360" y="420" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="22">lessons</text>`
+    + `<text x="660" y="380" fill="#E8E2D4" font-family="ui-monospace,Menlo,monospace" font-size="80" font-weight="700">${totals.projectsActive}</text>`
+    + `<text x="660" y="420" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="22">projects</text>`
+    + `<text x="960" y="380" fill="#E8E2D4" font-family="ui-monospace,Menlo,monospace" font-size="80" font-weight="700">${totals.monthsRunning}</text>`
+    + `<text x="960" y="420" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="22">months</text>`
+    + `</g>`
+    + `<text x="60" y="${h - 40}" fill="#807a6c" font-family="ui-monospace,Menlo,monospace" font-size="22">powered by fleet-control</text>`
+    + `</svg>`;
+}
+
+export function _renderOperatorOgSvgForTests(p: OperatorProfilePayload): string {
+  return renderOperatorOgSvg(p);
+}
