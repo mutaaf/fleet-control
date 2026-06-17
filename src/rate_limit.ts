@@ -402,9 +402,12 @@ export function resolveRateLimitOpts(
  *  surfaces the rate-limit covers. Production callers gate on this so
  *  the middleware adds zero overhead to /api/*, /, the SPA assets, etc.
  *  The set is documented in the ticket's "Engineering notes" section
- *  and matches the existing public-route mounts in src/server.ts. */
+ *  and matches the existing public-route mounts in src/server.ts.
+ *  Ticket 0065 adds /operator/ to inherit the same per-IP throttle
+ *  as the rest of the public surface family. */
 export function isRateLimitedPath(path: string): boolean {
   return path.startsWith("/embed/")
     || path.startsWith("/og/")
-    || path.startsWith("/share/");
+    || path.startsWith("/share/")
+    || path.startsWith("/operator/");
 }
