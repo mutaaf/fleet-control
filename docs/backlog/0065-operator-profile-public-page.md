@@ -1,7 +1,7 @@
 ---
 id: 0065
 title: Public operator-attributed profile page - one stable signed URL the operator pastes into a CV / LinkedIn / portfolio so each share converts cold readers into fleet-control prospects
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-17
@@ -485,4 +485,6 @@ would create a cycle.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-17 (implementation-dev): branch feat/0065-operator-profile-public-page opened; status flipped to in-progress.
+- 2026-06-17: per LESSONS 2026-06-13, views.ts does NOT import lessons.ts today
+  (lessons.ts → views.ts is the existing direction). The ticket's "anonymiseLessonBody is REUSED" note would create the cycle the LESSON warns against. Instead I reuse the EXISTING private `anonymiseExcerpt` already living next to `fleetFailureModes` in views.ts (added in 0058) - same shape, identical rules - so no new import edge is added.
