@@ -679,6 +679,70 @@ test("0064 AC9: new doctor check appears in BOTH human and JSON renderings of ru
     "JSON output must surface the new check");
 });
 
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0067 AC10 — share-clipboard doctor check
+// ────────────────────────────────────────────────────────────────────
+
+test("0067 AC10: share-clipboard check renders ok when pbcopy exits 0", async () => {
+  const { checkShareClipboardAvailable } = await import("../src/doctor.ts");
+  const { deps } = buildDeps({
+    exec: async (cmd) => {
+      if (cmd === "pbcopy") return { stdout: "", code: 0 };
+      return { stdout: "", code: 0 };
+    },
+  });
+  const c = await checkShareClipboardAvailable(deps);
+  assert.equal(c.status, "ok", "pbcopy code=0 must render as ok");
+});
+
+test("0067 AC10: share-clipboard check renders warn when pbcopy throws ENOENT", async () => {
+  const { checkShareClipboardAvailable } = await import("../src/doctor.ts");
+  const { deps } = buildDeps({
+    exec: async (cmd) => {
+      if (cmd === "pbcopy") {
+        const e = new Error("spawn pbcopy ENOENT") as Error & { code: string };
+        e.code = "ENOENT";
+        throw e;
+      }
+      return { stdout: "", code: 0 };
+    },
+  });
+  const c = await checkShareClipboardAvailable(deps);
+  assert.equal(c.status, "warn",
+    "ENOENT means the binary is missing (Linux) — degraded-but-working, not a fail");
+  assert.ok(c.detail, "warn must carry a detail line explaining the fallback");
+});
+
+test("0067 AC10: share-clipboard check appears in runDoctor output when offline=false", async () => {
+  const { runDoctor, renderHuman, renderJson } = await import("../src/doctor.ts");
+  const { deps } = buildDeps({
+    fetchUrl: async () => ({ ok: true, status: 200 }),
+    exec: async (cmd) => {
+      if (cmd === "launchctl") return { stdout: "12345 0 com.fleet.control.fleetd\n", code: 0 };
+      if (cmd === "pbcopy") return { stdout: "", code: 0 };
+      return { stdout: "", code: 0 };
+    },
+  });
+  const r = await runDoctor(deps);
+  const human = renderHuman(r, { color: false });
+  const json = renderJson(r);
+  assert.match(human, /share clipboard available/i,
+    "human output must surface the new share-clipboard check");
+  assert.match(json, /share clipboard available/i,
+    "JSON output must surface the new share-clipboard check");
+});
+
+test("0067 AC10: share-clipboard check is SUPPRESSED by FLEET_DOCTOR_OFFLINE / opts.offline=true", async () => {
+  const { runDoctor, renderHuman } = await import("../src/doctor.ts");
+  const { deps } = buildDeps({
+    exec: async () => ({ stdout: "", code: 0 }),
+  });
+  const r = await runDoctor(deps, { offline: true });
+  const human = renderHuman(r, { color: false });
+  assert.ok(!/share clipboard available/i.test(human),
+    "offline=true must suppress the share-clipboard check (LESSONS 2026-06-15)");
+});
+
 test("AC11: package.json `dependencies` stays empty", async () => {
   const { readFileSync } = await import("node:fs");
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));

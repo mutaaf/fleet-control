@@ -457,6 +457,49 @@ export async function checkGhAuth(deps: DoctorDeps): Promise<DoctorCheck> {
   };
 }
 
+/** Ticket 0067: probe the macOS clipboard binary (pbcopy) so the
+ *  `fleetctl share` subcommand's clipboard plumbing has a doctor
+ *  pre-check. ENOENT (Linux CI / non-Mac dev box) renders as warn
+ *  (NOT fail - the no-pbcopy fallback is degraded-but-working: the
+ *  share blurb still hits stdout for manual copy). A clean exit
+ *  renders as ok. Per LESSONS 2026-06-15 the check sits INSIDE the
+ *  if (!opts.offline) branch in runDoctor so the FLEET_DOCTOR_OFFLINE=1
+ *  CLI subprocess test bypasses it. */
+export async function checkShareClipboardAvailable(deps: DoctorDeps): Promise<DoctorCheck> {
+  try {
+    const r = await deps.exec("pbcopy", []);
+    if (r.code === 0) {
+      return {
+        category: CAT_CONTROL,
+        name: "share clipboard available",
+        status: "ok",
+        detail: "pbcopy responded — fleetctl share will copy the blurb to the clipboard",
+      };
+    }
+    return {
+      category: CAT_CONTROL,
+      name: "share clipboard available",
+      status: "warn",
+      detail: `pbcopy exited ${r.code} — fleetctl share will fall back to stdout-only`,
+      fix: "verify pbcopy is on the PATH (macOS ships it by default; on Linux install a clipboard helper or set FLEET_SHARE_NO_CLIPBOARD=1)",
+    };
+  } catch (e: unknown) {
+    const code = e && typeof e === "object" && "code" in e
+      ? (e as { code?: unknown }).code
+      : undefined;
+    const isMissing = code === "ENOENT";
+    return {
+      category: CAT_CONTROL,
+      name: "share clipboard available",
+      status: "warn",
+      detail: isMissing
+        ? "pbcopy not on PATH (Linux / minimal dev box) — fleetctl share falls back to stdout-only"
+        : `pbcopy probe failed: ${e instanceof Error ? e.message : String(e)}`,
+      fix: "install pbcopy or set FLEET_SHARE_NO_CLIPBOARD=1 to silence this check",
+    };
+  }
+}
+
 /** Ticket 0064: verify the rate-limit middleware is wired by hitting
  *  /embed/pulse.html 5 times from the loopback context via the
  *  injected fetchUrl. Loopback callers are exempt - if any of the 5
@@ -553,6 +596,15 @@ export async function runDoctor(deps: DoctorDeps, opts: RunDoctorOptions = {}): 
   // this check directly via the helper (no offline gate needed on the
   // direct call).
   if (!opts.offline) checks.push(await checkRateLimitWired(deps));
+  // Ticket 0067: share-clipboard check. Same opts.offline gate as
+  // its siblings - the check shells out to pbcopy via deps.exec
+  // which the production defaultDeps wires to a real binary. In
+  // the FLEET_DOCTOR_OFFLINE=1 CLI subprocess test the gate
+  // bypasses the check so a Linux CI box doesn't see a phantom
+  // warn from a missing pbcopy. Unit tests drive the check
+  // directly via the helper (no offline gate needed on the direct
+  // call).
+  if (!opts.offline) checks.push(await checkShareClipboardAvailable(deps));
   // Network
   if (!opts.offline) {
     checks.push(await checkGhAuth(deps));

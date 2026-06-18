@@ -14,6 +14,7 @@ import { ntfyConfigFrom, ntfyTestCommand } from "../src/ntfy.ts";
 import { resolveWindow, isQuietNow, nextWindowEnd } from "../src/quiet_hours.ts";
 import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
 import { listSnapshots } from "../src/snapshot.ts";
+import { runShareCli } from "../src/share.ts";
 import {
   computeReceipts, persistReceipts, unpublishReceipts,
   listPublishedReceipts, isValidMonthIso,
@@ -440,6 +441,26 @@ switch (cmd) {
   case "show": show(arg ?? ""); break;
   case "pricing": pricing(); break;
   case "snapshot": await snapshot(); break;
+  case "share": {
+    // Ticket 0067: `fleetctl share <pulse|receipts|calculator|lessons|
+    // profile>` mints a snapshot token, composes a deterministic
+    // 3-line blurb, copies it to the macOS clipboard (pbcopy), and
+    // prints the same blurb to stdout for manual copy. `fleetctl
+    // share revoke <id-prefix>` calls the existing 0013 revoke
+    // helper. The CLI shim is intentionally thin - the testable
+    // logic lives in src/share.ts behind runShareCli() so the
+    // pbcopy shell-out is gated through a runner seam.
+    const result = await runShareCli({
+      db,
+      cfg,
+      argv: argv.slice(1),
+      env: process.env,
+    });
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.exitCode !== 0) process.exitCode = result.exitCode;
+    break;
+  }
   case "receipts": receipts(); break;
   case "serve": {
     db.close(); // server opens its own handle
@@ -749,6 +770,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|doctor [--json]|onboard [--non-interactive] [--skip <list>] [--help]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|share <pulse|receipts|calculator|lessons|profile|revoke <id-prefix>>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|doctor [--json]|onboard [--non-interactive] [--skip <list>] [--help]]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run" && cmd !== "demo") db.close();

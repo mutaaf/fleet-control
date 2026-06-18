@@ -1,7 +1,7 @@
 ---
 id: 0067
 title: fleetctl share CLI subcommand - one command snapshots the current state signs a token and prints a paste-ready multi-line blurb plus copies it to the clipboard so the operator's "look what shipped" moment lands on LinkedIn or Slack in under 5 seconds
-status: groomed
+status: in-progress
 priority: P2
 area: infra
 created: 2026-06-17
@@ -551,4 +551,23 @@ blurb in pure code.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-17 (implementation-dev): branch feat/0067-fleetctl-share-cli-paste-ready-blurb cut from main. Mapped the
+  pre-loaded context to the existing 0013 snapshot infra (`src/snapshot.ts`)
+  + 0066 stakeholder kind precedent + the `createSnapshot(db, { name,
+  fleetView, kind })` signature already in tree. The snapshot.kind column
+  is TEXT-no-CHECK so extending with `share_pulse | share_receipts |
+  share_calculator | share_lessons` requires zero schema work (the column
+  is added via ALTER per 0066). Per LESSONS 2026-06-13 the new module
+  lives at `src/share.ts` (NOT `src/views.ts`) - the share module imports
+  `views.ts` one-way for the payload helpers (`fleetWeeklyPulse`,
+  `lessonSavingsRollup`, `operatorProfilePayload`) and `receipts.ts` for
+  `computeReceipts`; neither of those imports `src/share.ts` back, so
+  there is no function-import cycle. Per LESSONS 2026-05-26 the pbcopy
+  shell-out is gated behind a one-purpose runner seam
+  `_setShareClipboardRunnerForTests(fn)` so the tests never invoke the
+  real pbcopy binary. The CLI subcommand parses argv hermetically, mints
+  the snapshot row, composes the blurb deterministically per surface, and
+  pipes the blurb to `execFile('pbcopy', [], { input: blurb })` (argv
+  array literal per AGENTS.md Hard NOs - never a composed shell string).
+  Non-Mac fallback is the `FLEET_SHARE_NO_CLIPBOARD=1` env var per
+  LESSONS 2026-06-15.
