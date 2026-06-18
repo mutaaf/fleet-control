@@ -1,7 +1,7 @@
 ---
 id: 0067
 title: fleetctl share CLI subcommand - one command snapshots the current state signs a token and prints a paste-ready multi-line blurb plus copies it to the clipboard so the operator's "look what shipped" moment lands on LinkedIn or Slack in under 5 seconds
-status: in-progress
+status: shipped
 priority: P2
 area: infra
 created: 2026-06-17
