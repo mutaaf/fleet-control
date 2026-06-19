@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -4558,6 +4558,148 @@ function serveLessonsPublicJson(db: DB, now: Date): {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Ticket 0069 - Public lesson lineage page.
+//
+// Two PUBLIC routes (no auth, no loopback gate; both inherit the 0064
+// rate-limit via isRateLimitedPath in src/rate_limit.ts which ticket
+// 0069 extends to cover /lessons-public/):
+//
+//   GET /lessons-public/<slug>/lineage          - HTML timeline page
+//   GET /og/lessons-public/<slug>/lineage.svg   - 1200x630 OG card
+//
+// Both mount BEFORE the path.startsWith api auth gate further down
+// so a remote LinkedIn / Twitter / Bluesky / Hacker News reader can
+// fetch them without a token. Per LESSONS 2026-06-15 the
+// static-grep ordering anchors on the if-statement, not the prose -
+// hence why this comment block paraphrases the gate rather than
+// quoting it verbatim.
+//
+// The lineage payload is composed by `lessonLineagePayload` in
+// src/views.ts which itself wraps a 60s memo cache keyed on slug and
+// busted by the (MAX(created_at), COUNT(*)) tuple per LESSONS
+// 2026-06-07 (the lesson_credit table has no surrogate id). The
+// invalidation hook is registered on
+// globalThis.__fleet_lesson_lineage_invalidate__ from THIS module
+// (server.ts) on module load; the consumer is
+// src/lessons.ts attributeHealsToLessons which reads the slot lazily
+// after a non-zero credit insert per the existing 0055 pattern.
+// The slot pattern is LESSONS 2026-06-05 break ingest-server cache-
+// invalidation cycles via a globalThis slot, not a circular import.
+// ────────────────────────────────────────────────────────────────────
+
+/** Re-export the views.ts cache seams under the conventional
+ *  server.ts names so tests (and the wider codebase) reach for them
+ *  via the same chokepoint as the 0057 / 0058 caches. */
+export function _resetLessonLineageCacheForTests(): void {
+  _resetLessonLineageCacheFromViews();
+}
+export function _getLessonLineageCacheBuildsForTests(): number {
+  return _getLessonLineageCacheBuildsFromViews();
+}
+export function _invalidateLessonLineageCache(): void {
+  _invalidateLessonLineageCacheFromViews();
+}
+
+(globalThis as { __fleet_lesson_lineage_invalidate__?: () => void })
+  .__fleet_lesson_lineage_invalidate__ = _invalidateLessonLineageCache;
+
+/** Single chokepoint for GET /lessons-public/<slug>/lineage. Returns
+ *  404 when the lineage payload is null (slug has zero catches);
+ *  otherwise 200 + the rendered HTML. */
+function serveLessonsPublicLineagePage(
+  db: DB, cfg: FleetConfig, now: Date, slug: string, req: { headers: { host?: string } },
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = lessonLineagePayload(db, slug, now, { cfg });
+  if (!payload) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: renderLessonsPublicNotFound(),
+    };
+  }
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const html = renderLessonLineagePage(payload, { quietHoursActive: quiet });
+  const withMeta = injectLessonLineageOgMetaTags(html, cfg, slug, payload, req);
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: withMeta,
+  };
+}
+
+/** Single chokepoint for GET /og/lessons-public/<slug>/lineage.svg. */
+function serveLessonsPublicLineageOgSvg(
+  db: DB, cfg: FleetConfig, now: Date, slug: string,
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = lessonLineagePayload(db, slug, now, { cfg });
+  if (!payload) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "not found",
+    };
+  }
+  return {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+    body: renderLessonLineageOgSvg(payload),
+  };
+}
+
+/** Inject og:* / twitter:* meta tags into the lineage HTML page. The
+ *  og:image URL is composed from cfg.operator?.publicHost when set
+ *  (matches the 0061 / 0065 absolute-vs-relative composition pattern)
+ *  and falls back to the request Host header otherwise. Per AC6 the
+ *  four required meta tags (og:image, twitter:card, og:title,
+ *  og:description) all appear; per LESSONS 2026-06-12 we anchor the
+ *  test on a property=/name= attribute pair, not on a greedy id=. */
+function injectLessonLineageOgMetaTags(
+  html: string,
+  cfg: FleetConfig,
+  slug: string,
+  payload: LessonLineagePayload,
+  req: { headers: { host?: string } },
+): string {
+  if (html.indexOf("</head>") < 0) return html;
+  // Compose the og:image URL.
+  const publicHost = String(cfg.operator?.publicHost ?? "").trim();
+  let base: string;
+  if (publicHost) {
+    // Strip any trailing slash so the join below stays single-slashed.
+    base = publicHost.replace(/\/+$/, "");
+  } else {
+    const rawHost = String(req.headers?.host ?? "127.0.0.1:7070").trim();
+    const safeHost = rawHost.replace(/[^A-Za-z0-9.:_-]/g, "") || "127.0.0.1:7070";
+    base = "http://" + safeHost;
+  }
+  const safeSlug = encodeURIComponent(slug);
+  const ogUrl = base + "/og/lessons-public/" + safeSlug + "/lineage.svg";
+  const safeUrl = ogUrl.replace(/[<>"']/g, "");
+  const safeTitle = String(payload.anonymisedTitle || payload.title)
+    .replace(/[<>"']/g, "").slice(0, 120);
+  const safeDesc = (payload.totals.catches + " catches across "
+    + payload.totals.projects + " projects - "
+    + "~" + payload.totals.hoursSavedTotal.toFixed(1) + "h saved cumulative.")
+    .replace(/[<>"']/g, "").slice(0, 200);
+  const block = `
+<meta property="og:type" content="article" data-testid="lineage-og-meta-og-type" />
+<meta property="og:title" content="${safeTitle}" data-testid="lineage-og-meta-og-title" />
+<meta property="og:description" content="${safeDesc}" data-testid="lineage-og-meta-og-description" />
+<meta property="og:image" content="${safeUrl}" data-testid="lineage-og-meta-og-image" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta name="twitter:card" content="summary_large_image" data-testid="lineage-og-meta-twitter-card" />
+<meta name="twitter:image" content="${safeUrl}" />`;
+  return html.replace("</head>", block + "\n</head>");
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Ticket 0058 - Public failure-mode landing pages.
 //
 // Three public routes (no auth, no loopback gate):
@@ -5373,6 +5515,18 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
       }
       if (path === "/og/calculator.svg" && req.method === "GET") {
         const result = serveOgCalculatorSvg(db, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0069: OG card sibling for the lesson lineage page.
+      // PUBLIC route mounted BEFORE the path startsWith api auth gate
+      // so a remote feed crawler can fetch it without a token. 404
+      // when the slug has no lesson_credit rows. Per LESSONS
+      // 2026-06-12 the SVG carries data-testid="lineage-og-title" so
+      // tests anchor on the testid not a body substring.
+      const ogLm = path.match(/^\/og\/lessons-public\/([a-z0-9-]+)\/lineage\.svg$/);
+      if (ogLm && req.method === "GET") {
+        const result = serveLessonsPublicLineageOgSvg(db, cfg, new Date(), ogLm[1]);
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }
@@ -6574,11 +6728,48 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }
+      // Ticket 0069: public lesson lineage page. Mounted BEFORE the
+      // existing /lessons-public/<slug> permalink so the more
+      // specific URL shape (slug + /lineage suffix) wins. Both routes
+      // are public; the lineage route 404s when the slug has no
+      // lesson_credit rows (lessonLineagePayload returns null). The
+      // route mounts BEFORE the path startsWith api auth gate per
+      // LESSONS 2026-06-15 so a remote reader without a token reaches
+      // the renderer - this comment paraphrases the if-statement
+      // rather than quoting it to avoid leaking into sibling tests
+      // that use indexOf to locate the actual gate.
+      const lpLineageM = path.match(/^\/lessons-public\/([a-z0-9-]+)\/lineage$/);
+      if (lpLineageM && req.method === "GET") {
+        const result = serveLessonsPublicLineagePage(db, cfg, new Date(), lpLineageM[1], req);
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
       const lpm = path.match(/^\/lessons-public\/([a-z0-9-]+)$/);
       if (lpm && req.method === "GET") {
         const result = serveLessonsPublicPermalink(db, new Date(), lpm[1]);
+        // Ticket 0069: inject the lineage cross-link inside the
+        // existing 0057 permalink body when the lesson has >= 2
+        // catches. We append the link block right before the
+        // closing </article> tag so the renderer-direct output
+        // matches the seam in views.ts
+        // composeLessonsPublicLineageLink (which the renderer-direct
+        // test in tests/lesson-lineage.test.ts AC7 uses). Per LESSONS
+        // 2026-06-12 the testid is the anchor.
+        let body = result.body;
+        if (result.status === 200) {
+          const lineage = lessonLineagePayload(db, lpm[1], new Date(), { cfg });
+          if (lineage && lineage.totals.catches >= 2) {
+            const linkBlock = composeLessonsPublicLineageLink(
+              lineage.slug, lineage.totals.projects,
+            );
+            const closingArticle = body.lastIndexOf("</article>");
+            if (closingArticle >= 0) {
+              body = body.slice(0, closingArticle) + linkBlock + body.slice(closingArticle);
+            }
+          }
+        }
         res.writeHead(result.status, result.headers);
-        return res.end(result.body);
+        return res.end(body);
       }
       // Ticket 0058: public failure-mode landing pages — index +
       // permalink HTML. PUBLIC — no auth, no loopback gate (the URL IS

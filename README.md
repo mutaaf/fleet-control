@@ -236,6 +236,8 @@ Everything is JSON. Loopback is fully trusted; LAN requires an `x-fleet-token` h
 
 Read endpoints refresh stale data inline (max once every 10s if the daemon is off), so the UI always reflects something current without you running `backfill`.
 
+**Public artifact surfaces** (no auth, paste-friendly URLs): `/pulse`, `/receipts`, `/year`, `/calculator`, `/failures`, `/lessons-public`, `/lessons-public/<slug>` (one lesson permalink), and — new in ticket 0069 — `/lessons-public/<slug>/lineage` (timeline of every project that lesson has caught a re-occurrence in, plus a 1200x630 OG card at `/og/lessons-public/<slug>/lineage.svg`).
+
 ### Write
 
 | Method | Path | Body | Action |
