@@ -1,7 +1,7 @@
 ---
 id: 0070
 title: fleetctl export portfolio command writes a single self-contained portfolio.html bundle - inlined CSS, data URI OG image, no external fetches - so the operator can email it / attach to a CV / archive offline and the accumulated-history moat becomes a portable artifact the operator owns forever
-status: in-progress
+status: shipped
 priority: P2
 area: infra
 created: 2026-06-19
