@@ -1,7 +1,7 @@
 ---
 id: 0068
 title: Operator-to-operator referral graph - each operator declares who introduced them to fleet-control and their public profile shows "introduced N operators" so every share becomes a measurable acquisition node and the strongest evangelists get rewarded with a visible downstream tree
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-19
@@ -471,4 +471,14 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-19: branch feat/0068-operator-referral-graph opened off
+  origin/main. Marking status in-progress. Plan: extend FleetConfig.
+  operator with the optional referredBy field; add referralGraphPayload
+  + recordReferralAck + renderReferralGraphPage helpers in src/views.ts
+  alongside operatorProfilePayload; wire GET /referrals/<handle> in
+  src/server.ts BEFORE the if (path.startsWith("/api/")) auth gate;
+  extend isRateLimitedPath in src/rate_limit.ts; add the conditional
+  stat block to renderOperatorProfilePage. Tests follow the 0065
+  operator-profile suite shape - one test() per AC, pure-helper tests
+  + renderer-direct seam for branches + boot-path tests for integration
+  shape. All timestamps anchor on a pinned NOW per LESSONS 2026-05-29.
