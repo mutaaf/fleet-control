@@ -1,7 +1,7 @@
 ---
 id: 0068
 title: Operator-to-operator referral graph - each operator declares who introduced them to fleet-control and their public profile shows "introduced N operators" so every share becomes a measurable acquisition node and the strongest evangelists get rewarded with a visible downstream tree
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-19
