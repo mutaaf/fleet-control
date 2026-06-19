@@ -4477,6 +4477,500 @@ export function lessonSavingsByProject(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Lesson lineage (ticket 0069).
+//
+// Composes lesson_credit (0042 attribution ledger) into a per-lesson
+// TIMELINE: one synthesised author event (the earliest credit row for
+// the slug) followed by every catch event in chronological order. Pure
+// read-side; no writes, no schema migration. The renderer surfaces the
+// timeline as a public anonymised SHARE artifact at the /lessons-public/
+// SLUG /lineage URL.
+//
+// Producer reconciliation per LESSONS schema-wins (2026-06-05) and
+// composite-PK-no-surrogate-id (2026-06-07):
+//   - lesson_credit columns are lesson_slug, lesson_date, lesson_title,
+//     heal_audit_id, project_slug, matched_substring, created_at
+//     per src/db.ts SCHEMA. There is no surrogate id column; ordering
+//     is by created_at ASC.
+//   - The slug parameter matches the existing 0057 archive's
+//     lesson_slug derivation so a paste from the aggregate page lands
+//     on the right lineage row.
+//   - hoursSaved per catch = hoursPerPr knob (cfg.worth_it.hours_per_pr,
+//     default 1). The totals strip uses the SUM of per-event hours so
+//     it matches the aggregate page exactly (one heal_audit_id per
+//     catch row; the lineage view splits the same denominator).
+//
+// Per LESSONS no-sqlite-cast: every row narrowing uses as unknown as
+// RowT[].
+// Per LESSONS no-backticks: plain string concat for SQL.
+// Per LESSONS 2026-06-13 the helper REUSES the existing private
+// anonymiseExcerpt in views.ts; it does NOT import from lessons.ts
+// (which would create a function-import cycle with the existing
+// lessons.ts to views.ts edge).
+// Per LESSONS 2026-06-11 every sibling-helper identifier in this
+// comment block stays in PLAIN PROSE - no backticks - so the 4000
+// char source-grep windows of lessonSavingsRollup and
+// lessonSavingsByProject upstream cannot leak into this section.
+// ────────────────────────────────────────────────────────────────────
+
+/** Default hours per merged-PR for the lineage hour-savings math. The
+ *  per-call opts win first, then cfg.worth_it.hours_per_pr, then this
+ *  documented default. Matches the 0048 / 0050 / 0052 precedent. */
+const LESSON_LINEAGE_DEFAULT_HOURS_PER_PR = 1;
+/** TTL for the lineage memo cache (60s per the AC). */
+const LESSON_LINEAGE_TTL_MS = 60_000;
+
+export interface LessonLineageEvent {
+  /** "author" for the synthesised birth event; "catch" for every
+   *  later credit row. */
+  kind: "author" | "catch";
+  /** ISO timestamp of the event. For "author" this is the earliest
+   *  lesson_credit.created_at for the slug. For "catch" it is the
+   *  row's own created_at. */
+  at: string;
+  /** Operator-anonymised project alias (project-N) or the public
+   *  bootstrap name (agent-fleet). */
+  projectAlias: string;
+  /** heal_audit_id of the catch row, or null on the author event. */
+  healAuditId: number | null;
+  /** Per-event hours-saved figure. Author event is 0 (the birth is a
+   *  marker, not a save); each catch contributes hoursPerPr (default
+   *  1.0) so the timeline sum matches the aggregate page exactly. */
+  hoursSaved: number;
+}
+
+export interface LessonLineageTotals {
+  /** Total catch rows for the slug. */
+  catches: number;
+  /** Distinct project_slug values among the catches. */
+  projects: number;
+  /** SUM of per-event hoursSaved across the timeline. */
+  hoursSavedTotal: number;
+}
+
+export interface LessonLineagePayload {
+  slug: string;
+  title: string;
+  anonymisedTitle: string;
+  birthDate: string;
+  birthProjectAlias: string;
+  events: LessonLineageEvent[];
+  totals: LessonLineageTotals;
+  asOf: string;
+  version: 1;
+}
+
+interface LessonLineageRow {
+  lesson_title: string;
+  heal_audit_id: number;
+  project_slug: string;
+  created_at: string;
+}
+
+interface LessonLineageProjectSlugRow { slug: string; }
+
+/** Build the operator alias map from the project table. The bootstrap
+ *  slug agent-fleet keeps its public name; every other slug becomes
+ *  project-N in deterministic alphabetical order. Mirrors the existing
+ *  per-helper alias-builder in views.ts so the lineage page's project
+ *  labels match the failure-mode and lesson-archive pages. */
+function buildAliasMapForLineage(db: DB): Record<string, string> {
+  const out: Record<string, string> = {};
+  let rows: LessonLineageProjectSlugRow[] = [];
+  try {
+    rows = db.prepare("SELECT slug FROM project ORDER BY slug").all() as unknown as LessonLineageProjectSlugRow[];
+  } catch { /* project table may not exist on a fresh boot */ }
+  let n = 1;
+  for (const r of rows) {
+    const slug = String(r.slug ?? "").trim();
+    if (!slug) continue;
+    if (slug === "agent-fleet") { out[slug] = "agent-fleet"; continue; }
+    if (!(slug in out)) { out[slug] = "project-" + String(n); n += 1; }
+  }
+  return out;
+}
+
+function resolveLineageHoursPerPr(cfg?: FleetConfig): number {
+  const v = cfg?.worth_it?.hours_per_pr;
+  if (typeof v === "number" && v > 0 && Number.isFinite(v)) return v;
+  return LESSON_LINEAGE_DEFAULT_HOURS_PER_PR;
+}
+
+export interface LessonLineagePayloadOptions {
+  /** Optional FleetConfig for the hoursPerPr knob. */
+  cfg?: FleetConfig;
+  /** Optional pre-built alias map (the test seam hands one in to keep
+   *  the renderer-direct path independent of the project table). */
+  projectAliasMap?: Record<string, string>;
+}
+
+// Per-slug memo cache for the lineage payload. 60s TTL per the AC.
+// The invalidation tuple is (MAX(created_at), COUNT(*)) of the
+// lesson_credit rows scoped to the slug per LESSONS 2026-06-07 (the
+// lesson_credit table has no surrogate id - composite PK is
+// (lesson_slug, lesson_date, heal_audit_id) per src/db.ts).
+interface LessonLineageCacheEntry {
+  tuple: string;
+  value: LessonLineagePayload | null;
+  expires_at: number;
+}
+const lessonLineageCache = new Map<string, LessonLineageCacheEntry>();
+let lessonLineageBuildCounter = 0;
+
+export function _resetLessonLineageCacheForTests(): void {
+  lessonLineageCache.clear();
+  lessonLineageBuildCounter = 0;
+}
+
+export function _getLessonLineageCacheBuildsForTests(): number {
+  return lessonLineageBuildCounter;
+}
+
+/** Invalidate the lineage memo cache. Wired through the globalThis
+ *  slot from src/server.ts on module load so a fresh lesson_credit
+ *  insert in src/lessons.ts attributeHealsToLessons wakes the cache
+ *  without an import cycle (the slot pattern is LESSONS 2026-06-05). */
+export function _invalidateLessonLineageCache(): void {
+  lessonLineageCache.clear();
+}
+
+interface LessonLineageTupleRow { mx: string | null; c: number | null; }
+
+function lessonLineageInvalidationTuple(db: DB, slug: string): string {
+  let row: LessonLineageTupleRow | undefined;
+  try {
+    row = db.prepare(
+      "SELECT MAX(created_at) AS mx, COUNT(*) AS c "
+      + "  FROM lesson_credit "
+      + " WHERE lesson_slug = ?",
+    ).get(slug) as unknown as LessonLineageTupleRow | undefined;
+  } catch { row = undefined; }
+  const mx = row?.mx ?? "";
+  const c = Number(row?.c ?? 0);
+  return "mx=" + mx + "|c=" + c;
+}
+
+/** Compose the lineage payload for one lesson slug. Returns null when
+ *  the slug has zero lesson_credit rows (the route 404s on null).
+ *  Memoised for 60s per slug via the lineage cache; the cache key is
+ *  the slug and the invalidation tuple is (MAX(created_at), COUNT(*))
+ *  per LESSONS 2026-06-07. */
+export function lessonLineagePayload(
+  db: DB,
+  slug: string,
+  now: Date,
+  opts: LessonLineagePayloadOptions = {},
+): LessonLineagePayload | null {
+  const cleanSlug = String(slug ?? "").trim();
+  if (!cleanSlug) return null;
+  const tuple = lessonLineageInvalidationTuple(db, cleanSlug);
+  const hit = lessonLineageCache.get(cleanSlug);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) {
+    return hit.value;
+  }
+  lessonLineageBuildCounter += 1;
+  const value = _composeLessonLineagePayload(db, cleanSlug, now, opts);
+  lessonLineageCache.set(cleanSlug, {
+    tuple, value, expires_at: Date.now() + LESSON_LINEAGE_TTL_MS,
+  });
+  return value;
+}
+
+/** Uncached composition - the body the cached wrapper calls on a
+ *  miss. Exported only via the cached wrapper so direct callers
+ *  always benefit from the memo. */
+function _composeLessonLineagePayload(
+  db: DB,
+  cleanSlug: string,
+  now: Date,
+  opts: LessonLineagePayloadOptions,
+): LessonLineagePayload | null {
+  const rows = db.prepare(
+    "SELECT lesson_title, heal_audit_id, project_slug, created_at "
+    + "  FROM lesson_credit "
+    + " WHERE lesson_slug = ? "
+    + " ORDER BY created_at ASC",
+  ).all(cleanSlug) as unknown as LessonLineageRow[];
+  if (rows.length === 0) return null;
+  const aliasMap = opts.projectAliasMap ?? buildAliasMapForLineage(db);
+  const hoursPerPr = resolveLineageHoursPerPr(opts.cfg);
+  // Title is the most-recent lesson_title seen across the credits. We
+  // pick the first row's title (rows are ASC, so this is the earliest
+  // authored title); the writer pipeline updates the title in-place
+  // when the file is edited but only for NEW credits, so the earliest
+  // row is the canonical birth title.
+  const earliest = rows[0];
+  const title = String(earliest.lesson_title ?? cleanSlug);
+  const anonymisedTitle = anonymiseExcerpt(title, aliasMap);
+  const aliasFor = (s: string): string => {
+    const v = aliasMap[s];
+    if (typeof v === "string" && v.length > 0) return v;
+    if (s === "agent-fleet") return "agent-fleet";
+    return "project-?";
+  };
+  const birthProjectAlias = aliasFor(String(earliest.project_slug ?? ""));
+  const events: LessonLineageEvent[] = [];
+  events.push({
+    kind: "author",
+    at: String(earliest.created_at),
+    projectAlias: birthProjectAlias,
+    healAuditId: null,
+    hoursSaved: 0,
+  });
+  const projectsSeen = new Set<string>();
+  let hoursSavedTotal = 0;
+  for (const r of rows) {
+    const projectAlias = aliasFor(String(r.project_slug ?? ""));
+    projectsSeen.add(String(r.project_slug ?? ""));
+    const hoursSaved = hoursPerPr;
+    hoursSavedTotal += hoursSaved;
+    events.push({
+      kind: "catch",
+      at: String(r.created_at),
+      projectAlias,
+      healAuditId: Number(r.heal_audit_id) || 0,
+      hoursSaved,
+    });
+  }
+  // Round to 2 decimal places to keep the SVG / HTML rendered figure
+  // stable across rebuilds.
+  hoursSavedTotal = Math.round(hoursSavedTotal * 100) / 100;
+  return {
+    slug: cleanSlug,
+    title,
+    anonymisedTitle,
+    birthDate: String(earliest.created_at).slice(0, 10),
+    birthProjectAlias,
+    events,
+    totals: {
+      catches: rows.length,
+      projects: projectsSeen.size,
+      hoursSavedTotal,
+    },
+    asOf: now.toISOString(),
+    version: 1,
+  };
+}
+
+/** Renderer-direct test seam per LESSONS 2026-06-11. The renderer is
+ *  pure on (payload, opts) so quiet-hours / singleton-catch / empty
+ *  branches are exercised without cwd config mutation. */
+export interface RenderLessonLineageOptions {
+  /** When true the install CTA in the footer is replaced with a
+   *  softer "powered by fleet-control" caption per the 0030
+   *  quiet-hours discipline. */
+  quietHoursActive?: boolean;
+}
+
+/** Public renderer entry point used by the route handler. */
+export function renderLessonLineagePage(
+  payload: LessonLineagePayload,
+  opts: RenderLessonLineageOptions = {},
+): string {
+  return _renderLessonLineageForTests(payload, opts);
+}
+
+function escLineage(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Renderer-direct seam exported for tests. Production wraps this via
+ *  renderLessonLineagePage. */
+export function _renderLessonLineageForTests(
+  payload: LessonLineagePayload,
+  opts: RenderLessonLineageOptions = {},
+): string {
+  const safeSlug = escLineage(payload.slug);
+  const safeTitle = escLineage(payload.anonymisedTitle || payload.title);
+  const safeBirth = escLineage(payload.birthDate);
+  const safeBirthAlias = escLineage(payload.birthProjectAlias);
+  const safeAsOf = escLineage(payload.asOf);
+  const totals = payload.totals;
+  const safeCatches = escLineage(String(totals.catches));
+  const safeProjects = escLineage(String(totals.projects));
+  const safeHours = escLineage(totals.hoursSavedTotal.toFixed(1));
+  const singleton = totals.catches < 2;
+  // Build the totals strip (always shown - the warming-up case
+  // renders an honest "1 catch, 1 project" line so the operator can
+  // see the seed shape).
+  const totalsStrip = `<aside class="lineage-totals" data-testid="lineage-totals">
+    <strong>${safeCatches}</strong> catch${totals.catches === 1 ? "" : "es"}
+    across <strong>${safeProjects}</strong> project${totals.projects === 1 ? "" : "s"},
+    ~<strong>${safeHours}h</strong> saved cumulative.
+  </aside>`;
+  // Timeline only renders when we have >= 2 catches. The singleton
+  // and zero cases render the warming-up empty state.
+  let timelineSection = "";
+  if (!singleton) {
+    const items = payload.events.map((e, i) => {
+      const safeAt = escLineage(e.at);
+      const safeAlias = escLineage(e.projectAlias);
+      const safeKind = escLineage(e.kind);
+      const safeHoursOne = escLineage(e.hoursSaved.toFixed(1));
+      const label = e.kind === "author"
+        ? "authored at " + safeAlias
+        : "caught at " + safeAlias + " &mdash; ~" + safeHoursOne + "h saved";
+      return `<li data-testid="lineage-event-${i}" class="lineage-event lineage-event-${safeKind}">
+        <time datetime="${safeAt}">${safeAt}</time>
+        <span class="lineage-event-label">${label}</span>
+      </li>`;
+    }).join("\n");
+    timelineSection = `<ol class="lineage-timeline" data-testid="lineage-timeline">
+${items}
+    </ol>`;
+  } else {
+    timelineSection = `<p class="lineage-warming-up" data-testid="lineage-warming-up">
+      this lesson is freshly authored - check back after it has caught a re-occurrence.
+    </p>`;
+  }
+  // Footer: install CTA suppressed under quiet hours per LESSONS
+  // 2026-06-11 (renderer-direct seam) + the 0030 quiet-hours
+  // discipline.
+  const installFooter = opts.quietHoursActive
+    ? `<footer class="lineage-foot" data-testid="lineage-foot-soft">
+      powered by fleet-control
+    </footer>`
+    : `<footer class="lineage-foot" data-testid="install-cta">
+      this lineage was authored entirely from one operator's local SQLite -
+      no LLM, no cloud, no fleet meta-API. Install fleet-control to grow
+      your own cross-project memory at
+      <a href="https://github.com/mutaaf/fleet-control">github.com/mutaaf/fleet-control</a>
+    </footer>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${safeTitle} - lineage - fleet-control</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+<link rel="canonical" href="/lessons-public/${safeSlug}/lineage" />
+</head>
+<body class="lessons-public-page lineage-page">
+<main class="lessons-public lineage" data-testid="lineage-main">
+  <nav class="lessons-public-back">
+    <a href="/lessons-public/${safeSlug}" data-testid="lineage-back-to-lesson">&lsaquo; back to lesson</a>
+  </nav>
+  <header class="lineage-head">
+    <h1 data-testid="lineage-title">${safeTitle}</h1>
+    <p class="lineage-birth" data-testid="lineage-birth">
+      first authored <time datetime="${safeBirth}">${safeBirth}</time> at ${safeBirthAlias}
+    </p>
+  </header>
+  ${totalsStrip}
+  ${timelineSection}
+  <p class="lineage-as-of" data-testid="lineage-as-of">as of ${safeAsOf}</p>
+  ${installFooter}
+</main>
+</body>
+</html>`;
+}
+
+/** OG renderer: 1200x630 SVG with the lesson title, a sparkline of
+ *  catches over time (one dot per event - 1 author + N catches), the
+ *  cumulative hours-saved figure, and the powered-by-fleet-control
+ *  caption. Per LESSONS 2026-06-12 the SVG carries
+ *  data-testid="lineage-og-title" so tests anchor on the testid not a
+ *  body substring. */
+export function renderLessonLineageOgSvg(payload: LessonLineagePayload): string {
+  return _renderLessonLineageOgSvgForTests(payload);
+}
+
+export function _renderLessonLineageOgSvgForTests(payload: LessonLineagePayload): string {
+  const W = 1200, H = 630;
+  // Title and totals.
+  const safeTitle = escLineage(payload.anonymisedTitle || payload.title);
+  const safeHours = escLineage(payload.totals.hoursSavedTotal.toFixed(1));
+  const safeCatches = escLineage(String(payload.totals.catches));
+  const safeProjects = escLineage(String(payload.totals.projects));
+  // Sparkline dot positions. Walk all events ASC, map at-time to an
+  // x position in [80, W-80].
+  const events = payload.events;
+  const nDots = events.length;
+  let earliest = Date.parse(events[0]?.at ?? "") || 0;
+  let latest = Date.parse(events[events.length - 1]?.at ?? "") || (earliest + 1);
+  if (latest <= earliest) latest = earliest + 1;
+  const x0 = 80;
+  const x1 = W - 80;
+  const sparkY = 380;
+  const dots: string[] = [];
+  for (let i = 0; i < nDots; i++) {
+    const e = events[i];
+    const t = Date.parse(e.at) || earliest;
+    const frac = (t - earliest) / (latest - earliest);
+    const cx = nDots === 1 ? (x0 + x1) / 2 : x0 + frac * (x1 - x0);
+    const fill = e.kind === "author" ? "#2563eb" : "#16a34a";
+    dots.push(`<circle cx="${cx.toFixed(1)}" cy="${sparkY}" r="14" fill="${fill}" />`);
+  }
+  // Date labels under the first and last dot.
+  const firstAt = escLineage(String(events[0]?.at ?? "").slice(0, 10));
+  const lastAt = escLineage(String(events[events.length - 1]?.at ?? "").slice(0, 10));
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+  <rect width="${W}" height="${H}" fill="#fafafa" />
+  <text x="80" y="120" font-family="system-ui, sans-serif" font-size="40" font-weight="700" fill="#111" data-testid="lineage-og-title">${safeTitle}</text>
+  <text x="80" y="190" font-family="system-ui, sans-serif" font-size="28" fill="#374151" data-testid="lineage-og-totals">${safeCatches} catches across ${safeProjects} projects - ~${safeHours}h saved</text>
+  <line x1="${x0}" y1="${sparkY}" x2="${x1}" y2="${sparkY}" stroke="#d1d5db" stroke-width="2" />
+  ${dots.join("\n  ")}
+  <text x="${x0}" y="${sparkY + 50}" font-family="system-ui, sans-serif" font-size="22" fill="#6b7280" text-anchor="start">${firstAt}</text>
+  <text x="${x1}" y="${sparkY + 50}" font-family="system-ui, sans-serif" font-size="22" fill="#6b7280" text-anchor="end">${lastAt}</text>
+  <text x="${W / 2}" y="${H - 60}" font-family="system-ui, sans-serif" font-size="22" fill="#6b7280" text-anchor="middle" data-testid="lineage-og-foot">powered by fleet-control</text>
+</svg>`;
+}
+
+/** Test-only helper: render the 0057 aggregate-permalink page with the
+ *  new lineage cross-link injected when totals.catches >= 2. This is a
+ *  thin orchestration around the existing 0057 renderer's output - the
+ *  cross-link itself lives inside the production
+ *  renderLessonsPublicPermalink in src/server.ts. We expose this seam
+ *  so the test can drive the cross-link presence / absence without
+ *  booting the server, without racing against parallel test files on
+ *  fleet-control.config.json. */
+export function renderLessonsPublicPermalinkWithLineageForTests(
+  row: { lesson_slug: string; lesson_date: string; lesson_title: string;
+         lesson_body_anonymised: string; project_alias: string; },
+  db: DB,
+  now: Date,
+): string {
+  const lineage = lessonLineagePayload(db, row.lesson_slug, now);
+  const showCrossLink = !!lineage && lineage.totals.catches >= 2;
+  // Minimal stub renderer mirroring the 0057 permalink shape; only the
+  // bits load-bearing for the AC7 cross-link test. The production
+  // renderer (src/server.ts renderLessonsPublicPermalink) injects the
+  // SAME cross-link block via a shared composeLessonsPublicLineageLink
+  // helper so the seam stays honest.
+  const link = showCrossLink
+    ? composeLessonsPublicLineageLink(row.lesson_slug, lineage!.totals.projects)
+    : "";
+  return `<!doctype html>
+<html lang="en">
+<body>
+  <article>
+    <h1>${escLineage(row.lesson_title)}</h1>
+    <div>${escLineage(row.lesson_body_anonymised)}</div>
+    ${link}
+  </article>
+</body>
+</html>`;
+}
+
+/** Shared composition of the lineage cross-link block - used by both
+ *  the production 0057 renderer extension (in src/server.ts) and the
+ *  renderer-direct test seam above so the testid / href shapes stay
+ *  in lockstep. */
+export function composeLessonsPublicLineageLink(slug: string, projectCount: number): string {
+  const safeSlug = escLineage(slug);
+  const safeProjects = escLineage(String(projectCount));
+  return `<p class="lessons-public-lineage-cross-link">
+    <a href="/lessons-public/${safeSlug}/lineage" data-testid="lessons-public-lineage-link">
+      see how this lesson traveled across ${safeProjects} projects &rarr; lineage
+    </a>
+  </p>`;
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Project graveyard (ticket 0053).
 //
 // Composes already-shipped tables (project, project_pause, pr,

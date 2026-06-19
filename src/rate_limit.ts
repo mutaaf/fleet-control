@@ -404,10 +404,17 @@ export function resolveRateLimitOpts(
  *  The set is documented in the ticket's "Engineering notes" section
  *  and matches the existing public-route mounts in src/server.ts.
  *  Ticket 0065 adds /operator/ to inherit the same per-IP throttle
- *  as the rest of the public surface family. */
+ *  as the rest of the public surface family.
+ *  Ticket 0069 adds /lessons-public/ so the public lesson-lineage
+ *  page (and the 0057 archive + permalink it siblings) inherit the
+ *  same per-IP throttle as the other public surfaces. The 0057
+ *  surface predates 0064 and did not opt in; the lineage ticket
+ *  closes that gap (a single popular paste of a lineage URL on
+ *  Hacker News must not starve the operator's own loopback portal). */
 export function isRateLimitedPath(path: string): boolean {
   return path.startsWith("/embed/")
     || path.startsWith("/og/")
     || path.startsWith("/share/")
-    || path.startsWith("/operator/");
+    || path.startsWith("/operator/")
+    || path.startsWith("/lessons-public/");
 }

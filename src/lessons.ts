@@ -729,6 +729,17 @@ export function attributeHealsToLessons(
         .__fleet_lesson_savings_by_project_invalidate__;
       if (typeof byProjectHook === "function") byProjectHook();
     } catch { /* never let an in-process cache fail an attribution */ }
+    // Ticket 0069: the per-slug lineage memo cache derives directly
+    // from lesson_credit rows; a fresh credit row may grow the
+    // timeline or flip a singleton-shape lesson into a multi-catch
+    // one. Wake the lineage memo via the same globalThis-slot pattern
+    // (registered by src/server.ts on module load) - never an import
+    // cycle (LESSONS 2026-06-05).
+    try {
+      const lineageHook = (globalThis as { __fleet_lesson_lineage_invalidate__?: () => void })
+        .__fleet_lesson_lineage_invalidate__;
+      if (typeof lineageHook === "function") lineageHook();
+    } catch { /* never let an in-process cache fail an attribution */ }
   }
   return { credits_inserted: inserted, heals_examined: healRows.length };
 }

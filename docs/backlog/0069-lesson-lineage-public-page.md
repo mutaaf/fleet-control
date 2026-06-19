@@ -1,7 +1,7 @@
 ---
 id: 0069
 title: Public lesson lineage page - one /lessons-public/<slug>/lineage URL traces a single cross-fleet lesson from its birth project through every later project it prevented a failure in with timestamps and dollars-saved per ripple so the moat-shaped artifact only fleet-control can author becomes the canonical "show me" link
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-19
@@ -441,4 +441,41 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-19: status -> in-progress on branch feat/0069-lesson-lineage-public-page.
+  Plan: (a) tests/lesson-lineage.test.ts with one test() per AC checkbox;
+  (b) new helpers `lessonLineagePayload`, `renderLessonLineagePage`,
+  `_renderLessonLineageForTests`, `renderLessonLineageOgSvg`,
+  `_renderLessonLineageOgSvgForTests` in src/views.ts alongside the existing
+  `lessonSavingsRollup` (0052) and `lessonSavingsByProject` (0056) family;
+  (c) new public routes GET /lessons-public/<slug>/lineage and
+  GET /og/lessons-public/<slug>/lineage.svg in src/server.ts mounted BEFORE
+  the `if (path.startsWith("/api/"))` auth gate; (d) globalThis slot
+  `__fleet_lesson_lineage_invalidate__` registered from src/server.ts and
+  consumed lazily from src/lessons.ts attributeHealsToLessons; (e) extend
+  the existing 0057 `renderLessonsPublicPermalink` with a cross-link to
+  the lineage page when `totals.catches >= 2`; (f) extend
+  `isRateLimitedPath` to include `/lessons-public/` (the 0057 surface
+  did not add it - confirmed by grep src/rate_limit.ts:408-413);
+  (g) README bullet under the Server routes - Read table.
+  Reconciliation notes per LESSONS:
+  - 2026-06-13: NO new `from "./lessons.ts"` import in views.ts. The
+    anonymisation reuses the existing private `anonymiseExcerpt` already
+    in views.ts (at views.ts:7132, added by 0058).
+  - 2026-06-05: the 0057 helper is named `lessonsPublicArchive` (not
+    `lessonsPublicPayload` as the spec prose says). lineage helper uses
+    its own name; the totals-strip arithmetic uses the existing
+    LESSON_SAVINGS_FLOOR_USD floor + cfg.worth_it.hourly_rate_usd
+    pattern so the rollup numbers stay consistent with 0052.
+  - 2026-06-07: cache invalidation tuple is
+    (MAX(lesson_credit.created_at WHERE lesson_slug=?),
+     COUNT(*) FROM lesson_credit WHERE lesson_slug=?) - lesson_credit
+    has composite PK (lesson_slug, lesson_date, heal_audit_id), no
+    surrogate id.
+  - 2026-06-11: helper comment block keeps every sibling-helper
+    identifier in PLAIN PROSE (no backticks) so 0052 character-window
+    grep tests cannot leak across the helper boundary.
+  - 2026-06-15: cross-link uses `data-testid` attribute (not
+    greedy `id=` regex).
+  - 2026-06-11: `_renderLessonLineageForTests(payload, opts)` is the
+    renderer-direct seam for the quiet-hours branch; no cwd config
+    mutation in any test.
