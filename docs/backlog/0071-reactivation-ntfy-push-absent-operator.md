@@ -1,7 +1,7 @@
 ---
 id: 0071
 title: Reactivation ntfy push when the operator has not opened the portal in 5+ days - one Sunday 18:00 nudge with a deep link to a "what you would have missed" digest page so the operator who drifted gets a single character-shaped notification that pulls them back without nagging
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-19
@@ -502,3 +502,7 @@ Each box maps 1:1 to a test scenario.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-06-19 - implementation-dev: flipped status from groomed to
+  in-progress; branch feat/0071-reactivation-ntfy-push-absent-operator
+  cut from origin/main.
