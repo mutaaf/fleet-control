@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -4071,6 +4071,132 @@ function serveOperatorOgSvg(
   };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0068 - Operator-to-operator referral graph.
+//
+// One PUBLIC route (no auth, no loopback gate; inherits the 0064
+// rate-limit via isRateLimitedPath in src/rate_limit.ts and mounts
+// BEFORE the if path startsWith api auth gate further down):
+//   GET /referrals/<handle>          - self-contained HTML page
+//
+// Per-handle memo cache. The cache invalidation tuple is
+// (MAX snapshot.created_at WHERE kind='referral_ack',
+//  COUNT(*) FROM snapshot WHERE kind='referral_ack') per LESSONS
+// 2026-06-07 - the snapshot table carries created_at but no
+// surrogate id. Per LESSONS in-process dedup sets need an explicit
+// reset hook for tests we expose _resetReferralGraphCacheForTests;
+// per LESSONS expose a build counter for cache-hit tests we expose
+// _getReferralGraphCacheBuildsForTests; per LESSONS 2026-06-05 the
+// ingest invalidation function is registered on globalThis under
+// __fleet_referral_invalidate__.
+//
+// Per LESSONS 2026-06-11 the cfg-dependent quietHours branch is
+// driven via _renderReferralGraphForTests in views.ts, NOT cwd
+// config mutation.
+const REFERRAL_GRAPH_TTL_MS = 60_000; // 60s per the ticket cadence
+interface ReferralGraphCacheEntry {
+  tuple: string;
+  value: ReferralGraphPayload;
+  expires_at: number;
+}
+const referralGraphCache = new Map<string, ReferralGraphCacheEntry>();
+let referralGraphBuildCounter = 0;
+
+export function _resetReferralGraphCacheForTests(): void {
+  referralGraphCache.clear();
+  referralGraphBuildCounter = 0;
+}
+
+export function _getReferralGraphCacheBuildsForTests(): number {
+  return referralGraphBuildCounter;
+}
+
+interface ReferralGraphTupleRow { mx: string | null; c: number | null; }
+
+function referralGraphInvalidationTuple(db: DB, handle: string): string {
+  // Per LESSONS 2026-06-07 the snapshot table has no surrogate id;
+  // we proxy fresh ack via (MAX created_at WHERE kind='referral_ack',
+  // COUNT(*) WHERE kind='referral_ack'). Either moving busts the
+  // cache identically to a phantom id.
+  const row = db.prepare(
+    "SELECT MAX(created_at) AS mx, COUNT(*) AS c FROM snapshot WHERE kind = 'referral_ack'",
+  ).get() as unknown as ReferralGraphTupleRow | undefined;
+  const mx = row?.mx ?? "";
+  const c = Number(row?.c ?? 0);
+  return handle + "|" + mx + "|" + c;
+}
+
+export function _invalidateReferralGraphCache(): void {
+  referralGraphCache.clear();
+}
+
+(globalThis as { __fleet_referral_invalidate__?: () => void })
+  .__fleet_referral_invalidate__ = _invalidateReferralGraphCache;
+
+/** Cached chokepoint for the referral graph payload. Returns null
+ *  ONLY when the handle is empty - callers pass a non-empty handle
+ *  per the route handler's prefix guard. */
+function getReferralGraphCached(
+  db: DB, cfg: FleetConfig, handle: string, now: Date,
+): ReferralGraphPayload | null {
+  if (!handle) return null;
+  const tuple = referralGraphInvalidationTuple(db, handle);
+  const hit = referralGraphCache.get(handle);
+  if (hit && hit.tuple === tuple && hit.expires_at > Date.now()) return hit.value;
+  const value = referralGraphPayload(db, cfg, handle, now);
+  referralGraphBuildCounter += 1;
+  referralGraphCache.set(handle, {
+    tuple, value, expires_at: Date.now() + REFERRAL_GRAPH_TTL_MS,
+  });
+  return value;
+}
+
+/** Test seam: drive the cached layer directly. */
+export function _referralGraphCachedForTests(
+  db: DB, cfg: FleetConfig, handle: string, now: Date,
+): ReferralGraphPayload | null {
+  return getReferralGraphCached(db, cfg, handle, now);
+}
+
+/** Single chokepoint for GET /referrals/<handle>. The visitor does
+ *  NOT need to BE the upstream operator - anyone can browse the
+ *  page; the consent gate on displayHandle in the payload protects
+ *  anonymity. 404s when the rendered payload has totalIntroduced=0
+ *  AND the upstream operator config does NOT name this handle (a
+ *  stranger browsing a non-existent referral graph gets 404; the
+ *  upstream operator browsing their own empty graph gets a 200 with
+ *  the honest empty-state copy). */
+function serveReferralGraph(
+  db: DB, cfg: FleetConfig, handle: string, now: Date,
+): { status: number; headers: Record<string, string>; body: string } {
+  const payload = getReferralGraphCached(db, cfg, handle, now);
+  if (!payload) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "not found",
+    };
+  }
+  const isOwner = cfg.operator?.handle === handle;
+  if (payload.totalIntroduced === 0 && !isOwner) {
+    return {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: "not found",
+    };
+  }
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const body = renderReferralGraphPage(payload, { quietHoursActive: quiet });
+  return {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=60",
+    },
+    body,
+  };
+}
+
 /** Per LESSONS 2026-06-12 "greedy [^>]+id= regex over a <h2 id=...
  *  data-testid=...>" - every meta tag carries a data-testid so the
  *  test assertions anchor on it (no greedy `property=` match). */
@@ -5192,6 +5318,13 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
     try { syncPricing(db); } catch { /* keep serving */ }
     runIngestPass(db, cfg);
     lastIngest = Date.now();
+    // Ticket 0068: write one local referral_ack snapshot row when
+    // cfg.operator.referredBy is set. Idempotent on the
+    // (upstream, downstream) tuple via the derived snapshot.id so a
+    // restart that re-reads the same cfg is a silent no-op. Bust the
+    // cache so any cached payload reflects the fresh row.
+    try { recordReferralAck(db, cfg, new Date()); } catch { /* keep serving */ }
+    _invalidateReferralGraphCache();
   } else {
     // Demo mode: the fixture is the source of truth. Forbid the periodic
     // read-time ingest from firing by pinning lastIngest into the future
@@ -5556,6 +5689,27 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           return res.end("not found");
         }
         const result = serveOperatorOgSvg(db, cfg, slug, new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
+      }
+      // Ticket 0068: operator-to-operator referral graph. PUBLIC route
+      // mounted BEFORE the if path startsWith api auth gate further
+      // down so a remote LinkedIn / Twitter / Bluesky reader can
+      // fetch the page without a token. The /referrals/ prefix is
+      // covered by isRateLimitedPath in src/rate_limit.ts so the
+      // 0064 throttle catches a misbehaving crawler. When the
+      // upstream operator named by handle has zero referral_ack rows
+      // AND the local cfg.operator.handle does NOT match the
+      // requested handle, the route 404s (a stranger browsing a non-
+      // existent graph); the local operator browsing their OWN
+      // empty graph gets 200 + honest empty-state copy.
+      if (path.startsWith("/referrals/") && req.method === "GET") {
+        const handle = path.slice("/referrals/".length);
+        if (!handle || handle.includes("/") || !/^[A-Za-z0-9._-]+$/.test(handle)) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const result = serveReferralGraph(db, cfg, handle, new Date());
         res.writeHead(result.status, result.headers);
         return res.end(result.body);
       }

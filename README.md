@@ -236,7 +236,29 @@ Everything is JSON. Loopback is fully trusted; LAN requires an `x-fleet-token` h
 
 Read endpoints refresh stale data inline (max once every 10s if the daemon is off), so the UI always reflects something current without you running `backfill`.
 
-**Public artifact surfaces** (no auth, paste-friendly URLs): `/pulse`, `/receipts`, `/year`, `/calculator`, `/failures`, `/lessons-public`, `/lessons-public/<slug>` (one lesson permalink), and — new in ticket 0069 — `/lessons-public/<slug>/lineage` (timeline of every project that lesson has caught a re-occurrence in, plus a 1200x630 OG card at `/og/lessons-public/<slug>/lineage.svg`).
+**Public artifact surfaces** (no auth, paste-friendly URLs): `/pulse`, `/receipts`, `/year`, `/calculator`, `/failures`, `/lessons-public`, `/lessons-public/<slug>` (one lesson permalink), `/lessons-public/<slug>/lineage` (timeline of every project that lesson has caught a re-occurrence in, plus a 1200x630 OG card at `/og/lessons-public/<slug>/lineage.svg`), and — new in ticket 0068 — `/referrals/<handle>` (the operator-to-operator referral graph: who introduced N operators to fleet-control, with anonymised tiles for downstream operators that have not opted into public credit).
+
+### Operator referrals
+
+The new operator who installed fleet-control because of an upstream operator's recommendation opts into the referral graph by adding one nested object to `fleet-control.config.json`:
+
+```json
+{
+  "operator": {
+    "handle": "alice",
+    "sinceDate": "2026-03-01",
+    "referredBy": {
+      "handle": "mutaaf",
+      "acknowledgedAt": "2026-06-19",
+      "consentPublicCredit": true
+    }
+  }
+}
+```
+
+On the next `fleetctl serve` boot the daemon writes one local `snapshot` row of `kind='referral_ack'` carrying `{ upstream: "mutaaf", downstream: "alice", acknowledgedAt, consentPublicCredit, version: 1 }`. The row is local to the new operator's DB — there is NO network call to the upstream operator's instance. The upstream operator's `/referrals/mutaaf` page is therefore a LOCAL VIEW of the upstream's own DB. The upstream operator's `/operator/mutaaf` page grows a fifth stat block "N operators introduced to fleet-control" that links to the referral graph.
+
+`consentPublicCredit` defaults to `false`: the downstream operator's real handle stays anonymised (rendered as a SHA-256 placeholder) on the upstream's page unless the downstream explicitly opts in. The opt-in flips the placeholder to the downstream's real handle so the chain is browseable.
 
 ### Write
 

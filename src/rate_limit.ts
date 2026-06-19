@@ -410,11 +410,15 @@ export function resolveRateLimitOpts(
  *  same per-IP throttle as the other public surfaces. The 0057
  *  surface predates 0064 and did not opt in; the lineage ticket
  *  closes that gap (a single popular paste of a lineage URL on
- *  Hacker News must not starve the operator's own loopback portal). */
+ *  Hacker News must not starve the operator's own loopback portal).
+ *  Ticket 0068 adds /referrals/ so the public operator-referral
+ *  graph page inherits the same per-IP throttle as the rest of the
+ *  /operator/ family. */
 export function isRateLimitedPath(path: string): boolean {
   return path.startsWith("/embed/")
     || path.startsWith("/og/")
     || path.startsWith("/share/")
     || path.startsWith("/operator/")
+    || path.startsWith("/referrals/")
     || path.startsWith("/lessons-public/");
 }
