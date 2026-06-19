@@ -950,3 +950,44 @@ If no (a pure helper that reads injected state), put it outside.
 Same trap will bite any future doctor check that wraps a real
 socket / shell-out — the unit test will be green and the AC8
 subprocess test silently triggers a real network attempt in CI.
+
+## 2026-06-19 — testing `loadConfig()` with a non-default config: spawn a subprocess pinned to a tmpdir cwd, never write to the real cwd's `fleet-control.config.json`
+
+Symptom: while shipping ticket 0068 I added an AC1 test that needed
+to verify `loadConfig()` populates the new `operator.referredBy`
+field when that field is present in `fleet-control.config.json`. The
+obvious first cut wrote the test config to `process.cwd() +
+"/fleet-control.config.json"` with the snapshot/restore pattern the
+0065 operator-profile test already uses for its boot tests. The
+test passed in isolation, then started flaking other test files
+(operator-profile AC2/AC4/AC5) the moment another file ran in
+parallel and also wrote to the same path. Cause: this is the
+2026-06-11 lesson exactly — `process.cwd()` is shared across all
+`node --test` workers on the same machine; the snapshot is per-
+process, the file is global. The 2026-06-11 lesson's fix was "for
+any branch test that depends on cfg, use a renderer-direct seam" —
+but my AC1 test wasn't testing a renderer branch. It was testing
+**`loadConfig()` itself**, which has no renderer-direct seam (it
+reads `process.cwd()` and parses JSON; the only way to drive it
+is to mutate something it reads). Fix: spawn a subprocess via
+`spawnSync(process.execPath, ["--input-type=module", "-e", "..."],
+{ cwd: <tmpdir> })` so the subprocess's `process.cwd()` is the
+tmpdir, NOT the test runner's shared cwd. The subprocess writes
+`<tmpdir>/fleet-control.config.json`, invokes `loadConfig()`,
+prints the result to stdout, and exits — zero contamination of
+the shared cwd. The test parses the stdout JSON for its
+assertions. General rule for this repo: any test that needs to
+drive `loadConfig()` against a NON-DEFAULT config file MUST run
+`loadConfig()` in a subprocess pinned to an isolated `cwd` via
+`spawnSync` — never write to the test-runner's `process.cwd() +
+"/fleet-control.config.json"`. The renderer-direct seam covers
+the "I need to drive a branch that depends on cfg" case; the
+subprocess-pinned-cwd seam covers the "I need to drive the cfg
+parser itself" case. Same trap will bite any future ticket that
+introduces a new optional config field whose AC expects "load
+this config; assert the parser returns the field populated".
+The script form `"import { loadConfig } from \"<abs-path-to-
+src/config.ts>\"; process.stdout.write(JSON.stringify(loadConfig
+()))"` is the smallest working seam — no FLEET_DB_PATH knob
+needed (the parser also reads that env var if set; passing it
+along via the subprocess's env keeps the tmpdir DB hermetic).

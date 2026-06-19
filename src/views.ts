@@ -1,4 +1,5 @@
 // Assemble API payloads: cached history (SQLite) + fresh live state (live.ts).
+import { createHash } from "node:crypto";
 import type { DB } from "./db.ts";
 import type { FleetConfig } from "./config.ts";
 import { jobLive, selfCancelDays } from "./live.ts";
@@ -8416,6 +8417,12 @@ export interface OperatorProfilePayload {
   topLessons: OperatorProfileLessonRow[];
   attribution: "anonymised" | "attributed";
   quietHoursActive: boolean;
+  /** Ticket 0068: number of downstream operators that recorded this
+   *  operator as their fleet-control referral. Composed from
+   *  referralGraphPayload(db, cfg, this.handle, now).totalIntroduced.
+   *  Renderer surfaces a fifth stat block ONLY when this is > 0
+   *  (the existing four stat blocks stay byte-identical otherwise). */
+  referralsIntroduced: number;
   asOf: string;
   version: 1;
 }
@@ -8588,6 +8595,12 @@ export function operatorProfilePayload(
     };
   });
 
+  // Ticket 0068: referralsIntroduced is populated by reading the
+  // totalIntroduced count from referralGraphPayload for the operator's
+  // own handle. The helper is defined below in this file (hoisted
+  // function declaration so forward reference is safe).
+  const referralsIntroduced = referralGraphPayload(db, cfg, op.handle, now).totalIntroduced;
+
   return {
     handle: op.handle,
     displayName: op.displayName ?? op.handle,
@@ -8604,6 +8617,7 @@ export function operatorProfilePayload(
     topLessons,
     attribution,
     quietHoursActive: false, // filled in by the route layer
+    referralsIntroduced,
     asOf: now.toISOString(),
     version: 1,
   };
@@ -8699,6 +8713,16 @@ export function renderOperatorProfilePage(
     ? `<div class="operator-profile-quiet" data-testid="operator-profile-quiet-caption">fleet operator since ${sinceDate}</div>`
     : `<a class="operator-profile-install-cta" data-testid="install-cta" href="https://github.com/mutaaf/fleet-control">install fleet-control</a>`;
 
+  // Ticket 0068: optional referrals stat block. Rendered ONLY when
+  // referralsIntroduced > 0 so the existing four-block layout stays
+  // byte-identical on a zero-referral fleet. The block links to the
+  // /referrals/<handle> route so a reader can browse the downstream
+  // tree.
+  const referralsCount = p.referralsIntroduced ?? 0;
+  const referralsBlock = referralsCount > 0
+    ? `<a class="operator-profile-stat" data-testid="operator-profile-referrals" href="/referrals/${handle}"><span class="operator-profile-stat-value">${referralsCount}</span><span class="operator-profile-stat-label">${referralsCount} operators introduced to fleet-control</span></a>`
+    : "";
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -8727,6 +8751,7 @@ export function renderOperatorProfilePage(
     <div class="operator-profile-stat" data-testid="operator-profile-lessons-authored"><span class="operator-profile-stat-value">${totals.lessonsAuthored}</span><span class="operator-profile-stat-label">lessons authored</span></div>
     <div class="operator-profile-stat" data-testid="operator-profile-projects-active"><span class="operator-profile-stat-value">${totals.projectsActive}</span><span class="operator-profile-stat-label">projects active</span></div>
     <div class="operator-profile-stat" data-testid="operator-profile-months-running"><span class="operator-profile-stat-value">${totals.monthsRunning}</span><span class="operator-profile-stat-label">months running</span></div>
+    ${referralsBlock}
   </section>
   <section class="operator-profile-recent">
     <h2>recent ships</h2>
@@ -8787,6 +8812,295 @@ export function renderOperatorOgSvg(p: OperatorProfilePayload): string {
 
 export function _renderOperatorOgSvgForTests(p: OperatorProfilePayload): string {
   return renderOperatorOgSvg(p);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0068 - Operator-to-operator referral graph.
+//
+// Three helpers + one renderer + one test seam:
+//   - referralGraphPayload(db, cfg, handle, now): compose the public
+//     tile list for the upstream operator named by handle.
+//   - recordReferralAck(db, cfg, now): write one local referral_ack
+//     snapshot row per startup when cfg.operator.referredBy is set;
+//     idempotent on the (upstream, downstream) tuple.
+//   - renderReferralGraphPage(payload, opts): pure HTML composer.
+//   - _renderReferralGraphForTests: branch driver per LESSONS 2026-06-11.
+//
+// LESSONS hygiene:
+//   - 2026-05-29 time-pinned: each helper takes now: Date. No
+//     new Date() inside the helpers.
+//   - 2026-06-05 invalidation: the server side caches the payload and
+//     registers an invalidation function on
+//     globalThis.__fleet_referral_invalidate__ so ingest-side commits
+//     bust the cache without an import cycle.
+//   - 2026-06-07 invalidation-tuple: snapshot rows have no surrogate
+//     id BUT do carry created_at; the cache key is
+//     (MAX(created_at WHERE kind='referral_ack'), COUNT(*) WHERE
+//     kind='referral_ack') - mirrors the riskiest-PR tuple precedent.
+//   - 2026-06-11 expose a renderer-direct seam so the quiet-hours
+//     branch is testable without booting startServer.
+//   - 2026-06-12 every HTML scrape anchors on data-testid so a
+//     greedy id= regex never picks up the wrong attribute.
+//   - 2026-06-13 no new module - the helpers live alongside the
+//     operator profile helpers in views.ts.
+//   - The leading comment block above uses plain prose for all
+//     identifiers (no backticks) per LESSONS 2026-06-11 character-
+//     window sibling-helper greps. The sibling siblings here are the
+//     operator profile helpers which do not have character-window
+//     greps but the precedent stays.
+// ────────────────────────────────────────────────────────────────────
+
+/** One tile on the referral graph page. handleAnon is the SHA-256 hex
+ *  first 8 chars of the downstream handle - stable across reloads so
+ *  the placeholder tile keeps the same anonymised identity. When the
+ *  downstream consented (consentPublicCredit = true) the renderer
+ *  surfaces displayHandle instead of the placeholder; otherwise
+ *  displayHandle is null and the placeholder is the only thing the
+ *  reader sees. */
+export interface ReferralGraphTile {
+  handleAnon: string;
+  displayHandle: string | null;
+  sinceDate: string;
+  prsShipped: number;
+  consentPublicCredit: boolean;
+}
+
+/** Full referral graph payload returned by referralGraphPayload. The
+ *  shape is the route renderer's input AND the operator-profile stat
+ *  block's source. version is 1 for v1; future field additions
+ *  extend without breaking the route shape. */
+export interface ReferralGraphPayload {
+  handle: string;
+  totalIntroduced: number;
+  /** ISO date of the earliest acknowledgedAt across the tiles. Null
+   *  when totalIntroduced === 0 (no since-date to project). */
+  since: string | null;
+  tiles: ReferralGraphTile[];
+  asOf: string;
+  version: 1;
+}
+
+interface ReferralAckRow {
+  payload_json: string;
+  created_at: string;
+}
+
+interface ReferralAckPayload {
+  upstream?: string;
+  downstream?: string;
+  acknowledgedAt?: string;
+  consentPublicCredit?: boolean;
+  prsShipped?: number;
+  sinceDate?: string;
+  version?: number;
+}
+
+/** Stable anonymised placeholder for a downstream handle. SHA-256 hex
+ *  first 8 chars - per the AC spec. */
+function referralHandleAnon(downstream: string): string {
+  return createHash("sha256").update(String(downstream ?? "")).digest("hex").slice(0, 8);
+}
+
+/** Compose the referral graph payload for an upstream operator. Pulls
+ *  every snapshot row whose kind = 'referral_ack' AND payload.upstream
+ *  matches the requested handle, then assembles one tile per row. The
+ *  helper is intentionally tolerant of malformed payloads (we treat
+ *  missing fields as their zero-values) so a corrupted local row
+ *  cannot break the route. */
+export function referralGraphPayload(
+  db: DB, _cfg: FleetConfig, handle: string, now: Date,
+): ReferralGraphPayload {
+  const rows = db.prepare(
+    "SELECT payload_json, created_at FROM snapshot "
+    + "WHERE kind = 'referral_ack' "
+    + "ORDER BY created_at ASC",
+  ).all() as unknown as ReferralAckRow[];
+
+  const tiles: ReferralGraphTile[] = [];
+  let earliest: string | null = null;
+  for (const r of rows) {
+    let parsed: ReferralAckPayload;
+    try { parsed = JSON.parse(r.payload_json) as ReferralAckPayload; }
+    catch { continue; }
+    if (!parsed || String(parsed.upstream ?? "") !== String(handle)) continue;
+    const downstream = String(parsed.downstream ?? "");
+    if (!downstream) continue;
+    const consent = parsed.consentPublicCredit === true;
+    const ackAt = String(parsed.acknowledgedAt ?? r.created_at ?? "");
+    if (ackAt && (earliest === null || ackAt < earliest)) earliest = ackAt;
+    tiles.push({
+      handleAnon: referralHandleAnon(downstream),
+      displayHandle: consent ? downstream : null,
+      sinceDate: String(parsed.sinceDate ?? ackAt.slice(0, 10) ?? ""),
+      prsShipped: Number(parsed.prsShipped) || 0,
+      consentPublicCredit: consent,
+    });
+  }
+
+  return {
+    handle: String(handle),
+    totalIntroduced: tiles.length,
+    since: earliest ? earliest.slice(0, 10) : null,
+    tiles,
+    asOf: now.toISOString(),
+    version: 1,
+  };
+}
+
+/** Write one referral_ack snapshot row when cfg.operator.referredBy is
+ *  set. Idempotent on the (upstream, downstream) tuple via the
+ *  derived snapshot.id - INSERT OR REPLACE means a subsequent call
+ *  with a flipped consent value overwrites in-place. The expires_at
+ *  field is 100 years out so the ack outlives any normal operator
+ *  retention without a manual extension. The operator revokes the
+ *  ack by editing their fleet-control.config.json (removing the
+ *  referredBy field) AND deleting the row - or just by deleting the
+ *  row directly via snapshot revoke. */
+export function recordReferralAck(db: DB, cfg: FleetConfig, _now: Date): void {
+  const op = cfg.operator;
+  if (!op || !op.handle || !op.referredBy || !op.referredBy.handle) return;
+  if (!op.referredBy.acknowledgedAt) return;
+  const upstream = String(op.referredBy.handle);
+  const downstream = String(op.handle);
+  if (!upstream || !downstream) return;
+  const consent = op.referredBy.consentPublicCredit === true;
+  const ackAt = String(op.referredBy.acknowledgedAt);
+  const id = createHash("sha256")
+    .update("ack|" + upstream + "|" + downstream)
+    .digest("hex");
+  const expiresAt = new Date(
+    new Date(ackAt).getTime() + 100 * 365 * 86_400_000,
+  ).toISOString();
+  const payload: ReferralAckPayload = {
+    upstream,
+    downstream,
+    acknowledgedAt: ackAt,
+    consentPublicCredit: consent,
+    prsShipped: 0,
+    sinceDate: ackAt.slice(0, 10),
+    version: 1,
+  };
+  // INSERT OR REPLACE on the derived id makes the call idempotent on
+  // (upstream, downstream). created_at takes the cfg.referredBy
+  // acknowledgedAt so a re-call with a flipped consent value does NOT
+  // shift the row's created_at - matching the operator's intent that
+  // the ack timestamp is the acknowledgement date, not the last-write
+  // moment.
+  db.prepare(
+    "INSERT OR REPLACE INTO snapshot(id,name,created_at,expires_at,revoked_at,payload_json,kind)"
+    + " VALUES(?,?,?,?,?,?,?)",
+  ).run(
+    id,
+    "referral-ack-" + upstream + "-" + downstream,
+    ackAt,
+    expiresAt,
+    null,
+    JSON.stringify(payload),
+    "referral_ack",
+  );
+}
+
+function escForReferral(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Render the self-contained referral graph HTML page. Pure on the
+ *  payload + the opts surface (quiet-hours flag drives the install
+ *  CTA branch). Empty-state branch (zero tiles) renders the honest
+ *  "no referrals visible from this instance yet" copy. */
+export function renderReferralGraphPage(
+  p: ReferralGraphPayload,
+  opts: { quietHoursActive: boolean },
+): string {
+  const handle = escForReferral(p.handle);
+  const totalIntroduced = Number(p.totalIntroduced) || 0;
+
+  const footer = opts.quietHoursActive
+    ? `<div class="referral-graph-quiet" data-testid="referral-graph-quiet-caption">powered by fleet-control</div>`
+    : `<a class="referral-graph-install-cta" data-testid="install-cta" href="https://github.com/mutaaf/fleet-control">install fleet-control</a>`;
+
+  if (totalIntroduced === 0) {
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${handle} - referrals</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+</head>
+<body class="referral-graph-page">
+<main class="referral-graph">
+  <header class="referral-graph-header">
+    <h1 class="referral-graph-handle" data-testid="referral-graph-handle">${handle}</h1>
+    <div class="referral-graph-subtitle">referrals to fleet-control</div>
+  </header>
+  <section class="referral-graph-empty" data-testid="referral-graph-empty">
+    no referrals visible from this instance yet - referrals appear when a downstream operator opens a PR on a project this fleet ingests.
+  </section>
+  <footer class="referral-graph-footer">
+    ${footer}
+  </footer>
+</main>
+</body>
+</html>`;
+  }
+
+  const tilesHtml = p.tiles.map((t, i) => {
+    const anonSafe = escForReferral(t.handleAnon);
+    const displaySafe = t.displayHandle ? escForReferral(t.displayHandle) : "";
+    const sinceSafe = escForReferral(t.sinceDate);
+    const prsSafe = escForReferral(String(t.prsShipped));
+    const handleLine = t.displayHandle
+      ? `<a class="referral-tile-handle" data-testid="referral-tile-handle-${i}" href="/operator/${displaySafe}">${displaySafe}</a>`
+      : `<span class="referral-tile-anon" data-testid="referral-tile-anon-${i}">operator-${anonSafe}</span>`;
+    return `<li class="referral-tile" data-testid="referral-tile-${i}">`
+      + handleLine
+      + ` <span class="referral-tile-since">operator since ${sinceSafe}</span>`
+      + ` <span class="referral-tile-prs">${prsSafe} PRs shipped</span>`
+      + `</li>`;
+  }).join("");
+
+  const sinceCopy = p.since
+    ? `since ${escForReferral(p.since)}`
+    : "all time";
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>${handle} - referrals</title>
+<link rel="stylesheet" href="/style.css" />
+<meta name="robots" content="index, follow" />
+</head>
+<body class="referral-graph-page">
+<main class="referral-graph">
+  <header class="referral-graph-header">
+    <h1 class="referral-graph-handle" data-testid="referral-graph-handle">${handle}</h1>
+    <div class="referral-graph-subtitle"><span data-testid="referral-graph-total">${totalIntroduced} operators</span> have credited ${handle} as their fleet-control introduction ${sinceCopy}</div>
+  </header>
+  <section class="referral-graph-tiles">
+    <ul class="referral-tiles">${tilesHtml}</ul>
+  </section>
+  <footer class="referral-graph-footer">
+    ${footer}
+  </footer>
+</main>
+</body>
+</html>`;
+}
+
+/** Test seam: drive the renderer's quiet-hours branch directly
+ *  without booting startServer or mutating cwd config. Per
+ *  LESSONS 2026-06-11. */
+export function _renderReferralGraphForTests(
+  p: ReferralGraphPayload,
+  opts: { quietHoursActive: boolean },
+): string {
+  return renderReferralGraphPage(p, opts);
 }
 
 // ────────────────────────────────────────────────────────────────────

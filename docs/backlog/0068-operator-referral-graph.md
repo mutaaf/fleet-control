@@ -482,3 +482,28 @@ Each box maps 1:1 to a test scenario.
   operator-profile suite shape - one test() per AC, pure-helper tests
   + renderer-direct seam for branches + boot-path tests for integration
   shape. All timestamps anchor on a pinned NOW per LESSONS 2026-05-29.
+- 2026-06-19: implemented FleetConfig.operator.referredBy in
+  src/config.ts; OperatorProfilePayload.referralsIntroduced in
+  src/views.ts (computed via referralGraphPayload); the new helper
+  block referralGraphPayload + recordReferralAck +
+  renderReferralGraphPage + _renderReferralGraphForTests landed
+  alongside the existing operator profile helpers in src/views.ts.
+  The server-side cache + globalThis.__fleet_referral_invalidate__
+  invalidation hook live in src/server.ts next to the operator-
+  profile cache. recordReferralAck fires from startServer post-
+  ingest; idempotent on the (upstream, downstream) tuple via the
+  derived snapshot.id. /referrals/<handle> mounts BEFORE the
+  if (path.startsWith("/api/")) auth gate alongside the /operator/
+  family; isRateLimitedPath grows /referrals/ alongside /operator/.
+  The conditional fifth stat block in renderOperatorProfilePage
+  renders ONLY when referralsIntroduced > 0 (existing four-block
+  layout stays byte-identical on a zero-referral fleet).
+- 2026-06-19: tests/operator-referral-graph.test.ts ships with one
+  test() per AC checkbox. AC1 drives loadConfig in an isolated
+  subprocess (cwd = a tmpdir) so the race against parallel test
+  files that mutate cwd's fleet-control.config.json never fires
+  per LESSONS 2026-06-11. AC4 boot integration is replaced with a
+  static grep + helper-direct cached-layer test for the same
+  reason. All 16 tests pass locally. The local gate
+  (npm ci + npx tsc --noEmit + node scripts/check-backlog.mjs)
+  is green.

@@ -102,6 +102,22 @@ export interface FleetConfig {
      *  page. When omitted the og:image falls back to the request
      *  Host header (per the 0061 composeOgMetaTags pattern). */
     publicHost?: string;
+    /** Ticket 0068: operator-to-operator referral. OPERATOR-AUTHORED:
+     *  the new operator credits the upstream operator who introduced
+     *  them to fleet-control by writing this field locally. The
+     *  consentPublicCredit toggle gates whether the upstream's
+     *  /referrals/<upstream> page surfaces this downstream's REAL
+     *  handle (true) or the anonymised 8-char hash placeholder
+     *  (false, the documented default). Omitting the field entirely
+     *  signals "I installed without a referral" - the daemon writes
+     *  no referral_ack row. The new operator's local instance writes
+     *  a referral_ack snapshot row on startup; there is NO network
+     *  call to the upstream operator's instance. */
+    referredBy?: {
+      handle: string;
+      acknowledgedAt: string;
+      consentPublicCredit?: boolean;
+    };
   };
 }
 
