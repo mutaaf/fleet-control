@@ -15,6 +15,7 @@ import { resolveWindow, isQuietNow, nextWindowEnd } from "../src/quiet_hours.ts"
 import { weeklyDigest, renderDigestMarkdown, isoWeekKey } from "../src/digest.ts";
 import { listSnapshots } from "../src/snapshot.ts";
 import { runShareCli } from "../src/share.ts";
+import { runExportPortfolioCli, runExportHelp } from "../src/export.ts";
 import {
   computeReceipts, persistReceipts, unpublishReceipts,
   listPublishedReceipts, isValidMonthIso,
@@ -462,6 +463,42 @@ switch (cmd) {
     break;
   }
   case "receipts": receipts(); break;
+  case "export": {
+    // Ticket 0070: `fleetctl export portfolio [--out <path>]
+    // [--include-lessons=false] [--include-receipts=false]` writes a
+    // single self-contained HTML bundle - inlined CSS, OG card as a
+    // data: URI, no external fetches at view time. The export CLI
+    // shim is intentionally thin - the testable logic lives in
+    // src/export.ts behind runExportPortfolioCli() so the file-write
+    // boundary is gated through a writer seam (no shell-out, no
+    // pbcopy parallel - this is a pure node:fs write).
+    const sub = argv[1];
+    if (!sub) {
+      const h = runExportHelp();
+      process.stdout.write(h.stdout);
+      process.exitCode = h.exitCode;
+      break;
+    }
+    if (sub === "portfolio") {
+      const result = runExportPortfolioCli({
+        db,
+        cfg,
+        argv: argv.slice(2),
+        now: new Date(),
+      });
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      if (result.exitCode !== 0) process.exitCode = result.exitCode;
+      break;
+    }
+    // Unknown sub-surface - print help + exit 1 so an operator typo
+    // never silently no-ops.
+    process.stderr.write(`unknown export sub-surface: ${sub}\n`);
+    const h = runExportHelp();
+    process.stdout.write(h.stdout);
+    process.exitCode = 1;
+    break;
+  }
   case "serve": {
     db.close(); // server opens its own handle
     const serveCfg = loadConfig();
@@ -770,6 +807,6 @@ switch (cmd) {
     }
     break;
   }
-  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|share <pulse|receipts|calculator|lessons|profile|revoke <id-prefix>>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|doctor [--json]|onboard [--non-interactive] [--skip <list>] [--help]]");
+  default: console.log("usage: fleetctl [backfill|status|runs <slug>|show <id>|serve|demo [--port=N]|daemon on|off|alerts|tokens add|list|revoke|pricing sync|show|ntfy test|quiet-hours|digest [--week|--last-7] [--save]|snapshot create <name>|list|revoke <id-prefix>|share <pulse|receipts|calculator|lessons|profile|revoke <id-prefix>>|receipts publish <slug> <YYYY-MM>|unpublish <slug> <YYYY-MM>|list|export portfolio [--out <path>]|doctor [--json]|onboard [--non-interactive] [--skip <list>] [--help]]");
 }
 if (cmd !== "serve" && cmd !== "daemon-run" && cmd !== "demo") db.close();

@@ -1,7 +1,7 @@
 ---
 id: 0070
 title: fleetctl export portfolio command writes a single self-contained portfolio.html bundle - inlined CSS, data URI OG image, no external fetches - so the operator can email it / attach to a CV / archive offline and the accumulated-history moat becomes a portable artifact the operator owns forever
-status: groomed
+status: in-progress
 priority: P2
 area: infra
 created: 2026-06-19
@@ -430,3 +430,18 @@ Each box maps 1:1 to a test scenario.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-19 — implementation-dev (Claude Opus 4.7, 1M context)
+
+Picked up by the ship loop. Branched feat/0070-fleetctl-export-portfolio-html
+off main. Plan: one test() per AC checkbox; new module src/export.ts;
+sibling subcommand mounted alongside `share` in bin/fleetctl.ts. Module
+imports views.ts + receipts.ts one-way (per LESSONS 2026-06-13). File-
+write boundary uses node:fs writeFileSync exposed behind
+_setExportWriterForTests (per LESSONS 2026-05-26). The OG card is
+inlined as a data: URI computed from renderOperatorOgSvg + Buffer.
+Path-safety reject for traversal + nul bytes (AC8). Missing-handle gate
+matches the 0067 fleetctl share profile precedent (AC7). Per LESSONS
+2026-06-19 the subprocess test for the CLI driver pins cwd to a tmpdir
+when it needs to drive loadConfig() with a non-default config so it
+never contaminates the test runner's shared cwd.
