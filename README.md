@@ -362,6 +362,28 @@ The home page of the portal shows a banner with the open count, and clicking thr
 
 ---
 
+## Reactivation push (ticket 0071)
+
+When the operator has been away from the portal for 5 or more days, fleet-control fires **one** ntfy push notification on Sunday at 18:00 local time (operator's quiet-hours timezone, defaulting to UTC) with a deep link to a `/digest-missed/<token>` page summarising what shipped during the absence.
+
+The schedule is intentionally conservative:
+
+- **Trigger window:** Sunday between 17:50 and 18:10 local time.
+- **Absence threshold:** `last_visit_at` older than 5 days.
+- **Dedup floor:** no prior reactivation push fired in the previous 14 days (so an operator absent for 3 weeks gets ONE nudge, not three).
+- **Quiet-hours:** the fleet-wide quiet-hours window suppresses the push even on Sunday 18:00; the operator wakes up to the digest page on Monday morning.
+
+The notification text is deterministic and friend-shaped — no marketing tone, no LLM call. Two branches:
+
+- `featuresShipped >= 1`: *"you've not checked in for N days. M features shipped without you. take a look: <url>"*
+- `featuresShipped === 0`: *"you've not checked in for N days. the fleet was quiet too. say hi when you can: <url>"*
+
+Tapping the notification lands the operator on `/digest-missed/<token>` — a self-contained page summarising the absent period (top three ships, the riskiest open PR, the biggest cost delta). The token is signed via the same 0013 snapshot infrastructure; the URL is throttled by the per-IP rate limiter (ticket 0064) so a leaked link cannot starve the operator's own loopback portal.
+
+**Opt-out:** add `"reactivationPush": { "disabled": true }` to `fleet-control.config.json`. The daemon helper short-circuits before any ntfy POST and no snapshot row is minted.
+
+---
+
 ## SQLite schema — what's in the database
 
 WAL mode. `synchronous=NORMAL`. Foreign keys on. Single writer; readers never block. Path defaults to `~/.local/state/fleet-control/fleet.db` (override with `dbPath` in the config).

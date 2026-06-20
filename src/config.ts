@@ -119,6 +119,15 @@ export interface FleetConfig {
       consentPublicCredit?: boolean;
     };
   };
+  /** Reactivation push opt-out (ticket 0071). When omitted (the default)
+   *  the daemon helper evaluateReactivationPush treats the operator as
+   *  enabled - the Sunday 18:00 nudge fires when the operator has been
+   *  absent for 5+ days. When set to true the helper short-circuits with
+   *  reason "opt_out" and never fires the push. The defaulting pattern
+   *  matches the existing embedRateLimit / worth_it nested fields. */
+  reactivationPush?: {
+    disabled?: boolean;
+  };
 }
 
 const DEFAULTS: FleetConfig = {
