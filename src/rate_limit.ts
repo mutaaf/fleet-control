@@ -413,12 +413,20 @@ export function resolveRateLimitOpts(
  *  Hacker News must not starve the operator's own loopback portal).
  *  Ticket 0068 adds /referrals/ so the public operator-referral
  *  graph page inherits the same per-IP throttle as the rest of the
- *  /operator/ family. */
+ *  /operator/ family.
+ *  Ticket 0071 adds /digest-missed/ so the reactivation-push deep
+ *  link (the new signed-token surface that resolves a stored
+ *  reactivation_digest snapshot) inherits the same per-IP throttle.
+ *  A drift-period digest URL is a public token-bearing surface
+ *  shaped identically to /share/ from the rate-limit's point of
+ *  view - the token IS the auth and the only legitimate caller is
+ *  the operator who tapped their own ntfy notification. */
 export function isRateLimitedPath(path: string): boolean {
   return path.startsWith("/embed/")
     || path.startsWith("/og/")
     || path.startsWith("/share/")
     || path.startsWith("/operator/")
     || path.startsWith("/referrals/")
-    || path.startsWith("/lessons-public/");
+    || path.startsWith("/lessons-public/")
+    || path.startsWith("/digest-missed/");
 }

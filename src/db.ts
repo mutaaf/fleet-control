@@ -290,6 +290,21 @@ CREATE TABLE IF NOT EXISTS lesson_credit (
   PRIMARY KEY (lesson_slug, lesson_date, heal_audit_id)
 );
 CREATE INDEX IF NOT EXISTS lesson_credit_created_at ON lesson_credit(created_at DESC);
+
+-- Reactivation push watermark (ticket 0071). At most one row, pinned via
+-- a CHECK on the primary key constant. The visit-tracking middleware in
+-- src/server.ts UPSERTs (INSERT OR REPLACE) the singleton on every
+-- authenticated, non-public, non-/api/ request from the operator so the
+-- daemon-side evaluateReactivationPush helper can compute days-since-
+-- visit by reading exactly one row. last_user_agent is recorded for
+-- future diagnostic prints; the daemon helper does NOT read it. Per
+-- LESSONS no backticks inside template-literal SQL strings, all
+-- identifiers stay plain words inside this SCHEMA template.
+CREATE TABLE IF NOT EXISTS operator_visit_watermark (
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  last_visit_at   TEXT,
+  last_user_agent TEXT
+);
 `;
 
 export type DB = DatabaseSync;

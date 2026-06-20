@@ -3,11 +3,12 @@
 // when the dashboard is closed. Shares the exact same orchestrator + rules.
 import { writeFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { randomBytes, createHash } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { loadConfig } from "./config.ts";
-import { openDb } from "./db.ts";
+import { loadConfig, type FleetConfig } from "./config.ts";
+import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { evalAlerts } from "./alerts.ts";
 import { runBudgetGuards } from "./budget_guard.ts";
@@ -16,6 +17,11 @@ import { runDriftHook } from "./drift.ts";
 import {
   runLessonsHook, loadCrossLessons, defaultLessonsPath, attributeHealsToLessons,
 } from "./lessons.ts";
+import {
+  evaluateReactivationPush, composeReactivationMessage,
+  type ReactivationPushPayload,
+} from "./views.ts";
+import { ntfyConfigFrom, sendNtfy, type NtfyResult } from "./ntfy.ts";
 
 const UID = process.getuid?.() ?? 0;
 const LABEL = "com.fleet.control.fleetd";
@@ -24,6 +30,114 @@ const REPO = join(fileURLToPath(import.meta.url), "..", "..");
 const LOGDIR = join(homedir(), ".local", "state", "fleet-control", "logs");
 
 const sleep = (s: number) => new Promise((r) => setTimeout(r, s * 1000));
+
+// ────────────────────────────────────────────────────────────────────
+// Reactivation push (ticket 0071) - one daemon-tick helper.
+//
+// Mints a reactivation_digest snapshot row plus POSTs the deterministic
+// ntfy message when the operator has been absent for 5 or more days AND
+// the local clock falls inside the Sunday 17:50 to 18:10 window. The
+// 14-day dedup floor lives inside evaluateReactivationPush so a re-tick
+// at now + 1h sees the just-minted row and short-circuits with reason
+// deduped - mirroring the alert dedup pattern in src/ntfy.ts. The deps
+// shape mirrors the 0009 / 0030 tick helpers - sendNtfy is injectable
+// so tests record a synthetic call instead of POSTing to ntfy.sh. Per
+// LESSONS 2026-06-15 the offline gate FLEET_DAEMON_OFFLINE=1 short-
+// circuits the helper at the daemon-tick boundary so the AC8
+// subprocess test never reaches the real ntfy transport.
+// ────────────────────────────────────────────────────────────────────
+
+export interface ReactivationPushDeps {
+  sendNtfy: (topic: string, payload: {
+    title: string;
+    message: string;
+    priority: number;
+    click?: string;
+    tags?: string[];
+  }) => Promise<NtfyResult>;
+  mintToken: () => string;
+  hostForUrl?: string;
+}
+
+export interface ReactivationPushResult {
+  fired: boolean;
+  reason: string;
+}
+
+const REACTIVATION_TTL_HOURS = 24 * 30;
+
+function defaultReactivationDeps(): ReactivationPushDeps {
+  return {
+    sendNtfy: (topic, payload) => sendNtfy(topic, {
+      title: payload.title,
+      message: payload.message,
+      priority: payload.priority,
+      tags: payload.tags,
+      click: payload.click,
+    }),
+    mintToken: () => randomBytes(24).toString("hex"),
+  };
+}
+
+/** Daemon-tick helper for the reactivation push (ticket 0071). Calls
+ *  evaluateReactivationPush, mints a reactivation_digest snapshot row
+ *  on the firing branch, then POSTs the deterministic ntfy message via
+ *  the injected sendNtfy seam. Returns fired plus the reason string
+ *  so the daemon log line stays diagnosable without re-running the
+ *  evaluator. Offline gate: FLEET_DAEMON_OFFLINE=1 short-circuits with
+ *  reason offline so a hermetic subprocess test (or a workstation
+ *  with no network) never touches the ntfy.sh transport. */
+export async function maybeFireReactivationPush(
+  db: DB,
+  cfg: FleetConfig,
+  now: Date,
+  deps?: Partial<ReactivationPushDeps>,
+): Promise<ReactivationPushResult> {
+  if (process.env.FLEET_DAEMON_OFFLINE === "1") {
+    return { fired: false, reason: "offline" };
+  }
+  const ncfg = ntfyConfigFrom(cfg);
+  if (!ncfg.topic) {
+    return { fired: false, reason: "ntfy_disabled" };
+  }
+  const merged: ReactivationPushDeps = {
+    ...defaultReactivationDeps(),
+    ...(deps ?? {}),
+  };
+  const host = merged.hostForUrl ?? ncfg.portalUrl.replace(/\/+$/, "").replace(/\/#\/p\/?$/, "");
+  const baseUrl = host || "http://127.0.0.1:7070";
+  const token = merged.mintToken();
+  const evaluation = evaluateReactivationPush(db, cfg, now, baseUrl, token);
+  if (!evaluation.shouldPush || !evaluation.payload) {
+    return { fired: false, reason: evaluation.reason };
+  }
+  const payload: ReactivationPushPayload = evaluation.payload;
+  const id = createHash("sha256").update(token).digest("hex");
+  const createdAt = now.toISOString();
+  const expiresAt = new Date(
+    now.getTime() + REACTIVATION_TTL_HOURS * 3600_000,
+  ).toISOString();
+  const name = "reactivation-" + createdAt.slice(0, 10);
+  db.prepare(
+    "INSERT INTO snapshot(id,name,created_at,expires_at,revoked_at,payload_json,kind)"
+    + " VALUES(?,?,?,?,?,?,?)",
+  ).run(
+    id, name, createdAt, expiresAt, null,
+    JSON.stringify(payload), "reactivation_digest",
+  );
+  const message = composeReactivationMessage(payload);
+  const title = payload.featuresShipped === 0
+    ? "the fleet was quiet too"
+    : payload.featuresShipped + " shipped while you were away";
+  await merged.sendNtfy(ncfg.topic, {
+    title,
+    message,
+    priority: 3,
+    click: payload.url,
+    tags: ["wave", "reactivation"],
+  });
+  return { fired: true, reason: "ready" };
+}
 
 /** The long-running loop (launchd ProgramArguments points here). */
 export async function runDaemon(intervalSec = 60): Promise<void> {
@@ -100,6 +214,21 @@ export async function runDaemon(intervalSec = 60): Promise<void> {
           }
         }
       } catch (e) { console.error("lesson-credit hook error:", e); }
+      // Ticket 0071: reactivation push. Cheap evaluator (one SQL read
+      // on operator_visit_watermark + one COUNT on snapshot kind =
+      // reactivation_digest); only the Sunday 17:50-18:10 branch
+      // actually mints a snapshot row + POSTs to ntfy. The 14-day
+      // dedup window inside the evaluator means a re-tick at now + 1h
+      // sees the just-minted row and short-circuits. Offline gate
+      // (FLEET_DAEMON_OFFLINE=1) short-circuits at the helper's
+      // entry point so the hermetic subprocess tests never reach
+      // the ntfy transport.
+      try {
+        const r = await maybeFireReactivationPush(db, cfg, new Date());
+        if (r.fired) {
+          console.log(`${new Date().toISOString()} reactivation push fired`);
+        }
+      } catch (e) { console.error("reactivation push hook error:", e); }
     } catch (e) { console.error("pass error:", e); }
     await sleep(intervalSec);
   }

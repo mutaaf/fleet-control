@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, serveReactivationDigest, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -121,6 +121,56 @@ function readBody(req: any): Promise<any> {
   return new Promise((resolve) => {
     let s = ""; req.on("data", (c: any) => (s += c)); req.on("end", () => { try { resolve(s ? JSON.parse(s) : {}); } catch { resolve({}); } });
   });
+}
+
+// Ticket 0071: visit-tracking middleware. The reactivation push helper
+// in src/views.ts evaluates days-since-visit against the singleton
+// operator_visit_watermark row; this helper UPSERTs that row on every
+// request that satisfies all three conditions: NOT under one of the
+// public-surface prefixes (/embed/, /og/, /share/, /referrals/,
+// /operator/, /lessons-public/, /receipts/, /pulse/, /calculator/,
+// /failures/, /year/, /digest-missed/) - those visitors are cold
+// readers, not the operator; NOT under /api/ (the daemon polls /api/
+// continuously and counting daemon polls as operator visits would
+// defeat the entire signal); AND request is loopback OR carries a
+// valid token. INSERT OR REPLACE on the singleton row keeps concurrent
+// updates consistent. Per LESSONS no backticks inside template-
+// literal SQL strings the identifiers stay plain words.
+const REACTIVATION_PUBLIC_PREFIXES = [
+  "/embed/",
+  "/og/",
+  "/share/",
+  "/referrals/",
+  "/operator/",
+  "/lessons-public/",
+  "/receipts/",
+  "/pulse",
+  "/calculator",
+  "/failures",
+  "/year/",
+  "/digest-missed/",
+];
+
+function isOperatorVisitPath(path: string): boolean {
+  // Skip the daemon-polled /api/ family - counting the daemon's poll
+  // as an operator visit defeats the entire signal. We do NOT use the
+  // statement shape that the route-ordering greps anchor on; the
+  // sibling identifier check below uses the prefix as a substring.
+  if (path.indexOf("/api/") === 0) return false;
+  for (const pfx of REACTIVATION_PUBLIC_PREFIXES) {
+    if (path === pfx || path.startsWith(pfx)) return false;
+  }
+  return true;
+}
+
+function recordOperatorVisit(db: DB, req: any, now: Date): void {
+  const userAgent = String(req.headers?.["user-agent"] ?? "");
+  try {
+    db.prepare(
+      "INSERT OR REPLACE INTO operator_visit_watermark"
+      + "(id, last_visit_at, last_user_agent) VALUES (1, ?, ?)",
+    ).run(now.toISOString(), userAgent.slice(0, 240));
+  } catch { /* best-effort; never block the request */ }
 }
 
 const WEB = join(fileURLToPath(import.meta.url), "..", "..", "web");
@@ -5355,6 +5405,41 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           res.writeHead(r429.status, r429.headers);
           return res.end(r429.body);
         }
+      }
+      // Ticket 0071: visit-tracking middleware. Sits between the rate
+      // limit and the route dispatcher so the watermark reflects every
+      // authenticated operator request without counting daemon polls
+      // or public-surface cold-reader hits. Loopback-or-token gate
+      // matches the existing requireAuth posture; we run authenticate
+      // inline (not requireAuth, which JSON-responds on failure) so a
+      // remote caller without a token still proceeds to the route
+      // dispatcher and lands on whichever 401 / 404 the next handler
+      // owns.
+      if (isOperatorVisitPath(path)) {
+        if (isLoopback(req)) {
+          recordOperatorVisit(db, req, new Date());
+        } else {
+          const raw = String(req.headers["x-fleet-token"] ?? url.searchParams.get("token") ?? "");
+          if (raw && authenticate(db, raw)) {
+            recordOperatorVisit(db, req, new Date());
+          }
+        }
+      }
+      // Ticket 0071: reactivation digest deep link. PUBLIC route
+      // mounted BEFORE the /api/ auth gate further down so an operator
+      // tapping the ntfy notification from their phone (no token)
+      // reaches the renderer. The token IS the auth - 404 on unknown
+      // OR revoked OR expired OR wrong-kind tokens via the
+      // serveReactivationDigest helper. Per LESSONS 2026-06-15 the
+      // static route-ordering grep anchors on the actual if-statement
+      // (with curly brace) at the gate; this comment intentionally
+      // does NOT reproduce the if-statement shape so a sibling test's
+      // naked indexOf does not collapse to the comment offset.
+      const dmm = path.match(/^\/digest-missed\/([0-9a-fA-F]+)$/);
+      if (dmm && req.method === "GET") {
+        const result = serveReactivationDigest(db, cfg, dmm[1], new Date());
+        res.writeHead(result.status, result.headers);
+        return res.end(result.body);
       }
       // Ticket 0062: monthly fleet retro card dismissal. Sits BEFORE
       // the /api/control/<verb> dispatcher so the verb dispatcher's

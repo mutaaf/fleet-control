@@ -9599,3 +9599,502 @@ export function stakeholderInviteCard(
     payload_id: "static-v1",
   };
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Reactivation push (ticket 0071).
+//
+// Three pure helpers + one renderer-direct seam compose the Sunday
+// 18:00 reactivation nudge for an operator who has been absent for
+// 5 or more days:
+//
+//   evaluateReactivationPush(db, cfg, now) returns a shouldPush
+//     boolean plus a reason string plus the composed payload. The
+//     boolean is true only when all six gates pass: Sunday in tz,
+//     local time between 17:50 and 18:10, last_visit_at older than
+//     5 days, opt-out flag absent, no prior reactivation snapshot
+//     in the last 14 days, and quietHoursActiveAnywhere false.
+//
+//   composeReactivationMessage(payload) returns the deterministic
+//     ntfy message string. Two branches: features-shipped (M is
+//     1 or more) and fleet-was-quiet (M is 0). Pure on its input.
+//
+//   reactivationDigestPayload(db, cfg, lastVisitAt, now) walks the
+//     pr table for the absent period and assembles the digest
+//     payload the deep-link page renders. Reused by both the
+//     daemon helper (snapshot mint) and the route (live render).
+//
+//   renderReactivationDigestPage / _renderReactivationDigestForTests
+//     produce the self-contained HTML page for the deep link.
+//     Quiet-hours flag drives a soft footer per LESSONS
+//     2026-06-11 renderer-direct seam pattern.
+//
+// All comment lines below use plain prose only; no backticks around
+// any identifier per LESSONS 2026-06-11 character-window-source-grep
+// avoidance (sibling helpers like stakeholderInviteCard and the
+// fleetWeeklyPulse family carry slice-grepped tests against their
+// own name plus N characters, so a backticked identifier in this
+// block could poison their slice windows).
+// ────────────────────────────────────────────────────────────────────
+
+const REACTIVATION_DEDUP_WINDOW_DAYS = 14;
+const REACTIVATION_ABSENT_DAYS = 5;
+const REACTIVATION_PUSH_WINDOW_START_MIN = 17 * 60 + 50;
+const REACTIVATION_PUSH_WINDOW_END_MIN = 18 * 60 + 10;
+
+export interface ReactivationPushPayload {
+  daysAway: number;
+  featuresShipped: number;
+  lastVisitAt: string;
+  generatedAt: string;
+  url: string;
+  highlights: ReactivationDigestHighlight[];
+}
+
+export interface ReactivationDigestHighlight {
+  kind: "longest_merged_pr" | "riskiest_open_pr" | "biggest_cost_delta";
+  project_slug: string;
+  label: string;
+}
+
+export interface ReactivationLessonHighlight {
+  lesson_slug: string;
+  lesson_date: string;
+  lesson_title: string;
+}
+
+export type ReactivationReason =
+  | "ready"
+  | "no_visit"
+  | "within_window"
+  | "not_sunday"
+  | "outside_18_window"
+  | "opt_out"
+  | "deduped"
+  | "quiet_hours_active";
+
+export interface ReactivationEvaluation {
+  shouldPush: boolean;
+  reason: ReactivationReason;
+  payload: ReactivationPushPayload | null;
+}
+
+interface VisitWatermarkRow { last_visit_at: string | null; }
+
+function readLastVisitAt(db: DB): string | null {
+  const row = db.prepare(
+    "SELECT last_visit_at FROM operator_visit_watermark WHERE id = 1",
+  ).get() as unknown as VisitWatermarkRow | undefined;
+  return row?.last_visit_at ?? null;
+}
+
+function quietHoursTz(cfg: FleetConfig): string {
+  const anyCfg = cfg as unknown as { quietHours?: { tz?: string } };
+  const tz = anyCfg.quietHours?.tz;
+  if (typeof tz === "string" && tz) {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: tz });
+      return tz;
+    } catch { return "UTC"; }
+  }
+  return "UTC";
+}
+
+interface ZoneClock { dayOfWeek: number; minuteOfDay: number; }
+
+function clockInZone(now: Date, tz: string): ZoneClock {
+  let fmt: Intl.DateTimeFormat;
+  try {
+    fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+  } catch {
+    fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: "UTC",
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+  }
+  const parts = fmt.formatToParts(now);
+  let weekday = "Sun";
+  let hour = 0;
+  let minute = 0;
+  for (const p of parts) {
+    if (p.type === "weekday") weekday = p.value;
+    else if (p.type === "hour") hour = Number(p.value);
+    else if (p.type === "minute") minute = Number(p.value);
+  }
+  if (hour === 24) hour = 0;
+  const map: Record<string, number> = {
+    Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+  };
+  const dow = map[weekday] ?? 0;
+  return { dayOfWeek: dow, minuteOfDay: hour * 60 + minute };
+}
+
+function countRecentReactivationSnapshots(db: DB, now: Date): number {
+  const cutoff = new Date(
+    now.getTime() - REACTIVATION_DEDUP_WINDOW_DAYS * 86_400_000,
+  ).toISOString();
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c FROM snapshot "
+    + " WHERE kind = 'reactivation_digest' "
+    + "   AND created_at >= ?",
+  ).get(cutoff) as unknown as { c: number | null } | undefined;
+  return Number(row?.c ?? 0) || 0;
+}
+
+function countMergedAgentPrsSince(db: DB, sinceIso: string): number {
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c FROM pr "
+    + " WHERE is_agent = 1 "
+    + "   AND state = 'MERGED' "
+    + "   AND fetched_at IS NOT NULL "
+    + "   AND fetched_at >= ?",
+  ).get(sinceIso) as unknown as { c: number | null } | undefined;
+  return Number(row?.c ?? 0) || 0;
+}
+
+interface AbsentPeriodPrRow {
+  number: number;
+  title: string;
+  project_slug: string;
+  fetched_at: string;
+  gh_created_at: string | null;
+}
+
+function topLongestRunningMergedPr(
+  db: DB, sinceIso: string,
+): AbsentPeriodPrRow | null {
+  const row = db.prepare(
+    "SELECT pr.number AS number, pr.title AS title, "
+    + "       p.slug AS project_slug, pr.fetched_at AS fetched_at, "
+    + "       pr.gh_created_at AS gh_created_at "
+    + "  FROM pr LEFT JOIN project p ON p.id = pr.project_id "
+    + " WHERE pr.is_agent = 1 "
+    + "   AND pr.state = 'MERGED' "
+    + "   AND pr.fetched_at IS NOT NULL "
+    + "   AND pr.fetched_at >= ? "
+    + "   AND pr.gh_created_at IS NOT NULL "
+    + " ORDER BY (julianday(pr.fetched_at) - julianday(pr.gh_created_at)) DESC, "
+    + "          pr.fetched_at DESC "
+    + " LIMIT 1",
+  ).get(sinceIso) as unknown as AbsentPeriodPrRow | undefined;
+  return row ?? null;
+}
+
+function topRiskiestOpenPr(db: DB, sinceIso: string): AbsentPeriodPrRow | null {
+  const row = db.prepare(
+    "SELECT pr.number AS number, pr.title AS title, "
+    + "       p.slug AS project_slug, pr.fetched_at AS fetched_at, "
+    + "       pr.gh_created_at AS gh_created_at "
+    + "  FROM pr LEFT JOIN project p ON p.id = pr.project_id "
+    + " WHERE pr.is_agent = 1 "
+    + "   AND pr.state = 'open' "
+    + "   AND pr.gh_created_at IS NOT NULL "
+    + "   AND pr.gh_created_at <= ? "
+    + " ORDER BY pr.gh_created_at ASC "
+    + " LIMIT 1",
+  ).get(sinceIso) as unknown as AbsentPeriodPrRow | undefined;
+  return row ?? null;
+}
+
+interface ProjectCostDelta { project_slug: string; cost: number; }
+
+function topProjectByCostInWindow(
+  db: DB, sinceIso: string,
+): ProjectCostDelta | null {
+  const sinceDay = sinceIso.slice(0, 10);
+  const row = db.prepare(
+    "SELECT p.slug AS project_slug, SUM(c.cost_usd) AS cost "
+    + "  FROM cost_rollup_day c LEFT JOIN project p ON p.id = c.project_id "
+    + " WHERE c.day >= ? "
+    + " GROUP BY p.id "
+    + " ORDER BY cost DESC, p.slug ASC "
+    + " LIMIT 1",
+  ).get(sinceDay) as unknown as { project_slug: string | null; cost: number | null } | undefined;
+  if (!row || !row.project_slug) return null;
+  const cost = Number(row.cost) || 0;
+  if (cost <= 0) return null;
+  return { project_slug: String(row.project_slug), cost };
+}
+
+/** Compose the reactivation digest payload for the absent period.
+ *  Pure read-side; the daemon helper persists the result via a
+ *  reactivation_digest snapshot row and the deep-link route renders
+ *  it. lastVisitAt is the ISO timestamp the operator was last seen
+ *  on the portal; the helper computes daysAway and the period
+ *  highlights against it. */
+export function reactivationDigestPayload(
+  db: DB,
+  _cfg: FleetConfig,
+  lastVisitAt: string,
+  now: Date,
+  baseUrl: string,
+  token: string,
+): ReactivationPushPayload {
+  const lastMs = Date.parse(lastVisitAt);
+  const daysAway = Number.isFinite(lastMs)
+    ? Math.max(0, Math.floor((now.getTime() - lastMs) / 86_400_000))
+    : 0;
+  const featuresShipped = countMergedAgentPrsSince(db, lastVisitAt);
+  const highlights: ReactivationDigestHighlight[] = [];
+  const longest = topLongestRunningMergedPr(db, lastVisitAt);
+  if (longest) {
+    highlights.push({
+      kind: "longest_merged_pr",
+      project_slug: longest.project_slug,
+      label: "longest-running PR finally merged: #"
+        + String(longest.number) + " in " + longest.project_slug,
+    });
+  }
+  const riskiest = topRiskiestOpenPr(db, lastVisitAt);
+  if (riskiest) {
+    highlights.push({
+      kind: "riskiest_open_pr",
+      project_slug: riskiest.project_slug,
+      label: "riskiest open PR still waiting: #"
+        + String(riskiest.number) + " in " + riskiest.project_slug,
+    });
+  }
+  const costy = topProjectByCostInWindow(db, lastVisitAt);
+  if (costy) {
+    highlights.push({
+      kind: "biggest_cost_delta",
+      project_slug: costy.project_slug,
+      label: "biggest cost delta: " + costy.project_slug
+        + " spent $" + costy.cost.toFixed(2),
+    });
+  }
+  const cleanBase = baseUrl.replace(/\/+$/, "");
+  const url = cleanBase + "/digest-missed/" + token;
+  return {
+    daysAway,
+    featuresShipped,
+    lastVisitAt,
+    generatedAt: now.toISOString(),
+    url,
+    highlights,
+  };
+}
+
+/** Compose the deterministic ntfy message for a reactivation push.
+ *  Pure on payload. Two branches: features-shipped is 1 or more
+ *  versus fleet-was-quiet at zero. Lowercase, friend-text tone. */
+export function composeReactivationMessage(payload: ReactivationPushPayload): string {
+  const n = Math.max(0, Math.floor(payload.daysAway));
+  const m = Math.max(0, Math.floor(payload.featuresShipped));
+  const url = String(payload.url ?? "");
+  if (m === 0) {
+    return "you've not checked in for " + n + " days. "
+      + "the fleet was quiet too. say hi when you can: " + url;
+  }
+  const featureWord = m === 1 ? "feature" : "features";
+  return "you've not checked in for " + n + " days. "
+    + m + " " + featureWord + " shipped without you. "
+    + "take a look: " + url;
+}
+
+/** Evaluate whether a reactivation push should fire NOW. Pure read
+ *  side: looks up the visit watermark, the opt-out flag, the local
+ *  Sunday clock in the operator's tz, the dedup window, and the
+ *  fleet-wide quiet hours. Returns shouldPush plus a reason string
+ *  identifying which gate decided the outcome. The composed payload
+ *  is supplied when shouldPush is true so the daemon helper can
+ *  forward the same shape to createSnapshot plus sendNtfy without
+ *  re-walking the SQL. baseUrl plus token are the URL components
+ *  the daemon helper resolves; in the evaluator's pure-test seam
+ *  the caller supplies them so the result is deterministic on
+ *  fixture input. */
+export function evaluateReactivationPush(
+  db: DB,
+  cfg: FleetConfig,
+  now: Date,
+  baseUrl = "http://127.0.0.1:7070",
+  token = "",
+): ReactivationEvaluation {
+  const optOut = cfg.reactivationPush?.disabled === true;
+  if (optOut) return { shouldPush: false, reason: "opt_out", payload: null };
+
+  const lastVisitAt = readLastVisitAt(db);
+  if (!lastVisitAt) {
+    return { shouldPush: false, reason: "no_visit", payload: null };
+  }
+  const lastMs = Date.parse(lastVisitAt);
+  if (!Number.isFinite(lastMs)) {
+    return { shouldPush: false, reason: "no_visit", payload: null };
+  }
+  const daysSince = (now.getTime() - lastMs) / 86_400_000;
+  if (daysSince < REACTIVATION_ABSENT_DAYS) {
+    return { shouldPush: false, reason: "within_window", payload: null };
+  }
+
+  const tz = quietHoursTz(cfg);
+  const clock = clockInZone(now, tz);
+  if (clock.dayOfWeek !== 0) {
+    return { shouldPush: false, reason: "not_sunday", payload: null };
+  }
+  if (clock.minuteOfDay < REACTIVATION_PUSH_WINDOW_START_MIN
+      || clock.minuteOfDay > REACTIVATION_PUSH_WINDOW_END_MIN) {
+    return { shouldPush: false, reason: "outside_18_window", payload: null };
+  }
+
+  if (countRecentReactivationSnapshots(db, now) > 0) {
+    return { shouldPush: false, reason: "deduped", payload: null };
+  }
+
+  if (quietHoursActiveAnywhere(cfg, now)) {
+    return { shouldPush: false, reason: "quiet_hours_active", payload: null };
+  }
+
+  const payload = reactivationDigestPayload(db, cfg, lastVisitAt, now, baseUrl, token);
+  return { shouldPush: true, reason: "ready", payload };
+}
+
+/** Renderer options for the deep-link digest page. quietHoursActive
+ *  swaps the "open your portal" CTA for a softer "powered by
+ *  fleet-control" footer per the 0030 quiet-hours discipline. */
+export interface ReactivationDigestRenderOptions {
+  quietHoursActive?: boolean;
+  portalUrl?: string;
+}
+
+/** Public renderer entry point. Production wraps the test seam. */
+export function renderReactivationDigestPage(
+  payload: ReactivationPushPayload,
+  opts: ReactivationDigestRenderOptions = {},
+): string {
+  return _renderReactivationDigestForTests(payload, opts);
+}
+
+function escReactivation(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Renderer-direct seam exposed for tests per LESSONS 2026-06-11.
+ *  Production also routes through this from the public wrapper above. */
+export function _renderReactivationDigestForTests(
+  payload: ReactivationPushPayload,
+  opts: ReactivationDigestRenderOptions = {},
+): string {
+  const portalUrl = opts.portalUrl ?? "/";
+  const safeDays = escReactivation(String(Math.max(0, Math.floor(payload.daysAway))));
+  const safeShipped = escReactivation(String(Math.max(0, Math.floor(payload.featuresShipped))));
+  const safeLast = escReactivation(payload.lastVisitAt.slice(0, 10));
+  const quiet = payload.featuresShipped === 0;
+
+  const headlineHtml = quiet
+    ? "<h1 data-testid=\"digest-missed-headline\">the fleet was quiet while you were away</h1>"
+    : "<h1 data-testid=\"digest-missed-headline\">"
+      + safeShipped + " features shipped while you were away</h1>";
+
+  const subhead = "<p class=\"digest-missed-sub\" data-testid=\"digest-missed-sub\">"
+    + "since you last checked in (<time datetime=\"" + safeLast + "\">"
+    + safeLast + "</time>), it has been " + safeDays + " days.</p>";
+
+  let body = "";
+  if (quiet) {
+    body = "<section class=\"digest-missed-quiet-period\" "
+      + "data-testid=\"digest-missed-quiet-period\">"
+      + "the fleet was quiet while you were away - nothing to catch up on. "
+      + "say hi when you can.</section>";
+  } else {
+    const items = payload.highlights.map((h, i) => {
+      const safeLabel = escReactivation(h.label);
+      const safeKind = escReactivation(h.kind);
+      return "<li data-testid=\"digest-missed-highlight-" + i + "\" "
+        + "class=\"digest-missed-highlight digest-missed-" + safeKind + "\">"
+        + safeLabel + "</li>";
+    }).join("");
+    body = "<ol class=\"digest-missed-highlights\" "
+      + "data-testid=\"digest-missed-highlights\">" + items + "</ol>";
+  }
+
+  const cta = opts.quietHoursActive
+    ? "<footer class=\"digest-missed-foot\" "
+      + "data-testid=\"digest-missed-foot-soft\">powered by fleet-control</footer>"
+    : "<footer class=\"digest-missed-foot\">"
+      + "<a class=\"digest-missed-cta\" data-testid=\"digest-missed-cta\" "
+      + "href=\"" + escReactivation(portalUrl) + "\">open your portal</a></footer>";
+
+  return "<!doctype html>\n"
+    + "<html lang=\"en\">\n"
+    + "<head>\n"
+    + "<meta charset=\"utf-8\" />\n"
+    + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\" />\n"
+    + "<title>" + (quiet ? "the fleet was quiet" : safeShipped + " features shipped")
+    + " - fleet-control</title>\n"
+    + "<link rel=\"stylesheet\" href=\"/style.css\" />\n"
+    + "<meta name=\"robots\" content=\"noindex, nofollow\" />\n"
+    + "</head>\n"
+    + "<body class=\"digest-missed-page\">\n"
+    + "<main class=\"digest-missed\" data-testid=\"digest-missed-main\">\n"
+    + "<header class=\"digest-missed-head\">" + headlineHtml + subhead + "</header>\n"
+    + body + "\n"
+    + cta + "\n"
+    + "</main>\n"
+    + "</body>\n"
+    + "</html>";
+}
+
+export interface ServeReactivationDigestResult {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+/** Single chokepoint the server hits for GET /digest-missed/<token>.
+ *  Resolves the token via SHA-256 hash against snapshot.id, asserts
+ *  the row's kind is exactly reactivation_digest, and renders the
+ *  page from the frozen payload. 404 on any failure mode (unknown,
+ *  wrong-kind, revoked, expired) so a guesser can NOT fingerprint
+ *  which tokens used to exist. The token IS the auth - no
+ *  requireAuth chain runs against this route. */
+export function serveReactivationDigest(
+  db: DB,
+  cfg: FleetConfig,
+  token: string,
+  now: Date,
+): ServeReactivationDigestResult {
+  const headers: Record<string, string> = {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "x-robots-tag": "noindex, nofollow",
+  };
+  if (!token || typeof token !== "string" || !/^[0-9a-f]+$/i.test(token)) {
+    return { status: 404, headers, body: "<!doctype html><title>not found</title>" };
+  }
+  const id = createHash("sha256").update(token).digest("hex");
+  const row = db.prepare(
+    "SELECT name, created_at, expires_at, revoked_at, payload_json, kind "
+    + " FROM snapshot WHERE id = ?",
+  ).get(id) as unknown as {
+    name: string; created_at: string; expires_at: string;
+    revoked_at: string | null; payload_json: string; kind: string | null;
+  } | undefined;
+  if (!row) return { status: 404, headers, body: "<!doctype html><title>not found</title>" };
+  if (row.kind !== "reactivation_digest") {
+    return { status: 404, headers, body: "<!doctype html><title>not found</title>" };
+  }
+  if (row.revoked_at) {
+    return { status: 404, headers, body: "<!doctype html><title>not found</title>" };
+  }
+  if (new Date(row.expires_at).getTime() <= now.getTime()) {
+    return { status: 404, headers, body: "<!doctype html><title>not found</title>" };
+  }
+  let payload: ReactivationPushPayload;
+  try { payload = JSON.parse(row.payload_json) as ReactivationPushPayload; }
+  catch {
+    return { status: 404, headers, body: "<!doctype html><title>not found</title>" };
+  }
+  const quiet = quietHoursActiveAnywhere(cfg, now);
+  const body = renderReactivationDigestPage(payload, { quietHoursActive: quiet });
+  return { status: 200, headers, body };
+}
