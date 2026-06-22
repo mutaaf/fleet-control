@@ -1,7 +1,7 @@
 ---
 id: 0069
 title: Public lesson lineage page - one /lessons-public/<slug>/lineage URL traces a single cross-fleet lesson from its birth project through every later project it prevented a failure in with timestamps and dollars-saved per ripple so the moat-shaped artifact only fleet-control can author becomes the canonical "show me" link
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-19
