@@ -1,7 +1,7 @@
 ---
 id: 0071
 title: Reactivation ntfy push when the operator has not opened the portal in 5+ days - one Sunday 18:00 nudge with a deep link to a "what you would have missed" digest page so the operator who drifted gets a single character-shaped notification that pulls them back without nagging
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-19
