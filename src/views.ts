@@ -9601,6 +9601,460 @@ export function stakeholderInviteCard(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Ticket 0072 - Fleet anniversary milestone card and signed share URL.
+//
+// One home-page card fires ONLY on milestone moments (the install-date
+// calendar anniversary AND each crossing of 100 / 500 / 1000 lifetime
+// merged-agent PRs). The card carries a single share button that mints
+// a /share/anniversary/<token> snapshot URL (a new snapshot.kind). The
+// route and the OG sibling at /og/share/anniversary/<token>.svg both
+// resolve the token against the existing 0013 / 0066 snapshot infra.
+//
+// LESSONS hygiene applied here:
+//   - 2026-05-29 every helper takes the caller's now: Date so tests
+//     can pin the wall clock without drift.
+//   - 2026-06-05 cycle-safe: the helper lives inside views.ts so the
+//     server consumes it via a single import; no new module edge.
+//   - 2026-06-05 producer-vs-spec: the lifetime PR count reads
+//     state = MERGED uppercase AND is_agent = 1 - matching the same
+//     reader convention used by countActiveProjectsInMonth and the
+//     0040 / 0044 riskiest / spend-efficiency helpers.
+//   - 2026-06-07 the pr table has no surrogate id - the helper uses
+//     COUNT plus MIN(fetched_at) for the install-date side-effect
+//     write; no MAX(id).
+//   - 2026-06-11 every renderer goes through a _render*ForTests seam
+//     so the branches drive directly without booting startServer.
+//   - 2026-06-13 per-candidate tests seed enough trailing rows to
+//     clear the lessons-still-cited bullet.
+//   - 2026-06-15 the leading prose block uses plain prose for any
+//     sibling-helper-grep-vulnerable identifier (no backticks here).
+// ────────────────────────────────────────────────────────────────────
+
+/** Discriminator for the moment kind. install_year fires when the
+ *  current calendar day matches the install-date row's month + day
+ *  AND years >= 1. pr_100 / pr_500 / pr_1000 fire when the lifetime
+ *  merged-agent PR count just crossed the named threshold. none is
+ *  the no-op case (364 days out of the year on the calendar; below
+ *  the next threshold on the PR axis). */
+export type AnniversaryKind =
+  | "install_year"
+  | "pr_100"
+  | "pr_500"
+  | "pr_1000"
+  | "none";
+
+/** Payload the home card + share page + OG SVG all read. version is
+ *  pinned at 1 so future field additions extend without breaking the
+ *  snapshot payload schema. */
+export interface AnniversaryMoment {
+  kind: AnniversaryKind;
+  /** ISO date string. For install_year this is the recorded install
+   *  date (MIN(pr.fetched_at) at first observation, stamped into the
+   *  operator_install_milestones row). For pr_100 / pr_500 / pr_1000
+   *  this is the timestamp the threshold was first crossed (the row
+   *  recorded_at when persisted). For none this is the empty string. */
+  anniversaryDate: string;
+  /** Whole-year delta between now and the install date. 0 for
+   *  threshold-crossing branches AND for none. */
+  years: number;
+  /** Lifetime merged-agent PR count. */
+  lifetimePrs: number;
+  /** Time-saved approximation drawn from the 0052 lessonSavingsRollup
+   *  arithmetic: heal_count times the average failed-ship cost in
+   *  dollars, converted to whole hours at a documented $75/hr rate. */
+  lifetimeHoursSaved: number;
+  /** Distinct cross-fleet lessons credited in the trailing 90 days. */
+  topLessonsStillCited: number;
+  asOf: string;
+  version: 1;
+}
+
+const ANNIVERSARY_THRESHOLDS = [100, 500, 1000] as const;
+type AnniversaryThreshold = typeof ANNIVERSARY_THRESHOLDS[number];
+
+function thresholdKind(t: AnniversaryThreshold): "pr_100" | "pr_500" | "pr_1000" {
+  if (t === 100) return "pr_100";
+  if (t === 500) return "pr_500";
+  return "pr_1000";
+}
+
+interface AnniversaryInstallRow {
+  recorded_at: string | null;
+}
+
+interface AnniversaryLifetimeRow {
+  c: number | null;
+  earliest: string | null;
+}
+
+function lifetimeMergedAgentPrs(db: DB): AnniversaryLifetimeRow {
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c, MIN(fetched_at) AS earliest"
+    + " FROM pr WHERE state = 'MERGED' AND is_agent = 1",
+  ).get() as unknown as AnniversaryLifetimeRow | undefined;
+  return {
+    c: Number(row?.c ?? 0) || 0,
+    earliest: row?.earliest ?? null,
+  };
+}
+
+/** Write the install_date row if no row exists yet. The recorded_at
+ *  value is the earliest pr.fetched_at on a merged-agent row when one
+ *  exists, otherwise the caller-supplied now. Idempotent on re-call
+ *  thanks to the PK on kind. Exported with the leading-underscore
+ *  convention so production callers know not to invoke this directly. */
+export function _recordInstallDateIfMissing(db: DB, now: Date): void {
+  const existing = db.prepare(
+    "SELECT recorded_at FROM operator_install_milestones WHERE kind = 'install_date'",
+  ).get() as unknown as AnniversaryInstallRow | undefined;
+  if (existing) return;
+  const life = lifetimeMergedAgentPrs(db);
+  const recordedAt = life.earliest && life.c > 0 ? life.earliest : now.toISOString();
+  db.prepare(
+    "INSERT OR IGNORE INTO operator_install_milestones(kind, recorded_at, payload_json)"
+    + " VALUES (?, ?, ?)",
+  ).run("install_date", recordedAt, JSON.stringify({ source: "auto" }));
+}
+
+function recordThresholdIfMissing(
+  db: DB, kind: "pr_100" | "pr_500" | "pr_1000",
+  recordedAt: string, payload: Record<string, unknown>,
+): void {
+  db.prepare(
+    "INSERT OR IGNORE INTO operator_install_milestones(kind, recorded_at, payload_json)"
+    + " VALUES (?, ?, ?)",
+  ).run(kind, recordedAt, JSON.stringify(payload));
+}
+
+function hasMilestoneRow(db: DB, kind: string): boolean {
+  const row = db.prepare(
+    "SELECT 1 AS ok FROM operator_install_milestones WHERE kind = ?",
+  ).get(kind) as unknown as { ok: number } | undefined;
+  return !!row;
+}
+
+/** Compute the topLessonsStillCited number. Distinct lesson slugs the
+ *  fleet's lesson_credit table credits over the trailing 90 days. The
+ *  helper is read-only and SQL-only (no LLM). */
+function topLessonsStillCitedCount(db: DB, now: Date): number {
+  const cutoff = new Date(now.getTime() - 90 * 24 * 3600_000).toISOString();
+  const row = db.prepare(
+    "SELECT COUNT(DISTINCT lesson_slug) AS c FROM lesson_credit"
+    + " WHERE created_at >= ?",
+  ).get(cutoff) as unknown as { c: number | null } | undefined;
+  return Number(row?.c ?? 0) || 0;
+}
+
+/** Documented hourly-rate the time-saved bullet converts the dollar
+ *  savings into. Matches the worth-it / 0048 / 0052 implicit hourly
+ *  framing. Plain constant inline so the calculator stays self-
+ *  contained. */
+const ANNIVERSARY_HOURLY_RATE_USD = 75.0;
+
+/** Top-level helper. Returns the AnniversaryMoment payload the home
+ *  composer and the share renderer both read. Pure on (db, cfg, now)
+ *  except for the install_date side-effect write the first time the
+ *  fleet has merged-agent PR data but no install_date row. */
+export function fleetAnniversaryMoment(
+  db: DB,
+  _cfg: FleetConfig,
+  now: Date,
+): AnniversaryMoment {
+  const life = lifetimeMergedAgentPrs(db);
+  const lifetimePrs = life.c;
+
+  // Side-effect: write the install_date row from the earliest
+  // pr.fetched_at the first time we observe a non-empty fleet. The
+  // helper short-circuits if a row already exists.
+  if (lifetimePrs > 0) {
+    _recordInstallDateIfMissing(db, now);
+  }
+
+  const installRow = db.prepare(
+    "SELECT recorded_at FROM operator_install_milestones WHERE kind = 'install_date'",
+  ).get() as unknown as AnniversaryInstallRow | undefined;
+
+  // Lifetime hours saved approximation per the lessonSavingsRollup
+  // math: heal_count * average failed-ship cost; converted to whole
+  // hours at the documented hourly rate. Trailing 365-day window is
+  // sufficient on a 1-year-anniversary fleet; for longer-running
+  // fleets the same window keeps the number stable. lessonSavingsRollup
+  // returns the per-lesson rows; we sum the saved_usd to derive a
+  // floor; on an empty fleet it falls back to 0 hours.
+  let lifetimeHoursSaved = 0;
+  try {
+    const savings = lessonSavingsRollup(db, { windowDays: 365, now });
+    const totalSavedUsd = savings.lesson_savings.reduce(
+      (acc, r) => acc + (r.saved_usd || 0), 0,
+    );
+    lifetimeHoursSaved = Math.max(0, Math.round(totalSavedUsd / ANNIVERSARY_HOURLY_RATE_USD));
+  } catch {
+    lifetimeHoursSaved = 0;
+  }
+
+  const topLessonsStillCited = topLessonsStillCitedCount(db, now);
+
+  const baseline: AnniversaryMoment = {
+    kind: "none",
+    anniversaryDate: "",
+    years: 0,
+    lifetimePrs,
+    lifetimeHoursSaved,
+    topLessonsStillCited,
+    asOf: now.toISOString(),
+    version: 1,
+  };
+
+  // Threshold branch: re-evaluate against the lifetime count. The
+  // helper persists a row the first time each threshold is crossed
+  // so subsequent calls in the same year do not re-fire (the
+  // calendar-based install_year branch handles the recurring case
+  // via inbox_dismissal at the home composer layer).
+  for (const t of [...ANNIVERSARY_THRESHOLDS].sort((a, b) => b - a)) {
+    if (lifetimePrs >= t && !hasMilestoneRow(db, thresholdKind(t))) {
+      // First crossing - persist and return.
+      recordThresholdIfMissing(db, thresholdKind(t), now.toISOString(), {
+        lifetime_prs: lifetimePrs,
+        lifetime_hours_saved: lifetimeHoursSaved,
+        top_lessons_still_cited: topLessonsStillCited,
+      });
+      return {
+        ...baseline,
+        kind: thresholdKind(t),
+        anniversaryDate: now.toISOString().slice(0, 10),
+      };
+    }
+  }
+
+  // Calendar-anniversary branch: fire when now's month + day match
+  // the install_date row's month + day AND the year delta is >= 1.
+  if (installRow && installRow.recorded_at) {
+    const installAt = new Date(installRow.recorded_at);
+    if (!Number.isNaN(installAt.getTime())) {
+      const sameMonthDay = installAt.getUTCMonth() === now.getUTCMonth()
+        && installAt.getUTCDate() === now.getUTCDate();
+      const yearsDelta = now.getUTCFullYear() - installAt.getUTCFullYear();
+      if (sameMonthDay && yearsDelta >= 1) {
+        return {
+          ...baseline,
+          kind: "install_year",
+          anniversaryDate: installRow.recorded_at.slice(0, 10),
+          years: yearsDelta,
+        };
+      }
+    }
+  }
+
+  return baseline;
+}
+
+/** Renderer options for the home-page card. */
+export interface AnniversaryCardRenderOptions {
+  /** When true the renderer emits the empty string so the SPA hides
+   *  the card. Maps to an inbox_dismissal row at the home composer. */
+  dismissed?: boolean;
+}
+
+/** One-line headline by kind. Pure on the payload. */
+function anniversaryHeadline(p: AnniversaryMoment): string {
+  if (p.kind === "install_year") {
+    const yearsWord = p.years === 1 ? "year" : "years";
+    return p.years + " " + yearsWord + " ago today you ran your first agent";
+  }
+  if (p.kind === "pr_100") return "you just crossed 100 merged features shipped autonomously";
+  if (p.kind === "pr_500") return "you just crossed 500 merged features shipped autonomously";
+  if (p.kind === "pr_1000") return "you just crossed 1000 merged features shipped autonomously";
+  return "";
+}
+
+function escAnniversary(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Pure HTML composer for the home-page card. Carries the
+ *  anniversary-card + anniversary-share-button testids. The share
+ *  button is a real <button data-act=share-anniversary> the SPA can
+ *  bind to; tests anchor on the testid not the button text. */
+export function renderAnniversaryCard(
+  p: AnniversaryMoment,
+  opts: AnniversaryCardRenderOptions = {},
+): string {
+  if (opts.dismissed) return "";
+  if (p.kind === "none") return "";
+  const headline = escAnniversary(anniversaryHeadline(p));
+  const bullet1 = "<li data-testid=\"anniversary-bullet-prs\">"
+    + escAnniversary(p.lifetimePrs) + " features shipped"
+    + "</li>";
+  const bullet2 = "<li data-testid=\"anniversary-bullet-hours\">"
+    + escAnniversary(p.lifetimeHoursSaved) + " hours saved"
+    + "</li>";
+  const bullet3 = "<li data-testid=\"anniversary-bullet-lessons\">"
+    + escAnniversary(p.topLessonsStillCited) + " lessons still cited"
+    + "</li>";
+  const button = "<button class=\"anniversary-share\""
+    + " data-testid=\"anniversary-share-button\""
+    + " data-act=\"share-anniversary\""
+    + " type=\"button\">share the moment</button>";
+  return "<section class=\"anniversary-card\""
+    + " data-testid=\"anniversary-card\""
+    + " data-kind=\"" + escAnniversary(p.kind) + "\">"
+    + "<div class=\"anniversary-eyebrow\" data-testid=\"anniversary-eyebrow\">milestone</div>"
+    + "<h2 class=\"anniversary-headline\" data-testid=\"anniversary-headline\">" + headline + "</h2>"
+    + "<ul class=\"anniversary-bullets\">"
+    + bullet1 + bullet2 + bullet3
+    + "</ul>"
+    + button
+    + "</section>";
+}
+
+export function _renderAnniversaryCardForTests(
+  p: AnniversaryMoment,
+  opts: AnniversaryCardRenderOptions = {},
+): string {
+  return renderAnniversaryCard(p, opts);
+}
+
+/** Renderer options for the public /share/anniversary/<token> page. */
+export interface AnniversaryShareRenderOptions {
+  /** Operator display name; falls back to your fleet when omitted. */
+  displayName?: string;
+  /** Absolute base URL the og:image meta tag composes against. */
+  publicHost?: string;
+  /** Plain token string; appended onto the OG image URL. */
+  token: string;
+  /** Quiet-hours flag - when true the install CTA is replaced by a
+   *  softer powered-by caption per the 0030 quiet-hours posture. */
+  quietHoursActive: boolean;
+}
+
+/** Pure HTML composer for the public share page. Self-contained: no
+ *  external script, no /api fetch, no operator state on the page. The
+ *  og:image meta tag points at the SVG sibling so a feed crawler picks
+ *  it up. */
+export function renderAnniversarySharePage(
+  p: AnniversaryMoment,
+  opts: AnniversaryShareRenderOptions,
+): string {
+  const headline = escAnniversary(anniversaryHeadline(p));
+  const subject = opts.displayName
+    ? escAnniversary(opts.displayName) + "'s fleet"
+    : "your fleet";
+  const description = subject + " - "
+    + escAnniversary(p.lifetimePrs) + " features shipped, "
+    + escAnniversary(p.lifetimeHoursSaved) + " hours saved, "
+    + escAnniversary(p.topLessonsStillCited) + " lessons still cited";
+  const safeHost = (opts.publicHost ?? "").replace(/\/+$/, "");
+  const safeToken = escAnniversary(opts.token);
+  const ogImage = safeHost + "/og/share/anniversary/" + safeToken + ".svg";
+  const title = subject + " - fleet anniversary";
+  const ctaBlock = opts.quietHoursActive
+    ? "<footer class=\"anniversary-foot\" data-testid=\"anniversary-foot\">powered by fleet-control</footer>"
+    : "<footer class=\"anniversary-foot\" data-testid=\"anniversary-foot\">"
+      + "powered by fleet-control - "
+      + "<span data-testid=\"install-cta\">install yours</span>"
+      + "</footer>";
+  return "<!doctype html>"
+    + "<html lang=\"en\">"
+    + "<head>"
+    + "<meta charset=\"utf-8\" />"
+    + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\" />"
+    + "<title>" + escAnniversary(title) + "</title>"
+    + "<link rel=\"stylesheet\" href=\"/style.css\" />"
+    + "<meta property=\"og:title\" content=\"" + escAnniversary(title) + "\" />"
+    + "<meta property=\"og:description\" content=\"" + escAnniversary(description) + "\" />"
+    + "<meta property=\"og:image\" content=\"" + escAnniversary(ogImage) + "\" />"
+    + "<meta property=\"og:type\" content=\"website\" />"
+    + "<meta name=\"twitter:card\" content=\"summary_large_image\" />"
+    + "<meta name=\"twitter:title\" content=\"" + escAnniversary(title) + "\" />"
+    + "<meta name=\"twitter:description\" content=\"" + escAnniversary(description) + "\" />"
+    + "<meta name=\"robots\" content=\"index, follow\" />"
+    + "</head>"
+    + "<body class=\"anniversary-share-page\" data-testid=\"anniversary-share-page\">"
+    + "<main class=\"anniversary-share\">"
+    + "<header class=\"anniversary-share-header\">"
+    + "<h1 data-testid=\"anniversary-share-headline\">" + headline + "</h1>"
+    + "</header>"
+    + "<ul class=\"anniversary-share-bullets\">"
+    + "<li data-testid=\"anniversary-share-bullet-prs\">"
+    + escAnniversary(p.lifetimePrs) + " features shipped</li>"
+    + "<li data-testid=\"anniversary-share-bullet-hours\">"
+    + escAnniversary(p.lifetimeHoursSaved) + " hours saved</li>"
+    + "<li data-testid=\"anniversary-share-bullet-lessons\">"
+    + escAnniversary(p.topLessonsStillCited) + " lessons still cited</li>"
+    + "</ul>"
+    + "</main>"
+    + ctaBlock
+    + "</body>"
+    + "</html>";
+}
+
+export function _renderAnniversaryShareForTests(
+  p: AnniversaryMoment,
+  opts: AnniversaryShareRenderOptions,
+): string {
+  return renderAnniversarySharePage(p, opts);
+}
+
+/** Renderer options for the OG SVG sibling. */
+export interface AnniversaryOgRenderOptions {
+  displayName?: string;
+}
+
+/** Hand-rolled 1200x630 SVG for the OG card. Per LESSONS 2026-06-12
+ *  the testid is the test anchor; no greedy attribute regex. */
+export function renderAnniversaryOgSvg(
+  p: AnniversaryMoment,
+  opts: AnniversaryOgRenderOptions = {},
+): string {
+  const w = 1200;
+  const h = 630;
+  const display = opts.displayName ? escAnniversary(opts.displayName) : "your fleet";
+  const headline = escAnniversary(anniversaryHeadline(p));
+  return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    + "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + w + "\" height=\"" + h + "\""
+    + " viewBox=\"0 0 " + w + " " + h + "\" role=\"img\" aria-label=\"fleet anniversary\">"
+    + "<rect width=\"100%\" height=\"100%\" fill=\"#0E0F0D\"></rect>"
+    + "<text x=\"60\" y=\"110\" fill=\"#807a6c\" font-family=\"ui-monospace,Menlo,monospace\""
+    + " font-size=\"32\">fleet anniversary</text>"
+    + "<text x=\"60\" y=\"190\" fill=\"#E8E2D4\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"44\" font-weight=\"700\""
+    + " data-testid=\"anniversary-og-headline\">" + headline + "</text>"
+    + "<text x=\"60\" y=\"240\" fill=\"#807a6c\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"28\""
+    + " data-testid=\"anniversary-og-display\">" + display + "</text>"
+    + "<g data-testid=\"anniversary-og-numbers\">"
+    + "<text x=\"60\" y=\"410\" fill=\"#E8E2D4\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"80\" font-weight=\"700\">"
+    + escAnniversary(p.lifetimePrs) + "</text>"
+    + "<text x=\"60\" y=\"450\" fill=\"#807a6c\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"22\">PRs shipped</text>"
+    + "<text x=\"420\" y=\"410\" fill=\"#E8E2D4\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"80\" font-weight=\"700\">"
+    + escAnniversary(p.lifetimeHoursSaved) + "</text>"
+    + "<text x=\"420\" y=\"450\" fill=\"#807a6c\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"22\">hours saved</text>"
+    + "<text x=\"780\" y=\"410\" fill=\"#E8E2D4\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"80\" font-weight=\"700\">"
+    + escAnniversary(p.topLessonsStillCited) + "</text>"
+    + "<text x=\"780\" y=\"450\" fill=\"#807a6c\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"22\">lessons still cited</text>"
+    + "</g>"
+    + "<text x=\"60\" y=\"" + (h - 40) + "\" fill=\"#807a6c\""
+    + " font-family=\"ui-monospace,Menlo,monospace\" font-size=\"22\">"
+    + "powered by fleet-control</text>"
+    + "</svg>";
+}
+
+export function _renderAnniversaryOgSvgForTests(
+  p: AnniversaryMoment,
+  opts: AnniversaryOgRenderOptions = {},
+): string {
+  return renderAnniversaryOgSvg(p, opts);
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Reactivation push (ticket 0071).
 //
 // Three pure helpers + one renderer-direct seam compose the Sunday

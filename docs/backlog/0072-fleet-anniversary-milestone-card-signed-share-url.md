@@ -1,7 +1,7 @@
 ---
 id: 0072
 title: Fleet anniversary milestone card and signed share URL - a single home-page card surfaces "<N> year(s) ago today you ran your first agent" on the install-date anniversary plus 100-PR / 500-PR / 1000-PR thresholds with a one-tap share button minting a /share/anniversary/<token> page that frames the operator's accumulated history as a milestone moment only the local SQLite can author
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-23
@@ -617,4 +617,26 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-23 (implementation-dev) — picked up ticket. Plan:
+  - Add `operator_install_milestones` table to `src/db.ts` SCHEMA.
+  - Add `fleetAnniversaryMoment(db, cfg, now)` helper + renderer-direct
+    seam in `src/views.ts` alongside the 0066 stakeholder helpers
+    (per LESSONS 2026-06-13 no new module - lives inside views.ts).
+  - Reuse `lessonSavingsRollup` math for hours-saved, query `pr` table
+    with `is_agent = 1 AND state = 'MERGED'` (LESSONS 2026-06-05 the
+    schema casing here is upper-case MERGED for is_agent=1 ingest path).
+  - PRODUCER-VS-SPEC reconciliation: the existing stakeholder helper
+    uses `state = 'MERGED'` for merged-agent-PR counts (see
+    `src/views.ts:countActiveProjectsInMonth`); the new
+    fleetAnniversaryMoment helper matches that producer literal.
+  - Mount new public routes `/share/anniversary/<token>` and
+    `/og/share/anniversary/<token>.svg` BEFORE the
+    `if (path.startsWith("/api/"))` gate alongside the existing
+    `/share/stakeholder/` route. Add `POST /api/snapshot/anniversary`
+    inside the authenticated `/api/` block.
+  - Cache the helper for 60s with the LESSONS 2026-06-07 (MAX(fetched_at),
+    COUNT(*)) tuple; register `globalThis.__fleet_anniversary_invalidate__`.
+  - Tests live in `tests/fleet-anniversary.test.ts` and follow the
+    `tests/stakeholder-summary.test.ts` shape (renderer-direct seam +
+    boot-path integration + static-grep ordering).
+

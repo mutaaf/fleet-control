@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, serveReactivationDigest, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, serveReactivationDigest, fleetAnniversaryMoment, renderAnniversarySharePage, renderAnniversaryOgSvg, type AnniversaryMoment, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -35,7 +35,7 @@ import {
   type LessonsPublicArchiveRow,
 } from "./lessons.ts";
 import { statSync } from "node:fs";
-import { serveShare, getStakeholderSnapshot } from "./snapshot.ts";
+import { serveShare, getStakeholderSnapshot, getAnniversarySnapshot, createSnapshot } from "./snapshot.ts";
 import {
   serveReceipts, computeReceipts, persistReceipts, unpublishReceipts,
   isValidMonthIso, type ReceiptsPayload, type ServeReceiptsResult,
@@ -1177,6 +1177,107 @@ function _invalidateStakeholderSummaryCacheAfterIngest(): void {
 }
 (globalThis as { __fleet_stakeholder_summary_invalidate__?: () => void })
   .__fleet_stakeholder_summary_invalidate__ = _invalidateStakeholderSummaryCacheAfterIngest;
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0072 - Fleet anniversary moment cache + dismissal helper.
+//
+// 60-second memo cache keyed by `now.toISOString().slice(0, 10)` so
+// polled SPA refreshes hit a hot cache between renders. Invalidation
+// tuple per LESSONS 2026-06-07 uses (MAX(pr.fetched_at), COUNT(*)
+// FROM pr WHERE state='MERGED' AND is_agent=1) - the pr table has no
+// surrogate id; the pair is the "fresh merge landed" proxy. Hook
+// registered on globalThis.__fleet_anniversary_invalidate__ per
+// LESSONS 2026-06-05 so the ingest tick can bust the memo without a
+// circular import.
+// ────────────────────────────────────────────────────────────────────
+
+const ANNIVERSARY_TTL_MS = 60_000;
+interface AnniversaryCacheEntry {
+  tuple: string;
+  value: AnniversaryMoment;
+  expires_at: number;
+}
+const anniversaryCache = new Map<string, AnniversaryCacheEntry>();
+let anniversaryBuildCounter = 0;
+
+export function _resetAnniversaryCacheForTests(): void {
+  anniversaryCache.clear();
+  anniversaryBuildCounter = 0;
+}
+
+export function _getAnniversaryCacheBuildsForTests(): number {
+  return anniversaryBuildCounter;
+}
+
+interface AnniversaryTupleRow {
+  mx: string | null;
+  c: number | null;
+}
+
+function anniversaryInvalidationTuple(db: DB): string {
+  const row = db.prepare(
+    "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c"
+    + " FROM pr WHERE state = 'MERGED' AND is_agent = 1",
+  ).get() as unknown as AnniversaryTupleRow | undefined;
+  return String(row?.mx ?? "") + "|" + String(row?.c ?? "0");
+}
+
+function getAnniversaryMomentCached(
+  db: DB, cfg: FleetConfig, now: Date,
+): AnniversaryMoment {
+  const dateKey = now.toISOString().slice(0, 10);
+  const tuple = anniversaryInvalidationTuple(db);
+  const hit = anniversaryCache.get(dateKey);
+  if (hit && hit.tuple === tuple && hit.expires_at > now.getTime()) {
+    return hit.value;
+  }
+  anniversaryBuildCounter += 1;
+  const fresh = fleetAnniversaryMoment(db, cfg, now);
+  anniversaryCache.set(dateKey, {
+    tuple, value: fresh, expires_at: now.getTime() + ANNIVERSARY_TTL_MS,
+  });
+  return fresh;
+}
+
+function _invalidateAnniversaryCacheAfterIngest(): void {
+  anniversaryCache.clear();
+}
+(globalThis as { __fleet_anniversary_invalidate__?: () => void })
+  .__fleet_anniversary_invalidate__ = _invalidateAnniversaryCacheAfterIngest;
+
+/** Has the operator dismissed THIS year's install-anniversary card
+ *  OR the named PR threshold card for THIS year? Per LESSONS 2026-05-28
+ *  the dedup is a SOFT year-qualified payload_id so a future year's
+ *  anniversary still fires. The payload_id shape is documented in the
+ *  ticket spec:
+ *    - install_year card: "install_year:<YYYY>"
+ *    - threshold cards:   "<kind>:<YYYY>:<threshold>" - e.g. "pr_100:2026:100"
+ */
+function isAnniversaryDismissed(
+  db: DB, payloadId: string,
+): boolean {
+  const row = db.prepare(
+    "SELECT 1 AS ok FROM inbox_dismissal"
+    + " WHERE kind = 'anniversary'"
+    + "   AND project_slug = 'fleet'"
+    + "   AND payload_id = ?",
+  ).get(payloadId) as unknown as { ok: number } | undefined;
+  return !!row;
+}
+
+/** Compose the dismissal payload_id for the current moment + calendar
+ *  year. install_year uses the year alone; the threshold kinds carry
+ *  both the year AND the threshold value so a 2-year fleet that crosses
+ *  500 in year 2 still gets a distinct dismissal from a future 1000
+ *  crossing. */
+function anniversaryDismissPayloadId(m: AnniversaryMoment, now: Date): string {
+  const year = now.getUTCFullYear();
+  if (m.kind === "install_year") return "install_year:" + year;
+  if (m.kind === "pr_100") return "pr_100:" + year + ":100";
+  if (m.kind === "pr_500") return "pr_500:" + year + ":500";
+  if (m.kind === "pr_1000") return "pr_1000:" + year + ":1000";
+  return "";
+}
 
 /** Has the operator dismissed this month's retro card? Lookup keyed
  *  by (kind='monthly_retro', project_slug='fleet',
@@ -5847,6 +5948,70 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
         });
         return res.end(cached.html);
       }
+      // Ticket 0072: anniversary share page at /share/anniversary/<token>.
+      // PUBLIC - the token IS the auth; 404 on unknown / wrong-kind /
+      // revoked / expired tokens via getAnniversarySnapshot. The route
+      // sits before the api auth gate so a reader on Bluesky / LinkedIn
+      // who tapped a paste reaches the renderer with no token. The
+      // /share/ prefix is rate-limited per LESSONS 2026-06-15 the
+      // ordering anchor is the if-statement below; this comment
+      // describes the gate WITHOUT reproducing the if-statement shape
+      // so a sibling test's indexOf does not collapse to this offset.
+      const anmShare = path.match(/^\/share\/anniversary\/([0-9a-fA-F]+)$/);
+      if (anmShare && req.method === "GET") {
+        const token = anmShare[1];
+        const snap = getAnniversarySnapshot(db, token);
+        if (!snap) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const payload = snap.payload as AnniversaryMoment | null;
+        if (!payload || typeof payload !== "object" || payload.kind === "none") {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const quiet = quietHoursActiveAnywhere(cfg, new Date());
+        const hostHeader = String(req.headers["host"] ?? "127.0.0.1:7070");
+        const publicHost = cfg.operator?.publicHost ?? ("http://" + hostHeader);
+        const html = renderAnniversarySharePage(payload, {
+          displayName: cfg.operator?.displayName,
+          publicHost,
+          token,
+          quietHoursActive: quiet,
+        });
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "public, max-age=300",
+        });
+        return res.end(html);
+      }
+      // Ticket 0072: OG SVG sibling at /og/share/anniversary/<token>.svg.
+      // PUBLIC - same posture as /og/operator/<handle>.svg. The /og/
+      // prefix is rate-limited per the existing isRateLimitedPath set
+      // in src/rate_limit.ts so no new prefix needed.
+      const anmOg = path.match(/^\/og\/share\/anniversary\/([0-9a-fA-F]+)\.svg$/);
+      if (anmOg && req.method === "GET") {
+        const token = anmOg[1];
+        const snap = getAnniversarySnapshot(db, token);
+        if (!snap) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const payload = snap.payload as AnniversaryMoment | null;
+        if (!payload || typeof payload !== "object" || payload.kind === "none") {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return res.end("not found");
+        }
+        const svg = renderAnniversaryOgSvg(payload, {
+          displayName: cfg.operator?.displayName,
+        });
+        res.writeHead(200, {
+          "content-type": "image/svg+xml; charset=utf-8",
+          "cache-control": "public, max-age=300",
+          "access-control-allow-origin": "*",
+        });
+        return res.end(svg);
+      }
       if (path.startsWith("/api/")) {
         // All read endpoints require the `read` scope (loopback bypasses).
         const rauth = requireAuth(db, req, "read", url);
@@ -6542,6 +6707,59 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "cache-control": "max-age=600",
           });
           return res.end(body);
+        }
+        // Ticket 0072: anniversary milestone card. One compact home-
+        // page card on the install-date anniversary OR each 100/500/
+        // 1000-PR threshold crossing. The kind discriminator carries
+        // 'install_year' / 'pr_100' / 'pr_500' / 'pr_1000' / 'none' so
+        // the SPA can render the honest empty state. The route appends
+        // a `dismissed` boolean keyed off inbox_dismissal with the
+        // year-qualified payload_id per the LESSONS 2026-05-28
+        // aging-window pattern - e.g. install_year:2026 or
+        // pr_100:2026:100. 60-second memo cache; invalidation tuple
+        // (MAX(fetched_at), COUNT(*)) per LESSONS 2026-06-07.
+        if (path === "/api/fleet/anniversary") {
+          const now = new Date();
+          const v = getAnniversaryMomentCached(db, cfg, now);
+          const payloadId = anniversaryDismissPayloadId(v, now);
+          const dismissed = payloadId ? isAnniversaryDismissed(db, payloadId) : false;
+          const body = JSON.stringify({
+            ...v,
+            dismissed,
+            dismiss_payload_id: payloadId,
+          });
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=60",
+          });
+          return res.end(body);
+        }
+        // Ticket 0072: mint a snapshot for the current anniversary
+        // moment. Returns { url } pointing at /share/anniversary/<token>.
+        // The route freezes the SAME payload the operator just saw on
+        // the home card so the share page renders byte-for-byte the
+        // SAME numbers. Read scope (loopback bypasses) - matches the
+        // other read-side /api/fleet/* routes; the actual snapshot
+        // is read-only.
+        if (path === "/api/snapshot/anniversary" && req.method === "POST") {
+          const now = new Date();
+          const v = getAnniversaryMomentCached(db, cfg, now);
+          const hostHeader = String(req.headers["host"] ?? "127.0.0.1:7070");
+          const baseUrl = "http://" + hostHeader;
+          const minted = createSnapshot(db, {
+            name: "fleet anniversary",
+            fleetView: v,
+            kind: "anniversary",
+            baseUrl,
+          });
+          // The share_url is absolute (carries the host). Return the
+          // path-only form so the SPA can append it to its own host
+          // and the test asserts a stable /share/anniversary/<token>
+          // shape regardless of how the server is bound.
+          const idx = minted.share_url.indexOf("/share/anniversary/");
+          const url = idx >= 0 ? minted.share_url.slice(idx) : minted.share_url;
+          return json(res, { url, expires_at: minted.expires_at }, 200);
         }
         // Ticket 0053: project graveyard. Returns the documented
         // rollup of paused projects' lifetime ROI, with the cross-
