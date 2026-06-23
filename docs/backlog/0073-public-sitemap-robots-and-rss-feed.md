@@ -1,7 +1,7 @@
 ---
 id: 0073
 title: Public sitemap.xml plus robots.txt plus an /lessons-public/feed.xml RSS atom feed - one set of cold-discovery surfaces that lets a search engine index every public page already shipped (pulse, receipts, calculator, lessons, lessons-lineage, failures, operator, referrals) and lets a curious reader subscribe to new lessons in their feed reader so the moat of accumulated public artifacts finally becomes discoverable by strangers who never saw the operator's share post
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-23
@@ -660,4 +660,23 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-23 — picked up by implementation-dev. Branch
+  `feat/0073-sitemap-robots-feed` off `origin/main`. Plan: failing-test-
+  first under `tests/sitemap-and-feed.test.ts` (one per AC checkbox),
+  then helpers `fleetSitemapPayload` / `renderSitemapXml` /
+  `renderRobotsTxt` / `renderLessonsFeedAtom` + their renderer-direct
+  seams in `src/views.ts`, then three new public routes in
+  `src/server.ts` mounted BEFORE the `if (path.startsWith("/api/"))`
+  auth gate, then the rate-limit prefix additions in
+  `src/rate_limit.ts`. Reusing the existing private inline
+  `anonymiseExcerpt` (no new lessons.ts import; LESSONS 2026-06-13).
+  Cache invalidation tuple is
+  `(MAX(pr.fetched_at), COUNT(*) FROM pr) | (MAX(lesson_credit.
+  created_at), COUNT(*) FROM lesson_credit) | publicHost` per LESSONS
+  2026-06-07 + 2026-06-23. Sitemap helper consumes `lessonsPublicArchive`
+  (from `src/lessons.ts`) + `fleetFailureModes` + `lessonLineagePayload`
+  (already in views.ts) — no function-import-cycle risk because
+  `lessons.ts → views.ts` is the only existing edge between the two and
+  this addition keeps it one-way (views.ts reads lessons.ts via a
+  function call lookup in server.ts that hands the payload into the
+  sitemap helper, not a top-level import).
