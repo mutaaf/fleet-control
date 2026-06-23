@@ -102,10 +102,12 @@ export interface SnapshotCreateOpts {
    *  returned share_url targets /share/<token>. When set to
    *  "stakeholder_monthly" the row carries kind='stakeholder_monthly'
    *  AND the returned share_url targets /share/stakeholder/<token>
-   *  - the new stakeholder-monthly route. The snapshot.kind column
+   *  - the new stakeholder-monthly route. Ticket 0072: the
+   *  "anniversary" kind extends the same TEXT column (no CHECK) and
+   *  targets /share/anniversary/<token>. The snapshot.kind column
    *  is TEXT with no CHECK constraint so future kinds extend cleanly
    *  without a schema migration. */
-  kind?: "stakeholder_monthly" | "fleet_view";
+  kind?: "stakeholder_monthly" | "fleet_view" | "anniversary";
 }
 
 export interface ServeShareResult {
@@ -340,10 +342,13 @@ export function createSnapshot(db: DB, opts: SnapshotCreateOpts): MintedSnapshot
   // Ticket 0066: snapshot.kind discriminator. Legacy callers omit the
   // field; we persist NULL so the route dispatcher reads NULL as the
   // default fleet-view kind. The stakeholder route only matches rows
-  // where kind = 'stakeholder_monthly'.
-  const kind: string | null = opts.kind === "stakeholder_monthly"
-    ? "stakeholder_monthly"
-    : null;
+  // where kind = 'stakeholder_monthly'. Ticket 0072 extends with
+  // kind = 'anniversary' for the new /share/anniversary/<token>
+  // surface; the snapshot.kind column is TEXT with no CHECK so the
+  // additive kind extends without a schema migration.
+  let kind: string | null = null;
+  if (opts.kind === "stakeholder_monthly") kind = "stakeholder_monthly";
+  else if (opts.kind === "anniversary") kind = "anniversary";
 
   db.prepare(
     "INSERT INTO snapshot(id,name,created_at,expires_at,revoked_at,payload_json,kind) VALUES(?,?,?,?,?,?,?)",
@@ -354,10 +359,11 @@ export function createSnapshot(db: DB, opts: SnapshotCreateOpts): MintedSnapshot
   // /share/stakeholder/<token> route so the stakeholder URL is
   // distinguishable at a glance from a legacy fleet-view share. Every
   // other kind keeps the legacy /share/<token> shape so existing
-  // share URLs continue to resolve byte-for-byte.
-  const pathSegment = kind === "stakeholder_monthly"
-    ? "stakeholder/" + token
-    : token;
+  // share URLs continue to resolve byte-for-byte. Ticket 0072 adds
+  // anniversary tokens at /share/anniversary/<token>.
+  let pathSegment = token;
+  if (kind === "stakeholder_monthly") pathSegment = "stakeholder/" + token;
+  else if (kind === "anniversary") pathSegment = "anniversary/" + token;
   return {
     id_prefix: id.slice(0, 8),
     token,
@@ -406,6 +412,46 @@ export function getStakeholderSnapshot(db: DB, token: string): {
   };
 }
 
+/** Ticket 0072: resolve a presented token to an ANNIVERSARY snapshot
+ *  row. Returns null when:
+ *    - the token is empty / non-hex,
+ *    - no row matches the hash (unknown token),
+ *    - the matching row's kind is NOT 'anniversary' (the caller
+ *      passed a fleet-view or stakeholder-monthly token to the
+ *      anniversary route - the dispatcher 404s instead of leaking
+ *      the wrong renderer),
+ *    - the row is revoked,
+ *    - the row is expired.
+ *  Same shape as getStakeholderSnapshot - the route reads the
+ *  payload_json so it can re-render the SAME numbers the operator
+ *  saw the moment they minted the token. */
+export function getAnniversarySnapshot(db: DB, token: string): {
+  name: string; created_at: string; expires_at: string; payload: unknown;
+} | null {
+  if (!token || typeof token !== "string") return null;
+  if (!/^[0-9a-f]+$/i.test(token)) return null;
+  const id = hash(token);
+  const row = db.prepare(
+    "SELECT name,created_at,expires_at,revoked_at,kind,payload_json FROM snapshot WHERE id=?",
+  ).get(id) as {
+    name: string; created_at: string; expires_at: string;
+    revoked_at: string | null; kind: string | null; payload_json: string;
+  } | undefined;
+  if (!row) return null;
+  if (row.kind !== "anniversary") return null;
+  if (row.revoked_at) return null;
+  const now = Date.now();
+  if (new Date(row.expires_at).getTime() <= now) return null;
+  let payload: unknown = null;
+  try { payload = JSON.parse(row.payload_json); } catch { payload = null; }
+  return {
+    name: row.name,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    payload,
+  };
+}
+
 /** Resolve a presented token to its snapshot row. Returns null if no
  *  row matches (unknown token). Otherwise returns the parsed payload
  *  along with `expired` / `revoked` flags so callers (serveShare,
@@ -430,8 +476,10 @@ export function getSnapshot(db: DB, token: string): SnapshotResolved | null {
   // snapshots; a stakeholder-monthly token presented here is
   // a routing error (the operator pasted the wrong URL shape).
   // Return null so the route 404s instead of leaking the wrong
-  // renderer over the token's frozen payload.
+  // renderer over the token's frozen payload. Ticket 0072 extends
+  // this to anniversary tokens for the same reason.
   if (row.kind === "stakeholder_monthly") return null;
+  if (row.kind === "anniversary") return null;
   let payload: unknown = null;
   try { payload = JSON.parse(row.payload_json); } catch { payload = null; }
   const now = Date.now();

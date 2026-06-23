@@ -305,6 +305,26 @@ CREATE TABLE IF NOT EXISTS operator_visit_watermark (
   last_visit_at   TEXT,
   last_user_agent TEXT
 );
+
+-- Anniversary milestone record (ticket 0072). One row per milestone kind
+-- that has fired for the operator. kind is one of the four literals
+-- install_date / pr_100 / pr_500 / pr_1000. The install_date row is
+-- written ONCE on the first home-page render that sees a non-empty pr
+-- table (the helper writes the earliest pr.fetched_at as recorded_at);
+-- the threshold rows are written the first time the lifetime
+-- merged-agent-PR count crosses 100 / 500 / 1000 respectively. PK on
+-- kind makes re-firing across years a calendar question (handled by
+-- inbox_dismissal with a year-qualified payload_id) NOT a row-level
+-- one - the install_year card re-fires every year against the same
+-- install_date row. payload_json snapshots the aggregate at fire time
+-- so a future renderer can reproduce the moment if needed. Per
+-- LESSONS no backticks inside template-literal SQL strings, all
+-- identifiers stay plain words inside this SCHEMA template.
+CREATE TABLE IF NOT EXISTS operator_install_milestones (
+  kind          TEXT PRIMARY KEY,
+  recorded_at   TEXT NOT NULL,
+  payload_json  TEXT NOT NULL
+);
 `;
 
 export type DB = DatabaseSync;
