@@ -1,7 +1,7 @@
 ---
 id: 0074
 title: First-week new-operator coach card on the portal home - one day-tailored micro-tip per day for the first 7 days after install (set publicHost / try fleetctl share / pair your phone / open one PR autonomously / read your first cross-fleet lesson / pick a daily glance time / export your first portfolio) so the new operator who installed yesterday crosses every activation cliff before the friction sets in and the daily-check-in rhythm becomes a habit before day 7
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-23
@@ -696,4 +696,34 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-23 implementation-dev: branched feat/0074-first-week-coach-card.
+  Approach: new helper `newOperatorCoachTip(db, cfg, now)` and
+  `_renderCoachCardForTests(payload, opts)` in `src/views.ts`; new
+  endpoints `GET /api/fleet/coach` + `POST /api/coach/dismiss` in
+  `src/server.ts` with a 60s memo cache invalidated on dismissal via
+  `globalThis.__fleet_coach_invalidate__`. New optional config field
+  `cfg.coach?: { disabled?: boolean }` extends `FleetConfig`.
+  PRODUCER-VS-SPEC reconciliations:
+    - The `inbox_dismissal` PK is (kind, project_slug, payload_id) per
+      `src/db.ts` line 207. The coach uses `project_slug = 'fleet'` to
+      match the existing fleet-wide dismissal convention (anniversary
+      uses the same 'fleet' literal at server.ts:1262). The spec said
+      `project_slug = ''` (empty) but the existing convention is the
+      literal 'fleet'; we use 'fleet' for consistency with anniversary
+      dismissals.
+    - `lessonsPublicArchive` is sourced from the lessons FILE (no `db`
+      argument) - the helper signature in src/lessons.ts is
+      `lessonsPublicArchive(opts: { now?: Date; projectAliasMap?: ...})`.
+      The day-5 deepLink calls it accordingly. Top-cited slug is derived
+      via `lessonCreditRollup`'s `top_earner.lesson_slug`; when both are
+      empty the fallback is `/lessons-public/`.
+    - README anchors: the existing README has no `#operator-publichost`,
+      `#fleetctl-share`, `#lan-access-auth`, `#quiet-hours`,
+      `#fleetctl-export-portfolio` headings. Per the ticket's spec
+      ("The README also gains explicit anchors") we add a new
+      "First-week coach" subsection with five named anchors via
+      explicit `<a id=...></a>` tags so the deep-links resolve.
+    - Day-3 LAN-pairing target: spec said `#lan-access-auth` but the
+      existing README's `## LAN access + auth` markdown auto-anchor is
+      `#lan-access--auth` (two hyphens for the "+ "); we add an
+      explicit `<a id="lan-access-auth"></a>` to bridge the difference.

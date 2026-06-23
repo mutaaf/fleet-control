@@ -128,6 +128,15 @@ export interface FleetConfig {
   reactivationPush?: {
     disabled?: boolean;
   };
+  /** First-week new-operator coach card opt-out (ticket 0074). When
+   *  omitted (the default) the home-page coach card surfaces one
+   *  day-tailored micro-tip for the first 7 days after install_date.
+   *  When set to true the helper newOperatorCoachTip short-circuits
+   *  with kind 'none' and never renders. Defaulting pattern matches
+   *  the existing reactivationPush nested field above. */
+  coach?: {
+    disabled?: boolean;
+  };
 }
 
 const DEFAULTS: FleetConfig = {

@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, serveReactivationDigest, fleetAnniversaryMoment, renderAnniversarySharePage, renderAnniversaryOgSvg, fleetSitemapPayload, renderSitemapXml, renderRobotsTxt, renderLessonsFeedAtom, type FleetSitemapPayload, type AnniversaryMoment, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, serveReactivationDigest, fleetAnniversaryMoment, renderAnniversarySharePage, renderAnniversaryOgSvg, fleetSitemapPayload, renderSitemapXml, renderRobotsTxt, renderLessonsFeedAtom, newOperatorCoachTip, renderCoachCard, type CoachTipPayload, type FleetSitemapPayload, type AnniversaryMoment, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -1278,6 +1278,86 @@ function anniversaryDismissPayloadId(m: AnniversaryMoment, now: Date): string {
   if (m.kind === "pr_1000") return "pr_1000:" + year + ":1000";
   return "";
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0074 - First-week new-operator coach card cache.
+//
+// 60-second memo cache keyed by today's date plus the coach
+// invalidation tuple (install_date recorded_at plus the count of
+// coach_tip dismissals plus the top-cited lesson slug). Per LESSONS
+// 2026-06-23 the cache MUST expose a reset hook so the boot tests do
+// not leak state across in-process boots. The route writes a
+// coach_tip dismissal via the existing inbox_dismissal table; the
+// invalidation hook is registered on
+// globalThis.__fleet_coach_invalidate__ per LESSONS 2026-06-05 so
+// the POST handler busts the cache without a circular import.
+// ────────────────────────────────────────────────────────────────────
+
+const COACH_TTL_MS = 60_000;
+interface CoachCacheEntry {
+  tuple: string;
+  value: CoachTipPayload;
+  expires_at: number;
+}
+const coachCache = new Map<string, CoachCacheEntry>();
+let coachBuildCounter = 0;
+
+export function _resetCoachCacheForTests(): void {
+  coachCache.clear();
+  coachBuildCounter = 0;
+}
+
+export function _getCoachCacheBuildsForTests(): number {
+  return coachBuildCounter;
+}
+
+interface CoachTupleRow {
+  install_at: string | null;
+  dismiss_count: number | null;
+  top_slug: string | null;
+}
+
+function coachInvalidationTuple(db: DB): string {
+  const installRow = db.prepare(
+    "SELECT recorded_at AS install_at FROM operator_install_milestones WHERE kind = 'install_date'",
+  ).get() as unknown as { install_at: string | null } | undefined;
+  const dismissRow = db.prepare(
+    "SELECT COUNT(*) AS c FROM inbox_dismissal WHERE kind = 'coach_tip'",
+  ).get() as unknown as { c: number | null } | undefined;
+  const topRow = db.prepare(
+    "SELECT lesson_slug FROM lesson_credit"
+    + " GROUP BY lesson_slug, lesson_date, lesson_title"
+    + " ORDER BY COUNT(*) DESC, lesson_slug ASC"
+    + " LIMIT 1",
+  ).get() as unknown as { lesson_slug: string | null } | undefined;
+  const ia = String(installRow?.install_at ?? "");
+  const dc = String(dismissRow?.c ?? "0");
+  const ts = String(topRow?.lesson_slug ?? "");
+  return ia + "|" + dc + "|" + ts;
+}
+
+function getCoachTipCached(
+  db: DB, cfg: FleetConfig, now: Date,
+): CoachTipPayload {
+  const dateKey = now.toISOString().slice(0, 10);
+  const tuple = coachInvalidationTuple(db);
+  const hit = coachCache.get(dateKey);
+  if (hit && hit.tuple === tuple && hit.expires_at > now.getTime()) {
+    return hit.value;
+  }
+  coachBuildCounter += 1;
+  const fresh = newOperatorCoachTip(db, cfg, now);
+  coachCache.set(dateKey, {
+    tuple, value: fresh, expires_at: now.getTime() + COACH_TTL_MS,
+  });
+  return fresh;
+}
+
+function _invalidateCoachCacheAfterIngest(): void {
+  coachCache.clear();
+}
+(globalThis as { __fleet_coach_invalidate__?: () => void })
+  .__fleet_coach_invalidate__ = _invalidateCoachCacheAfterIngest;
 
 /** Has the operator dismissed this month's retro card? Lookup keyed
  *  by (kind='monthly_retro', project_slug='fleet',
@@ -6955,6 +7035,70 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
             "cache-control": "max-age=60",
           });
           return res.end(body);
+        }
+        // Ticket 0074: first-week new-operator coach card. Returns the
+        // CoachTipPayload the home composer renders. The route appends
+        // a `dismissed` boolean and the `dismiss_payload_id` so the
+        // SPA can post back to /api/coach/dismiss with the exact key.
+        // 60-second memo cache with an invalidation tuple keyed by
+        // (install_date, dismiss_count, top_cited_slug) per LESSONS
+        // 2026-06-07; the cache-bust hook on the dismiss endpoint
+        // clears the memo immediately so a fresh dismissal flips the
+        // next GET without waiting out the TTL.
+        if (path === "/api/fleet/coach") {
+          const now = new Date();
+          const v = getCoachTipCached(db, cfg, now);
+          let dismissPayloadId = "";
+          if (v.kind === "coach") dismissPayloadId = "day_" + v.day;
+          else if (v.kind === "graduated") dismissPayloadId = "graduation";
+          const body = JSON.stringify({
+            ...v,
+            dismiss_payload_id: dismissPayloadId,
+            dismissed: false,
+          });
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "access-control-allow-origin": "*",
+            "cache-control": "max-age=60",
+          });
+          return res.end(body);
+        }
+        // Ticket 0074: dismiss the current coach tip. Body shape:
+        // { day: N } for a day-N tip OR { payload_id: 'graduation' }
+        // for the graduation card. Writes an inbox_dismissal row with
+        // kind='coach_tip' and project_slug='fleet'. Read scope
+        // (loopback bypasses) - mirrors the existing inbox dismiss
+        // endpoint posture. Busts the coach memo cache after the
+        // write so the next GET sees the updated state.
+        if (path === "/api/coach/dismiss" && req.method === "POST") {
+          // Auth already gated by the enclosing `if (path.startsWith
+          // ("/api/"))` branch above - the read scope suffices because
+          // the write is additive (an inbox_dismissal row) and the
+          // path does not live under /api/control/*.
+          return readBody(req).then((body) => {
+            const day = Number((body as { day?: number })?.day);
+            const explicit = String((body as { payload_id?: string })?.payload_id ?? "").trim();
+            let payloadId = "";
+            if (Number.isFinite(day) && day >= 1 && day <= 7) {
+              payloadId = "day_" + Math.floor(day);
+            } else if (explicit === "graduation") {
+              payloadId = "graduation";
+            } else {
+              return json(res, { ok: false, message: "expected { day: 1..7 } or { payload_id: 'graduation' }" }, 400);
+            }
+            const dismissedAt = new Date().toISOString();
+            db.prepare(
+              "INSERT INTO inbox_dismissal(kind, project_slug, payload_id, dismissed_at)"
+              + " VALUES('coach_tip', 'fleet', ?, ?)"
+              + " ON CONFLICT(kind, project_slug, payload_id) DO NOTHING",
+            ).run(payloadId, dismissedAt);
+            // Bust the coach memo cache so a follow-up GET sees the
+            // fresh dismissal without waiting out the 60s TTL.
+            const inv = (globalThis as { __fleet_coach_invalidate__?: () => void })
+              .__fleet_coach_invalidate__;
+            if (typeof inv === "function") inv();
+            return json(res, { ok: true, dismissed_at: dismissedAt, payload_id: payloadId }, 200);
+          });
         }
         // Ticket 0072: mint a snapshot for the current anniversary
         // moment. Returns { url } pointing at /share/anniversary/<token>.
