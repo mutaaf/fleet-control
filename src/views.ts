@@ -10931,4 +10931,346 @@ export function renderLessonsFeedAtom(p: RenderFeedAtomInput): string {
 export function _renderFeedForTests(p: RenderFeedAtomInput): string {
   return renderLessonsFeedAtom(p);
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Ticket 0074 - First-week new-operator coach card.
+//
+// One pure helper newOperatorCoachTip(db, cfg, now) returns the
+// CoachTipPayload the home composer renders. The window opens day 1
+// (install day) and closes after day 7. The 7-day micro-tip table is
+// a module-private const at the top of the block; each entry carries
+// the documented headline / action / ctaLabel / deepLink. Day 5's
+// deep link is dynamic - it resolves to the top-cited lesson slug
+// via lesson_credit when one exists, else falls back to the index.
+//
+// LESSONS the implementation honours:
+//   - 2026-05-26 ESM only, _resetXForTests seam for any module-level
+//     state (the server-side cache layer carries its own seam).
+//   - 2026-05-28 dismissal gating via inbox_dismissal with
+//     project_slug='fleet' (matches the anniversary precedent).
+//   - 2026-05-29 the caller pins now; the helper does not call new
+//     Date() anywhere - tests pin the anchor.
+//   - 2026-06-05 the no-install-date fallback synthesises the
+//     install_date from MIN(pr.fetched_at) and writes the row via
+//     the existing _recordInstallDateIfMissing seam introduced by
+//     ticket 0072.
+//   - 2026-06-07 the pr table has no surrogate id - the helper uses
+//     MIN/COUNT to derive the synthetic install_date.
+//   - 2026-06-11 _renderCoachCardForTests is the renderer-direct
+//     seam so the 9 branches (7 days plus graduated plus none) drive
+//     directly without booting startServer or racing the cwd config.
+//   - 2026-06-13 the helper lives INSIDE views.ts (no new module).
+//     The day-5 dynamic deep link uses lesson_credit DIRECTLY (the
+//     existing lessonCreditRollup helper is already in this file).
+//   - 2026-06-15 the leading comment block uses plain prose for any
+//     sibling-helper-grep-vulnerable identifier (no backticks here).
+// ────────────────────────────────────────────────────────────────────
+
+export type CoachKind = "coach" | "graduated" | "none";
+
+export interface CoachTipPayload {
+  kind: CoachKind;
+  day: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+  headline: string;
+  action: string;
+  ctaLabel: string;
+  deepLink: string;
+  asOf: string;
+  version: 1;
+}
+
+interface CoachTipTemplate {
+  headline: string;
+  action: string;
+  ctaLabel: string;
+  /** Static deep-link target; day 5 overrides this dynamically via
+   *  the top-cited lesson slug lookup. */
+  deepLink: string;
+}
+
+const COACH_TIPS: Record<1 | 2 | 3 | 4 | 5 | 6 | 7, CoachTipTemplate> = {
+  1: {
+    headline: "day 1 of your fleet",
+    action: "set operator.publicHost in fleet-control.config.json so your share links become absolute URLs",
+    ctaLabel: "show me where",
+    deepLink: "#operator-publichost",
+  },
+  2: {
+    headline: "day 2 of your fleet",
+    action: "try fleetctl share pulse - it copies a paste-ready blurb to your clipboard. takes 5 seconds",
+    ctaLabel: "show me how",
+    deepLink: "#fleetctl-share",
+  },
+  3: {
+    headline: "day 3 of your fleet",
+    action: "pair your phone - scan the LAN QR from the home welcome banner",
+    ctaLabel: "show me how",
+    deepLink: "#lan-access-auth",
+  },
+  4: {
+    headline: "day 4 of your fleet",
+    action: "watch a PR merge end to end - the next autonomous PR your fleet opens surfaces here with one-tap approve",
+    ctaLabel: "open inbox",
+    deepLink: "/#/",
+  },
+  5: {
+    headline: "day 5 of your fleet",
+    action: "read your first cross-fleet lesson",
+    ctaLabel: "open lessons",
+    // Overridden by day-5 dynamic lookup; this static value is the
+    // documented fallback used when the helper short-circuits.
+    deepLink: "/lessons-public/",
+  },
+  6: {
+    headline: "day 6 of your fleet",
+    action: "pick your daily glance time - set cfg.quietHours so non-critical pushes respect your sleep window",
+    ctaLabel: "show me where",
+    deepLink: "#quiet-hours",
+  },
+  7: {
+    headline: "day 7 of your fleet",
+    action: "run fleetctl export portfolio to capture this week's portable artifact",
+    ctaLabel: "show me how",
+    deepLink: "#fleetctl-export-portfolio",
+  },
+};
+
+interface CoachInstallRow {
+  recorded_at: string | null;
+}
+
+interface CoachLifetimeRow {
+  c: number | null;
+  earliest: string | null;
+}
+
+interface CoachDismissRow {
+  ok: number;
+}
+
+interface CoachTopCitedRow {
+  lesson_slug: string | null;
+  saves: number | null;
+}
+
+function coachLifetimeMergedAgentPrs(db: DB): CoachLifetimeRow {
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c, MIN(fetched_at) AS earliest"
+    + " FROM pr WHERE state = 'MERGED' AND is_agent = 1",
+  ).get() as unknown as CoachLifetimeRow | undefined;
+  return {
+    c: Number(row?.c ?? 0) || 0,
+    earliest: row?.earliest ?? null,
+  };
+}
+
+/** Read the install_date row OR synthesise one via the existing
+ *  _recordInstallDateIfMissing side-effect when the pr table is
+ *  non-empty. Returns null when both are absent (truly fresh
+ *  install with no signal to compute a day from). */
+function coachReadInstallDate(db: DB, now: Date): string | null {
+  const existing = db.prepare(
+    "SELECT recorded_at FROM operator_install_milestones WHERE kind = 'install_date'",
+  ).get() as unknown as CoachInstallRow | undefined;
+  if (existing && existing.recorded_at) return existing.recorded_at;
+  const life = coachLifetimeMergedAgentPrs(db);
+  if (life.c > 0 && life.earliest) {
+    // Side-effect: persist the synthesised install_date via the
+    // existing helper. The helper is idempotent on re-call thanks to
+    // the PK on operator_install_milestones.kind.
+    _recordInstallDateIfMissing(db, now);
+    return life.earliest;
+  }
+  return null;
+}
+
+/** Is THIS day-N's coach tip already dismissed? */
+function coachIsDayDismissed(db: DB, day: number): boolean {
+  const row = db.prepare(
+    "SELECT 1 AS ok FROM inbox_dismissal"
+    + " WHERE kind = 'coach_tip'"
+    + "   AND project_slug = 'fleet'"
+    + "   AND payload_id = ?",
+  ).get("day_" + day) as unknown as CoachDismissRow | undefined;
+  return !!row;
+}
+
+/** Has the graduation card been dismissed? */
+function coachIsGraduationDismissed(db: DB): boolean {
+  const row = db.prepare(
+    "SELECT 1 AS ok FROM inbox_dismissal"
+    + " WHERE kind = 'coach_tip'"
+    + "   AND project_slug = 'fleet'"
+    + "   AND payload_id = 'graduation'",
+  ).get() as unknown as CoachDismissRow | undefined;
+  return !!row;
+}
+
+/** Resolve the day-5 deep link to the top-cited lesson slug when one
+ *  exists, else fall back to the documented /lessons-public/ index.
+ *  Uses lesson_credit directly so the helper stays read-only. */
+function coachDay5DeepLink(db: DB): string {
+  const row = db.prepare(
+    "SELECT lesson_slug, COUNT(*) AS saves"
+    + " FROM lesson_credit"
+    + " GROUP BY lesson_slug, lesson_date, lesson_title"
+    + " ORDER BY saves DESC, lesson_slug ASC"
+    + " LIMIT 1",
+  ).get() as unknown as CoachTopCitedRow | undefined;
+  if (row && row.lesson_slug) {
+    return "/lessons-public/" + String(row.lesson_slug);
+  }
+  return "/lessons-public/";
+}
+
+/** Compute the day-of-fleet (1-indexed) the operator is on. day 1 is
+ *  the install day itself; day 2 is 1 day after install; etc. */
+function coachComputeDay(installAtIso: string, now: Date): number {
+  const installMs = Date.parse(installAtIso);
+  if (!Number.isFinite(installMs)) return 0;
+  const deltaDays = Math.floor((now.getTime() - installMs) / 86_400_000);
+  return Math.max(0, deltaDays) + 1;
+}
+
+/** Top-level helper. Returns the coach payload the home composer
+ *  reads. Pure on (db, cfg, now) except for the install_date side-
+ *  effect write that _recordInstallDateIfMissing emits when the pr
+ *  table has signal but no install_date row exists yet. */
+export function newOperatorCoachTip(
+  db: DB,
+  cfg: FleetConfig,
+  now: Date,
+): CoachTipPayload {
+  const baseline: CoachTipPayload = {
+    kind: "none",
+    day: 1,
+    headline: "",
+    action: "",
+    ctaLabel: "",
+    deepLink: "",
+    asOf: now.toISOString(),
+    version: 1,
+  };
+
+  // Opt-out gate per LESSONS 2026-06-11 - short-circuits BEFORE any
+  // DB read so the disabled posture is observably free.
+  if (cfg.coach?.disabled === true) return baseline;
+
+  const installAt = coachReadInstallDate(db, now);
+  if (!installAt) return baseline;
+
+  const day = coachComputeDay(installAt, now);
+  if (day < 1) return baseline;
+
+  // Graduation branch - day 8 and beyond. The card surfaces ONCE
+  // post-week-1; the dismissal lives in inbox_dismissal with
+  // payload_id='graduation'.
+  if (day > 7) {
+    if (coachIsGraduationDismissed(db)) return baseline;
+    return {
+      kind: "graduated",
+      day: 7,
+      headline: "you've completed your first week",
+      action: "your fleet is now in the regular daily-glance rhythm; the home page is yours from here",
+      ctaLabel: "thanks",
+      deepLink: "/",
+      asOf: now.toISOString(),
+      version: 1,
+    };
+  }
+
+  // Coach branch - day N in [1, 7]. The per-day dismissal short-
+  // circuits THIS day to none without cascading to N+1.
+  if (coachIsDayDismissed(db, day)) return baseline;
+
+  const dayKey = day as 1 | 2 | 3 | 4 | 5 | 6 | 7;
+  const tip = COACH_TIPS[dayKey];
+  // Day 5 deep link is dynamic - resolves to the top-cited slug.
+  const deepLink = dayKey === 5 ? coachDay5DeepLink(db) : tip.deepLink;
+
+  return {
+    kind: "coach",
+    day: dayKey,
+    headline: tip.headline,
+    action: tip.action,
+    ctaLabel: tip.ctaLabel,
+    deepLink,
+    asOf: now.toISOString(),
+    version: 1,
+  };
+}
+
+export interface CoachCardRenderOptions {
+  /** When true the renderer emits the empty string so the SPA hides
+   *  the card. Maps to an inbox_dismissal row at the home composer. */
+  dismissed?: boolean;
+}
+
+function escCoach(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Pure HTML composer for the home-page card. Carries the
+ *  new-operator-coach-card + coach-day-N (or coach-graduation-card)
+ *  testids. The dismiss button is a real <button> the SPA can bind
+ *  to. */
+export function renderCoachCard(
+  p: CoachTipPayload,
+  opts: CoachCardRenderOptions = {},
+): string {
+  if (opts.dismissed) return "";
+  if (p.kind === "none") return "";
+  if (p.kind === "graduated") {
+    return "<section class=\"coach-card coach-graduation\""
+      + " data-testid=\"coach-graduation-card\""
+      + " data-kind=\"graduated\">"
+      + "<div class=\"coach-eyebrow\" data-testid=\"coach-eyebrow\">first week complete</div>"
+      + "<h2 class=\"coach-headline\" data-testid=\"coach-headline\">"
+      + escCoach(p.headline) + "</h2>"
+      + "<p class=\"coach-action\" data-testid=\"coach-action\">"
+      + escCoach(p.action) + "</p>"
+      + "<button class=\"coach-dismiss\""
+      + " data-testid=\"coach-dismiss-button\""
+      + " data-act=\"dismiss-coach\""
+      + " data-payload-id=\"graduation\""
+      + " type=\"button\">" + escCoach(p.ctaLabel || "thanks") + "</button>"
+      + "</section>";
+  }
+  // Coach branch: 1 <= day <= 7.
+  const dayN = String(p.day);
+  return "<section class=\"coach-card\""
+    + " data-testid=\"new-operator-coach-card\""
+    + " data-testid-day=\"coach-day-" + escCoach(dayN) + "\""
+    + " data-kind=\"coach\""
+    + " data-day=\"" + escCoach(dayN) + "\">"
+    + "<div class=\"coach-eyebrow\""
+    + " data-testid=\"coach-day-" + escCoach(dayN) + "\">"
+    + "day " + escCoach(dayN) + " of your fleet</div>"
+    + "<h2 class=\"coach-headline\" data-testid=\"coach-headline\">"
+    + escCoach(p.headline) + "</h2>"
+    + "<p class=\"coach-action\" data-testid=\"coach-action\">"
+    + escCoach(p.action) + "</p>"
+    + "<a class=\"coach-cta\""
+    + " data-testid=\"coach-cta\""
+    + " href=\"" + escCoach(p.deepLink) + "\">"
+    + escCoach(p.ctaLabel) + "</a>"
+    + "<button class=\"coach-dismiss\""
+    + " data-testid=\"coach-dismiss-button\""
+    + " data-act=\"dismiss-coach\""
+    + " data-payload-id=\"day_" + escCoach(dayN) + "\""
+    + " type=\"button\">got it</button>"
+    + "</section>";
+}
+
+/** Renderer-direct seam per LESSONS 2026-06-11. Drives each of the 9
+ *  branches (day 1-7, graduated, none) without booting startServer
+ *  or racing fleet-control.config.json. */
+export function _renderCoachCardForTests(
+  p: CoachTipPayload,
+  opts: CoachCardRenderOptions = {},
+): string {
+  return renderCoachCard(p, opts);
+}
 // endregion

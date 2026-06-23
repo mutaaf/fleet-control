@@ -23,6 +23,7 @@ The cockpit does not call the model. Every number you see comes from reading loc
 - [LAN access + auth](#lan-access--auth)
 - [The always-on daemon](#the-always-on-daemon)
 - [Alerts](#alerts)
+- [First-week coach](#first-week-coach-ticket-0074)
 - [SQLite schema — what's in the database](#sqlite-schema--whats-in-the-database)
 - [Pricing — how the dollar numbers are computed](#pricing--how-the-dollar-numbers-are-computed)
 - [Configuration reference](#configuration-reference)
@@ -300,6 +301,7 @@ Every shell-out uses `execFileSync(argv0, [args])` — never `exec(string)` — 
 
 ---
 
+<a id="lan-access-auth"></a>
 ## LAN access + auth
 
 By default the server binds to `127.0.0.1`. To use it from your phone or tablet:
@@ -391,6 +393,30 @@ The notification text is deterministic and friend-shaped — no marketing tone, 
 Tapping the notification lands the operator on `/digest-missed/<token>` — a self-contained page summarising the absent period (top three ships, the riskiest open PR, the biggest cost delta). The token is signed via the same 0013 snapshot infrastructure; the URL is throttled by the per-IP rate limiter (ticket 0064) so a leaked link cannot starve the operator's own loopback portal.
 
 **Opt-out:** add `"reactivationPush": { "disabled": true }` to `fleet-control.config.json`. The daemon helper short-circuits before any ntfy POST and no snapshot row is minted.
+
+---
+
+## First-week coach (ticket 0074)
+
+For the first 7 days after `install_date`, the portal home surfaces ONE small day-tailored coach card with a single micro-action per day. The card has a "got it" dismiss button; dismissing one day's tip never suppresses tomorrow's. After day 7 the card transforms once into a "you've completed your first week" graduation card; dismissing that retires the surface permanently.
+
+The 7-day sequence escalates from the smallest-effort wins (one config line) to habit-shaped wins (sleep window, portfolio export):
+
+<a id="operator-publichost"></a>
+- **day 1** — set `operator.publicHost` in `fleet-control.config.json` so your share links become absolute URLs (the [sitemap / robots / feed](#cold-discovery-sitemap-robots-rss) routes pick it up automatically).
+<a id="fleetctl-share"></a>
+- **day 2** — try `fleetctl share pulse`. It copies a paste-ready blurb to your clipboard. Takes 5 seconds.
+- **day 3** — pair your phone. Scan the LAN QR from the first-run welcome banner (see [LAN access + auth](#lan-access-auth) above for the wider setup).
+- **day 4** — watch a PR merge end to end. The next autonomous PR your fleet opens surfaces in the inbox with one-tap approve.
+- **day 5** — read your first cross-fleet lesson. The day-5 link routes to the top-cited lesson if one exists, else to `/lessons-public/`.
+<a id="quiet-hours"></a>
+- **day 6** — pick your daily glance time by setting `quietHours.start` / `quietHours.end` / `quietHours.tz` so non-critical pushes respect your sleep window.
+<a id="fleetctl-export-portfolio"></a>
+- **day 7** — run `fleetctl export portfolio` to capture this week's portable artifact as a single `.tar.gz` you can paste anywhere.
+
+The tip table is hard-coded and deterministic — no LLM call, no editorial labour, no per-render cost. The card stays portal-only (no ntfy push); a new operator opening the portal during the activation window is the only thing the surface needs.
+
+**Opt-out:** add `"coach": { "disabled": true }` to `fleet-control.config.json`. The helper short-circuits before any DB read and no card ever renders.
 
 ---
 
