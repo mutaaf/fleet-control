@@ -428,5 +428,15 @@ export function isRateLimitedPath(path: string): boolean {
     || path.startsWith("/operator/")
     || path.startsWith("/referrals/")
     || path.startsWith("/lessons-public/")
-    || path.startsWith("/digest-missed/");
+    || path.startsWith("/digest-missed/")
+    // Ticket 0073: the cold-discovery routes ride the same per-IP
+    // bucket so a popular crawler paste cannot starve the operator's
+    // own loopback portal. /sitemap.xml and /robots.txt are exact-
+    // match paths (no trailing slash so they don't fan out to a wider
+    // surface); /lessons-public/feed.xml is technically already
+    // covered by the /lessons-public/ prefix above but the explicit
+    // prefix keeps the matcher honest under refactor.
+    || path === "/sitemap.xml"
+    || path === "/robots.txt"
+    || path === "/lessons-public/feed.xml";
 }

@@ -1,7 +1,7 @@
 // Zero-dependency local server (node:http): JSON read API + static portal.
 // Binds 127.0.0.1 by default; set host 0.0.0.0 in fleet-control.config.json for
 // LAN access (phone/tablet) — Phase 4 adds the admin token before control routes.
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { join, extname } from "node:path";
@@ -10,7 +10,7 @@ import { loadConfig, type FleetConfig } from "./config.ts";
 import { openDb, type DB } from "./db.ts";
 import { runIngestPass } from "./ingest/index.ts";
 import { recentEvents } from "./ingest/events.ts";
-import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, serveReactivationDigest, fleetAnniversaryMoment, renderAnniversarySharePage, renderAnniversaryOgSvg, type AnniversaryMoment, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
+import { fleetView, projectView, runView, forecastFor, fleetLeaderboard, clampDays, fleetStreak, projectHealth, projectIdBySlug, projectBurndown, ticketShipReport, projectToolMix, clampToolMixDays, yesterdayGlance, costPerMergedPr, fridayWrap, isFriday, riskiestOpenPr, mondayCatchUp, isMonday, fleetChangelog, newSinceLastVisit, markSectionSeen, isValidNewSinceSection, lessonCreditRollup, lessonSavingsRollup, lessonSavingsByProject, spendEfficiencyRanking, stuckPrTaxonomy, prAutopsies, projectWorthItVerdict, projectWorthItSticky, fleetYearInReview, fleetMedianProjection, computeRoiProjection, fleetWeeklyPulse, projectGraveyard, fleetFailureModes, fleetBiggestSurprise, operatorProfilePayload, renderOperatorProfilePage, renderOperatorOgSvg, renderStakeholderSummaryFromDb, lessonLineagePayload, renderLessonLineagePage, renderLessonLineageOgSvg, composeLessonsPublicLineageLink, _resetLessonLineageCacheForTests as _resetLessonLineageCacheFromViews, _getLessonLineageCacheBuildsForTests as _getLessonLineageCacheBuildsFromViews, _invalidateLessonLineageCache as _invalidateLessonLineageCacheFromViews, referralGraphPayload, recordReferralAck, renderReferralGraphPage, serveReactivationDigest, fleetAnniversaryMoment, renderAnniversarySharePage, renderAnniversaryOgSvg, fleetSitemapPayload, renderSitemapXml, renderRobotsTxt, renderLessonsFeedAtom, type FleetSitemapPayload, type AnniversaryMoment, type YesterdayGlance, type CostPerMergedPr, type FridayWrap, type RiskiestOpenPr, type MondayCatchUp, type FleetChangelog, type FleetChangelogOptions, type NewSinceLastVisitOptions, type LessonCreditRollup, type LessonSavingsRollup, type LessonSavingsRow, type LessonSavingsByProject, type LessonSavingsByProjectRow, type SpendEfficiencyRanking, type StuckPrTaxonomy, type PrAutopsies, type ProjectWorthItVerdict, type ProjectWorthItSticky, type FleetYearInReview, type FleetMedianProjection, type FleetWeeklyPulse, type ProjectGraveyard, type GraveyardProjectRow, type FleetFailureModes, type FleetFailureModeRow, type FleetBiggestSurprise, type OperatorProfilePayload, type StakeholderSummary, type LessonLineagePayload, type ReferralGraphPayload } from "./views.ts";
 import { quietHoursActiveAnywhere } from "./quiet_hours.ts";
 import { recentAnomalies } from "./anomaly.ts";
 import { fleetInbox, dismissInboxItem, type DismissRequest } from "./inbox.ts";
@@ -4834,6 +4834,191 @@ function serveLessonsPublicJson(db: DB, now: Date): {
   };
 }
 
+// region include sitemap + robots + feed cache layer (ticket 0073).
+// One 5-minute memo cache per route (sitemap + feed) keyed by the
+// invalidation tuple (pr watermark, lesson_credit watermark, publicHost,
+// today date). robots.txt is composed cheaply per request so it does
+// NOT share a cache. Per LESSONS 2026-06-23 the date-string keyed memo
+// caches must expose a reset hook AND the boot harness must call it.
+// Per LESSONS 2026-06-07 the invalidation tuple uses
+// (MAX(pr.fetched_at), COUNT(*)) plus the lesson_credit equivalent.
+// Per LESSONS 2026-06-05 the invalidation hook is registered on
+// globalThis so a producer-side ingest can wake the cache without
+// taking a server import (which would be a cycle).
+//
+// The lessons archive rows ride through the same getLessonsPublicArchiveCached
+// pipeline above so the views.ts <-> lessons.ts function-import cycle
+// stays unbroken (LESSONS 2026-06-13: views.ts CANNOT import lessons.ts;
+// the caller in server.ts holds the only edge).
+
+interface SitemapCacheTuple {
+  prMx: string;
+  prCount: number;
+  creditMx: string;
+  creditCount: number;
+  publicHost: string;
+  dateKey: string;
+}
+
+function buildSitemapTuple(db: DB, cfg: FleetConfig, now: Date): SitemapCacheTuple {
+  const dateKey = now.toISOString().slice(0, 10);
+  const publicHost = String(cfg.operator?.publicHost ?? "").replace(/\/+$/, "");
+  let prRow: { mx: string | null; c: number | null } | undefined;
+  try {
+    prRow = db.prepare("SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr")
+      .get() as unknown as { mx: string | null; c: number | null } | undefined;
+  } catch { prRow = undefined; }
+  let creditRow: { mx: string | null; c: number | null } | undefined;
+  try {
+    creditRow = db.prepare(
+      "SELECT MAX(created_at) AS mx, COUNT(*) AS c FROM lesson_credit",
+    ).get() as unknown as { mx: string | null; c: number | null } | undefined;
+  } catch { creditRow = undefined; }
+  return {
+    prMx: String(prRow?.mx ?? ""),
+    prCount: Number(prRow?.c ?? 0),
+    creditMx: String(creditRow?.mx ?? ""),
+    creditCount: Number(creditRow?.c ?? 0),
+    publicHost,
+    dateKey,
+  };
+}
+
+function tupleKey(t: SitemapCacheTuple): string {
+  return [t.dateKey, t.publicHost, t.prMx, t.prCount, t.creditMx, t.creditCount].join("|");
+}
+
+interface SitemapCacheEntry {
+  key: string;
+  body: string;
+}
+
+let sitemapCacheEntry: SitemapCacheEntry | null = null;
+let lessonsFeedCacheEntry: SitemapCacheEntry | null = null;
+let sitemapBuildCounter = 0;
+let feedBuildCounter = 0;
+
+export function _resetSitemapCacheForTests(): void {
+  sitemapCacheEntry = null;
+  lessonsFeedCacheEntry = null;
+  sitemapBuildCounter = 0;
+  feedBuildCounter = 0;
+}
+
+export function _getSitemapCacheBuildsForTests(): number {
+  return sitemapBuildCounter;
+}
+
+export function _getLessonsFeedCacheBuildsForTests(): number {
+  return feedBuildCounter;
+}
+
+export function _invalidateSitemapCache(): void {
+  sitemapCacheEntry = null;
+  lessonsFeedCacheEntry = null;
+}
+
+(globalThis as { __fleet_sitemap_invalidate__?: () => void })
+  .__fleet_sitemap_invalidate__ = _invalidateSitemapCache;
+
+/** Resolve the publicHost surface for a request. The cfg field wins;
+ *  fall back to the Host header so a remote crawler still gets an
+ *  absolute Sitemap line in robots.txt. Loopback callers always see
+ *  the loopback host - they're the operator, not a crawler. */
+function resolvePublicHostForRequest(cfg: FleetConfig, req: IncomingMessage): string {
+  const cfgHost = String(cfg.operator?.publicHost ?? "").trim();
+  if (cfgHost) return cfgHost.replace(/\/+$/, "");
+  const host = String(req.headers.host ?? "127.0.0.1:7070");
+  // Trust the X-Forwarded-Proto when the operator runs behind a reverse
+  // proxy. Default to http for loopback / LAN; https when anything
+  // remote-looking is in play.
+  const proto = String(req.headers["x-forwarded-proto"] ?? "");
+  const scheme = proto === "https" ? "https" : "http";
+  return scheme + "://" + host;
+}
+
+function getSitemapCached(
+  db: DB, cfg: FleetConfig, now: Date, req: IncomingMessage,
+): { body: string } {
+  // The cache key embeds the resolved publicHost (after Host-header
+  // fallback) so two crawlers hitting from different hosts each get
+  // their own cached body. In practice production crawlers all hit
+  // through the same host; the fallback discipline keeps the unit
+  // tests honest.
+  const archive = getLessonsPublicArchiveCached(db, now);
+  const baseTuple = buildSitemapTuple(db, cfg, now);
+  // Resolve the EFFECTIVE host for the response - if cfg has no
+  // publicHost we mint one from the request so the urls render
+  // absolute under the operator's actual origin. The cache key
+  // includes this resolved host so a deployment behind two host
+  // names doesn't share a cache entry.
+  const resolvedHost = baseTuple.publicHost || resolvePublicHostForRequest(cfg, req);
+  const tuple: SitemapCacheTuple = { ...baseTuple, publicHost: resolvedHost };
+  const key = tupleKey(tuple);
+  if (sitemapCacheEntry && sitemapCacheEntry.key === key) {
+    return { body: sitemapCacheEntry.body };
+  }
+  sitemapBuildCounter += 1;
+  // Mint a synthetic cfg whose operator.publicHost reflects the
+  // resolved host so the payload helper renders absolute URLs.
+  const effectiveCfg: FleetConfig = {
+    ...cfg,
+    operator: cfg.operator
+      ? { ...cfg.operator, publicHost: resolvedHost }
+      : { handle: "", sinceDate: "", publicHost: resolvedHost } as any,
+  };
+  const payload: FleetSitemapPayload = fleetSitemapPayload(db, effectiveCfg, now, {
+    lessonsArchiveRows: archive.lessons,
+  });
+  const body = renderSitemapXml(payload);
+  sitemapCacheEntry = { key, body };
+  return { body };
+}
+
+function renderRobotsForRequest(cfg: FleetConfig, req: IncomingMessage): string {
+  const host = resolvePublicHostForRequest(cfg, req);
+  return renderRobotsTxt({ publicHost: host });
+}
+
+function getLessonsFeedCached(
+  db: DB, cfg: FleetConfig, now: Date, req: IncomingMessage,
+): { body: string } {
+  const archive = getLessonsPublicArchiveCached(db, now);
+  const baseTuple = buildSitemapTuple(db, cfg, now);
+  const resolvedHost = baseTuple.publicHost || resolvePublicHostForRequest(cfg, req);
+  const tuple: SitemapCacheTuple = { ...baseTuple, publicHost: resolvedHost };
+  const key = tupleKey(tuple) + "|feed";
+  if (lessonsFeedCacheEntry && lessonsFeedCacheEntry.key === key) {
+    return { body: lessonsFeedCacheEntry.body };
+  }
+  feedBuildCounter += 1;
+  // Take the 50 most-recent rows. lessonsPublicArchive returns lessons
+  // sorted newest first per its own contract; slice from the head.
+  const rows = archive.lessons.slice(0, 50);
+  // updated = the MAX(lesson_date) across surfaced rows, falling back
+  // to now if empty.
+  let updated = now.toISOString();
+  if (rows.length > 0) {
+    let mx = rows[0]!.lesson_date;
+    for (const r of rows) if (r.lesson_date > mx) mx = r.lesson_date;
+    updated = mx;
+  }
+  const entries = rows.map((l) => ({
+    slug: l.lesson_slug,
+    title: l.lesson_title,
+    updated: l.lesson_date,
+    summary: l.lesson_body_anonymised.slice(0, 280),
+  }));
+  const body = renderLessonsFeedAtom({
+    publicHost: resolvedHost,
+    updated,
+    entries,
+  });
+  lessonsFeedCacheEntry = { key, body };
+  return { body };
+}
+// endregion
+
 // ────────────────────────────────────────────────────────────────────
 // Ticket 0069 - Public lesson lineage page.
 //
@@ -6011,6 +6196,42 @@ export function startServer(host = "127.0.0.1", port = 7070, opts: StartServerOp
           "access-control-allow-origin": "*",
         });
         return res.end(svg);
+      }
+      // Ticket 0073: cold-discovery surfaces. Three PUBLIC routes -
+      // sitemap.xml, robots.txt, lessons-public/feed.xml - sit here so
+      // they share the no-token bypass posture of the other public
+      // surfaces below. The static-grep ordering test in
+      // tests/sitemap-and-feed.test.ts anchors on the EXACT
+      // statement shape of the auth gate per LESSONS 2026-06-15 (a
+      // sibling comment naming the gate would otherwise poison the
+      // index lookup). Cache-Control: max-age=3600 for the sitemap
+      // and feed; robots.txt picks max-age=86400 (it almost never
+      // changes). Per ticket 0064 each of these prefixes already
+      // appears in isRateLimitedPath() so a crawler paste cannot
+      // starve the operator's own loopback portal.
+      if (path === "/sitemap.xml" && req.method === "GET") {
+        const sitemapResult = getSitemapCached(db, cfg, new Date(), req);
+        res.writeHead(200, {
+          "content-type": "application/xml; charset=utf-8",
+          "cache-control": "public, max-age=3600",
+        });
+        return res.end(sitemapResult.body);
+      }
+      if (path === "/robots.txt" && req.method === "GET") {
+        const robotsResult = renderRobotsForRequest(cfg, req);
+        res.writeHead(200, {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "public, max-age=86400",
+        });
+        return res.end(robotsResult);
+      }
+      if (path === "/lessons-public/feed.xml" && req.method === "GET") {
+        const feedResult = getLessonsFeedCached(db, cfg, new Date(), req);
+        res.writeHead(200, {
+          "content-type": "application/atom+xml; charset=utf-8",
+          "cache-control": "public, max-age=3600",
+        });
+        return res.end(feedResult.body);
       }
       if (path.startsWith("/api/")) {
         // All read endpoints require the `read` scope (loopback bypasses).
