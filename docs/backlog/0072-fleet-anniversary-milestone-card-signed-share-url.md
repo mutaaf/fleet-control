@@ -1,7 +1,7 @@
 ---
 id: 0072
 title: Fleet anniversary milestone card and signed share URL - a single home-page card surfaces "<N> year(s) ago today you ran your first agent" on the install-date anniversary plus 100-PR / 500-PR / 1000-PR thresholds with a one-tap share button minting a /share/anniversary/<token> page that frames the operator's accumulated history as a milestone moment only the local SQLite can author
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-23

@@ -991,3 +991,40 @@ src/config.ts>\"; process.stdout.write(JSON.stringify(loadConfig
 ()))"` is the smallest working seam — no FLEET_DB_PATH knob
 needed (the parser also reads that env var if set; passing it
 along via the subprocess's env keeps the tmpdir DB hermetic).
+
+## 2026-06-23 — module-level memo caches with date-string keys must be
+reset between in-process boot tests; tmpdir DBs alone do not isolate
+
+Symptom: while shipping ticket 0072 I wired a module-level memo cache
+in `src/server.ts` for the new `fleetAnniversaryMoment` helper, keyed
+by `now.toISOString().slice(0, 10)` (today's date) with a
+`(MAX(pr.fetched_at), COUNT(*))` invalidation tuple. The renderer-
+direct tests passed; each individual boot-path test also passed in
+isolation. The moment two boot-path tests ran sequentially, the SECOND
+test's `GET /share/anniversary/<token>` started 404'ing on a payload
+the route SHOULD have rendered. Cause: each test calls `boot()` which
+mints a fresh tmpdir + fresh DB at a new `FLEET_DB_PATH`, but the
+module-level `anniversaryCache: Map<string, AnniversaryCacheEntry>`
+lives in the SAME server-module process. The first boot wrote a cache
+entry for today's date computed from DB-A's data; the second boot's
+matching tuple call (different DB-B, but same date key) hit the cached
+entry from DB-A — surfacing DB-A's payload (kind=`pr_100`) on DB-B's
+freshly minted snapshot token. The mint then froze the wrong payload
+into DB-B's snapshot row; the share route rendered `kind=none` (DB-B
+was empty) and 404'd. The invalidation tuple wouldn't have saved us
+either — both DBs returned `(MAX=null, COUNT=0)` for an empty
+fixture, so the tuple matched and the cache hit. Fix: every test that
+boots `startServer()` MUST call the cache reset hook (e.g.
+`_resetAnniversaryCacheForTests()`) at the top of its `boot()` helper.
+Centralised it in the boot harness so callers don't have to remember.
+General rule for this repo: any module-level memo cache whose KEY is
+"today's date" (or any other test-stable string) AND whose VALUE is
+computed from the DB MUST expose a `_reset*ForTests` hook AND the
+test harness MUST call it at every boot. The `FLEET_DB_PATH` env var
+isolates the DB, but NOT the cache — the cache lives in the
+server module's process memory and survives every `boot()` call
+inside one `node --test` worker. Same trap will bite any future
+ticket that adds a memo cache keyed by a calendar-day / week / month
+string (LESSONS 2026-06-11 covers the same hazard for
+`fleet-control.config.json` writes; this lesson is its in-process-cache
+cousin).
