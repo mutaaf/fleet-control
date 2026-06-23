@@ -1,7 +1,7 @@
 ---
 id: 0074
 title: First-week new-operator coach card on the portal home - one day-tailored micro-tip per day for the first 7 days after install (set publicHost / try fleetctl share / pair your phone / open one PR autonomously / read your first cross-fleet lesson / pick a daily glance time / export your first portfolio) so the new operator who installed yesterday crosses every activation cliff before the friction sets in and the daily-check-in rhythm becomes a habit before day 7
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-23
