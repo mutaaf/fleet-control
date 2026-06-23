@@ -236,7 +236,7 @@ Everything is JSON. Loopback is fully trusted; LAN requires an `x-fleet-token` h
 
 Read endpoints refresh stale data inline (max once every 10s if the daemon is off), so the UI always reflects something current without you running `backfill`.
 
-**Public artifact surfaces** (no auth, paste-friendly URLs): `/pulse`, `/receipts`, `/year`, `/calculator`, `/failures`, `/lessons-public`, `/lessons-public/<slug>` (one lesson permalink), `/lessons-public/<slug>/lineage` (timeline of every project that lesson has caught a re-occurrence in, plus a 1200x630 OG card at `/og/lessons-public/<slug>/lineage.svg`), and — new in ticket 0068 — `/referrals/<handle>` (the operator-to-operator referral graph: who introduced N operators to fleet-control, with anonymised tiles for downstream operators that have not opted into public credit).
+**Public artifact surfaces** (no auth, paste-friendly URLs): `/pulse`, `/receipts`, `/year`, `/calculator`, `/failures`, `/lessons-public`, `/lessons-public/<slug>` (one lesson permalink), `/lessons-public/<slug>/lineage` (timeline of every project that lesson has caught a re-occurrence in, plus a 1200x630 OG card at `/og/lessons-public/<slug>/lineage.svg`), `/referrals/<handle>` (the operator-to-operator referral graph: who introduced N operators to fleet-control, with anonymised tiles for downstream operators that have not opted into public credit), and — new in ticket 0073 — `/sitemap.xml`, `/robots.txt`, `/lessons-public/feed.xml` (the cold-discovery surfaces: see § Cold discovery below).
 
 ### Operator referrals
 
@@ -259,6 +259,16 @@ The new operator who installed fleet-control because of an upstream operator's r
 On the next `fleetctl serve` boot the daemon writes one local `snapshot` row of `kind='referral_ack'` carrying `{ upstream: "mutaaf", downstream: "alice", acknowledgedAt, consentPublicCredit, version: 1 }`. The row is local to the new operator's DB — there is NO network call to the upstream operator's instance. The upstream operator's `/referrals/mutaaf` page is therefore a LOCAL VIEW of the upstream's own DB. The upstream operator's `/operator/mutaaf` page grows a fifth stat block "N operators introduced to fleet-control" that links to the referral graph.
 
 `consentPublicCredit` defaults to `false`: the downstream operator's real handle stays anonymised (rendered as a SHA-256 placeholder) on the upstream's page unless the downstream explicitly opts in. The opt-in flips the placeholder to the downstream's real handle so the chain is browseable.
+
+### Cold discovery: sitemap, robots, RSS
+
+Three new public routes (ticket 0073) turn the accumulated public-surface portfolio into a search-engine-indexable moat:
+
+- **`GET /sitemap.xml`** — Sitemap 0.9 XML enumerating every public URL on this instance: the fixed pages (`/pulse`, `/receipts`, `/calculator`, `/lessons-public/`, `/year/<latest>`), the conditional operator pages (`/operator/<handle>`, `/referrals/<handle>` when `operator.handle` is set), every `/lessons-public/<slug>` (one row per archived lesson), every `/lessons-public/<slug>/lineage` (one row per lesson whose `lesson_credit` count is >= 2), and every `/failures/<signature>` (one row per active failure mode). Each url's `<lastmod>` tracks the content-source MAX timestamp (per the cross-fleet sitemap-freshness rule — Google's crawl budget targets the freshly-changed pages, never the render time).
+- **`GET /robots.txt`** — plain-text Allow/Disallow block. Allows every public prefix; disallows `/api/` and the loopback portal. The `Sitemap:` line uses `operator.publicHost` when set; falls back to the request Host header.
+- **`GET /lessons-public/feed.xml`** — Atom 1.0 feed of the 50 most-recent anonymised lessons. Each `<entry>` carries `<id>`, `<title>`, `<updated>`, `<summary>` (first 280 anonymised chars), and an `<link rel="alternate">` to the lesson permalink. Subscribe in NetNewsWire / Feedly / Reeder / Inoreader to get every new fleet lesson as it lands.
+
+Set `operator.publicHost` in `fleet-control.config.json` so the sitemap emits absolute URLs and the robots.txt `Sitemap:` line carries the canonical host. Submit the sitemap URL to Google Search Console once; the daily ingest pass busts the 5-minute memo cache on every fresh PR row so newly-authored lessons / failure modes surface in the next crawl.
 
 ### Write
 

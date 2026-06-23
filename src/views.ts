@@ -10552,3 +10552,383 @@ export function serveReactivationDigest(
   const body = renderReactivationDigestPage(payload, { quietHoursActive: quiet });
   return { status: 200, headers, body };
 }
+
+// region include fleetSitemapPayload, renderSitemapXml, renderRobotsTxt,
+// renderLessonsFeedAtom plus their renderer-direct test seams (ticket
+// 0073). One set of cold-discovery surfaces lets a search engine index
+// every public page already shipped and lets a curious reader subscribe
+// to new lessons in their feed reader. The composition reads every
+// public payload helper one-way (lessonsPublicArchive is supplied by
+// the caller per the same fleetFailureModes opts pattern - so this
+// module does NOT introduce a from-lessons-ts import; LESSONS
+// 2026-06-13 rules out the cycle). Each helper is pure on its inputs;
+// the boot-path tests drive the live SQL; the renderer-direct tests
+// drive the publicHost-set vs publicHost-unset branches.
+
+/** Per-url row in the sitemap payload. The four fields map 1:1 to the
+ *  Sitemap 0.9 schema. priority is a number in 0.0-1.0; changefreq is
+ *  one of the literal strings the spec accepts. */
+export interface SitemapUrl {
+  loc: string;
+  lastmod: string;
+  changefreq: "daily" | "weekly" | "monthly";
+  priority: number;
+}
+
+export interface FleetSitemapPayload {
+  urls: SitemapUrl[];
+  asOf: string;
+  version: 1;
+}
+
+export interface FleetSitemapPayloadOptions {
+  /** Optional pre-built lessons archive rows from src/lessons.ts
+   *  lessonsPublicArchive. The caller (src/server.ts) holds the only
+   *  edge to that helper so this file does NOT take a from-lessons-ts
+   *  import (the function-import cycle that LESSONS 2026-06-13
+   *  documents). When omitted the helper renders the fixed pages and
+   *  any failure-mode permalinks without lesson rows. */
+  lessonsArchiveRows?: Array<{
+    lesson_slug: string;
+    lesson_date: string;
+    lesson_title: string;
+    lesson_body_anonymised: string;
+  }>;
+  /** Optional pre-built failure-modes payload. When omitted the helper
+   *  calls fleetFailureModes internally. Tests pass this in to keep
+   *  the sitemap composition hermetic from the failure-modes branch
+   *  edges. */
+  failureModes?: FleetFailureModes;
+  /** Optional pre-built lineage gate. Tests drive the lineage AC
+   *  branch by passing a {slug -> catches} map; production reads
+   *  lesson_credit directly via a small SQL roll-up. */
+  lineageCatchesBySlug?: Record<string, number>;
+}
+
+interface SitemapPrTupleRow { mx: string | null; c: number | null; }
+
+/** Latest pr fetched_at + row count - the freshness anchor for the
+ *  fixed pages whose lastmod tracks the ingest watermark. Per LESSONS
+ *  2026-06-07 the pr table has no surrogate id, so we use the
+ *  MAX(fetched_at), COUNT(*) tuple as a stable proxy. */
+function ingestWatermarkIso(db: DB, now: Date): string {
+  let row: SitemapPrTupleRow | undefined;
+  try {
+    row = db.prepare(
+      "SELECT MAX(fetched_at) AS mx, COUNT(*) AS c FROM pr",
+    ).get() as unknown as SitemapPrTupleRow | undefined;
+  } catch { row = undefined; }
+  const mx = row?.mx;
+  if (typeof mx === "string" && mx) return mx;
+  return now.toISOString();
+}
+
+interface LessonCreditMaxRow { slug: string; mx: string; }
+
+/** Per-slug MAX(lesson_credit.created_at) lookup - powers the per-
+ *  lesson lastmod surface per the cross-fleet digitalcraft 2026-05-22
+ *  rule that lastmod tracks the CONTENT timestamp, not the render
+ *  timestamp. */
+function lessonCreditMaxBySlug(db: DB): Map<string, string> {
+  const out = new Map<string, string>();
+  let rows: LessonCreditMaxRow[] = [];
+  try {
+    rows = db.prepare(
+      "SELECT lesson_slug AS slug, MAX(created_at) AS mx "
+      + "  FROM lesson_credit "
+      + " GROUP BY lesson_slug",
+    ).all() as unknown as LessonCreditMaxRow[];
+  } catch { rows = []; }
+  for (const r of rows) {
+    if (r.slug && r.mx) out.set(r.slug, r.mx);
+  }
+  return out;
+}
+
+/** Per-slug COUNT(*) lesson_credit lookup - the lineage gate per
+ *  ticket 0069 (catches >= 2 surfaces the lineage permalink in the
+ *  sitemap; singleton-catch pages stay out). */
+interface LessonCreditCountRow { slug: string; c: number; }
+function lessonCreditCountBySlug(db: DB): Map<string, number> {
+  const out = new Map<string, number>();
+  let rows: LessonCreditCountRow[] = [];
+  try {
+    rows = db.prepare(
+      "SELECT lesson_slug AS slug, COUNT(*) AS c "
+      + "  FROM lesson_credit "
+      + " GROUP BY lesson_slug",
+    ).all() as unknown as LessonCreditCountRow[];
+  } catch { rows = []; }
+  for (const r of rows) {
+    if (r.slug) out.set(r.slug, Number(r.c) || 0);
+  }
+  return out;
+}
+
+interface FailureModePrFetchRow { mx: string | null; }
+/** Per-signature MAX(pr.fetched_at) helper - the per-failure-mode
+ *  lastmod tracks the most-recent PR row that hit the signature. */
+function failureModeLastSeenBySignature(
+  modes: FleetFailureModes,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const s of modes.signatures) {
+    if (s.signature && s.last_seen_at) out.set(s.signature, s.last_seen_at);
+  }
+  return out;
+}
+
+/** Compose a loc URL from a host prefix and a path. When the host is
+ *  empty the path stays relative (the AC7 publicHost-unset branch). */
+function composeLoc(publicHost: string, pathPart: string): string {
+  const host = String(publicHost ?? "").replace(/\/+$/, "");
+  if (!host) return pathPart;
+  return host + pathPart;
+}
+
+/** Build the sitemap payload by composing every existing public
+ *  payload helper. The lessons rows + failure modes are taken via opts
+ *  so the caller (src/server.ts) holds the only edge to lessons.ts
+ *  (LESSONS 2026-06-13 rules out the import cycle). When opts omits
+ *  either field the helper falls back: failure modes are computed
+ *  here via fleetFailureModes; lessons rows default to empty. */
+export function fleetSitemapPayload(
+  db: DB,
+  cfg: FleetConfig,
+  now: Date,
+  opts: FleetSitemapPayloadOptions = {},
+): FleetSitemapPayload {
+  const publicHost = String(cfg.operator?.publicHost ?? "").replace(/\/+$/, "");
+  const watermark = ingestWatermarkIso(db, now);
+  const year = now.getUTCFullYear();
+  const urls: SitemapUrl[] = [];
+
+  // Fixed pages. The watermark is the conservative lastmod surface
+  // for these - the underlying payload (pulse, receipts, calculator)
+  // refreshes when fresh PR rows land. /lessons-public/ and
+  // /year/<YYYY> share the same watermark for the same reason.
+  urls.push({
+    loc: composeLoc(publicHost, "/pulse"),
+    lastmod: watermark, changefreq: "weekly", priority: 0.9,
+  });
+  urls.push({
+    loc: composeLoc(publicHost, "/receipts"),
+    lastmod: watermark, changefreq: "monthly", priority: 0.7,
+  });
+  urls.push({
+    loc: composeLoc(publicHost, "/calculator"),
+    lastmod: watermark, changefreq: "monthly", priority: 0.6,
+  });
+  urls.push({
+    loc: composeLoc(publicHost, "/lessons-public/"),
+    lastmod: watermark, changefreq: "weekly", priority: 0.8,
+  });
+  urls.push({
+    loc: composeLoc(publicHost, "/year/" + String(year)),
+    lastmod: watermark, changefreq: "monthly", priority: 0.6,
+  });
+
+  // Conditional - operator profile + referrals page when the operator
+  // has set their handle (and therefore opted in to the public profile
+  // surface per ticket 0065).
+  const handle = String(cfg.operator?.handle ?? "").trim();
+  if (handle) {
+    urls.push({
+      loc: composeLoc(publicHost, "/operator/" + handle),
+      lastmod: watermark, changefreq: "weekly", priority: 0.7,
+    });
+    urls.push({
+      loc: composeLoc(publicHost, "/referrals/" + handle),
+      lastmod: watermark, changefreq: "monthly", priority: 0.5,
+    });
+  }
+
+  // Dynamic - one row per lesson permalink. lastmod uses the per-slug
+  // MAX(lesson_credit.created_at) when present; falls back to the
+  // lesson_date when no credits exist yet.
+  const lessonRows = opts.lessonsArchiveRows ?? [];
+  const lessonMax = lessonCreditMaxBySlug(db);
+  const lessonCount = opts.lineageCatchesBySlug ?? Object.fromEntries(lessonCreditCountBySlug(db));
+  for (const l of lessonRows) {
+    const slug = String(l.lesson_slug ?? "").trim();
+    if (!slug) continue;
+    const lastmod = lessonMax.get(slug) ?? l.lesson_date ?? watermark;
+    urls.push({
+      loc: composeLoc(publicHost, "/lessons-public/" + slug),
+      lastmod, changefreq: "monthly", priority: 0.6,
+    });
+    // Lineage page per ticket 0069 - only when catches >= 2.
+    const catches = Number(lessonCount[slug] ?? 0);
+    if (catches >= 2) {
+      urls.push({
+        loc: composeLoc(publicHost, "/lessons-public/" + slug + "/lineage"),
+        lastmod, changefreq: "monthly", priority: 0.5,
+      });
+    }
+  }
+
+  // Dynamic - one row per failure-mode permalink.
+  const modes = opts.failureModes ?? fleetFailureModes(db, { now });
+  const failLastSeen = failureModeLastSeenBySignature(modes);
+  for (const s of modes.signatures) {
+    const sig = String(s.signature ?? "").trim();
+    if (!sig) continue;
+    const lastmod = failLastSeen.get(sig) ?? watermark;
+    urls.push({
+      loc: composeLoc(publicHost, "/failures/" + sig),
+      lastmod, changefreq: "monthly", priority: 0.6,
+    });
+  }
+
+  return { urls, asOf: now.toISOString(), version: 1 };
+}
+
+/** Minimal XML escape. The four entities cover every value we surface
+ *  in the sitemap (URL chars don't need quote escaping but doing so
+ *  keeps the renderer robust against any future field shapes). */
+function escForSitemap(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+  }[c]!));
+}
+
+/** Render the Sitemap 0.9 XML body. The asOf field rides on the urlset
+ *  comment line so a future tooling consumer can sanity-check the
+ *  render time; per the cross-fleet digitalcraft rule the per-url
+ *  lastmod is what crawlers consume. */
+export function renderSitemapXml(p: FleetSitemapPayload): string {
+  const urls = p.urls.map((u) => {
+    const loc = escForSitemap(u.loc);
+    const lastmod = escForSitemap(u.lastmod);
+    const changefreq = escForSitemap(u.changefreq);
+    const priority = (Math.round(u.priority * 10) / 10).toFixed(1);
+    return "  <url>\n"
+      + "    <loc>" + loc + "</loc>\n"
+      + "    <lastmod>" + lastmod + "</lastmod>\n"
+      + "    <changefreq>" + changefreq + "</changefreq>\n"
+      + "    <priority>" + priority + "</priority>\n"
+      + "  </url>";
+  }).join("\n");
+  return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    + "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+    + urls
+    + "\n</urlset>";
+}
+
+/** Renderer-direct test seam per LESSONS 2026-06-11 - drives the
+ *  publicHost-unset branch without cwd config mutation. Production
+ *  also routes through renderSitemapXml; this seam re-stamps the
+ *  payload's host prefix when the test wants to override. */
+export interface RenderSitemapForTestsOpts {
+  publicHost?: string;
+}
+export function _renderSitemapForTests(
+  p: FleetSitemapPayload,
+  opts: RenderSitemapForTestsOpts = {},
+): string {
+  if (opts.publicHost === undefined) return renderSitemapXml(p);
+  const host = String(opts.publicHost ?? "").replace(/\/+$/, "");
+  const restamped: FleetSitemapPayload = {
+    asOf: p.asOf,
+    version: 1,
+    urls: p.urls.map((u) => ({
+      ...u,
+      loc: host && !u.loc.startsWith("http")
+        ? host + (u.loc.startsWith("/") ? u.loc : "/" + u.loc)
+        : u.loc,
+    })),
+  };
+  return renderSitemapXml(restamped);
+}
+
+export interface RobotsTxtOpts {
+  publicHost: string;
+}
+
+/** Render the documented robots.txt body. The Allow rules supersede
+ *  the Disallow: / when the Allow path is more specific. The Sitemap:
+ *  line carries the absolute URL the operator submits to Google
+ *  Search Console once. */
+export function renderRobotsTxt(opts: RobotsTxtOpts): string {
+  const host = String(opts.publicHost ?? "").replace(/\/+$/, "");
+  const lines: string[] = [];
+  lines.push("User-agent: *");
+  lines.push("Allow: /pulse");
+  lines.push("Allow: /receipts");
+  lines.push("Allow: /calculator");
+  lines.push("Allow: /lessons-public/");
+  lines.push("Allow: /failures/");
+  lines.push("Allow: /operator/");
+  lines.push("Allow: /referrals/");
+  lines.push("Allow: /year/");
+  lines.push("Allow: /share/");
+  lines.push("Allow: /og/");
+  lines.push("Allow: /embed/");
+  lines.push("Allow: /sitemap.xml");
+  lines.push("Disallow: /api/");
+  lines.push("Disallow: /");
+  if (host) lines.push("Sitemap: " + host + "/sitemap.xml");
+  return lines.join("\n") + "\n";
+}
+
+export function _renderRobotsForTests(opts: RobotsTxtOpts): string {
+  return renderRobotsTxt(opts);
+}
+
+export interface FeedEntryInput {
+  slug: string;
+  title: string;
+  updated: string;
+  summary: string;
+}
+
+export interface RenderFeedAtomInput {
+  publicHost: string;
+  updated: string;
+  entries: FeedEntryInput[];
+}
+
+/** Render an Atom 1.0 feed body. Self/alternate links use absolute
+ *  URLs when publicHost is set so a feed reader can resolve them
+ *  without rewriting. Per CROSS_LESSONS 2026-06-15 the rendered
+ *  attribute values may include MIME types and full paths; tests
+ *  scanning the body use [^>]* not [^/>]* to keep the regex liberal. */
+export function renderLessonsFeedAtom(p: RenderFeedAtomInput): string {
+  const host = String(p.publicHost ?? "").replace(/\/+$/, "");
+  const baseId = host ? host + "/lessons-public/" : "/lessons-public/";
+  const selfHref = host
+    ? host + "/lessons-public/feed.xml"
+    : "/lessons-public/feed.xml";
+  const altHref = host ? host + "/lessons-public/" : "/lessons-public/";
+  const updated = escForSitemap(p.updated);
+  const entries = p.entries.map((e) => {
+    const slug = escForSitemap(e.slug);
+    const entryHref = host
+      ? host + "/lessons-public/" + slug
+      : "/lessons-public/" + slug;
+    return "  <entry>\n"
+      + "    <id>" + entryHref + "</id>\n"
+      + "    <title>" + escForSitemap(e.title) + "</title>\n"
+      + "    <updated>" + escForSitemap(e.updated) + "</updated>\n"
+      + "    <summary>" + escForSitemap(e.summary) + "</summary>\n"
+      + "    <link rel=\"alternate\" type=\"text/html\" href=\""
+      + escForSitemap(entryHref) + "\" />\n"
+      + "  </entry>";
+  }).join("\n");
+  return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    + "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
+    + "  <title>fleet-control lessons</title>\n"
+    + "  <id>" + baseId + "</id>\n"
+    + "  <updated>" + updated + "</updated>\n"
+    + "  <link rel=\"self\" type=\"application/atom+xml\" href=\""
+    + escForSitemap(selfHref) + "\" />\n"
+    + "  <link rel=\"alternate\" type=\"text/html\" href=\""
+    + escForSitemap(altHref) + "\" />\n"
+    + entries
+    + "\n</feed>";
+}
+
+export function _renderFeedForTests(p: RenderFeedAtomInput): string {
+  return renderLessonsFeedAtom(p);
+}
+// endregion

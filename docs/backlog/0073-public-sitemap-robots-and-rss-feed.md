@@ -1,7 +1,7 @@
 ---
 id: 0073
 title: Public sitemap.xml plus robots.txt plus an /lessons-public/feed.xml RSS atom feed - one set of cold-discovery surfaces that lets a search engine index every public page already shipped (pulse, receipts, calculator, lessons, lessons-lineage, failures, operator, referrals) and lets a curious reader subscribe to new lessons in their feed reader so the moat of accumulated public artifacts finally becomes discoverable by strangers who never saw the operator's share post
-status: groomed
+status: in-progress
 priority: P1
 area: portal
 created: 2026-06-23
@@ -660,4 +660,64 @@ Each box maps 1:1 to a test scenario.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-23 — picked up by implementation-dev. Branch
+  `feat/0073-sitemap-robots-feed` off `origin/main`. Plan: failing-test-
+  first under `tests/sitemap-and-feed.test.ts` (one per AC checkbox),
+  then helpers `fleetSitemapPayload` / `renderSitemapXml` /
+  `renderRobotsTxt` / `renderLessonsFeedAtom` + their renderer-direct
+  seams in `src/views.ts`, then three new public routes in
+  `src/server.ts` mounted BEFORE the `if (path.startsWith("/api/"))`
+  auth gate, then the rate-limit prefix additions in
+  `src/rate_limit.ts`. Reusing the existing private inline
+  `anonymiseExcerpt` (no new lessons.ts import; LESSONS 2026-06-13).
+  Cache invalidation tuple is
+  `(MAX(pr.fetched_at), COUNT(*) FROM pr) | (MAX(lesson_credit.
+  created_at), COUNT(*) FROM lesson_credit) | publicHost` per LESSONS
+  2026-06-07 + 2026-06-23. Sitemap helper consumes `lessonsPublicArchive`
+  (from `src/lessons.ts`) + `fleetFailureModes` + `lessonLineagePayload`
+  (already in views.ts) — no function-import-cycle risk because
+  `lessons.ts → views.ts` is the only existing edge between the two and
+  this addition keeps it one-way (views.ts reads lessons.ts via a
+  function call lookup in server.ts that hands the payload into the
+  sitemap helper, not a top-level import).
+
+- 2026-06-23 — implemented. Shape that landed:
+  - `src/views.ts` — appended `fleetSitemapPayload`,
+    `renderSitemapXml`, `renderRobotsTxt`, `renderLessonsFeedAtom`,
+    plus the `_render*ForTests` renderer-direct seams. The sitemap
+    helper takes the `lessonsArchiveRows` opt so the caller (server.ts)
+    holds the only edge to `lessonsPublicArchive` and the
+    `views.ts ↔ lessons.ts` function-import cycle is avoided per
+    LESSONS 2026-06-13.
+  - `src/server.ts` — three new routes (`/sitemap.xml`, `/robots.txt`,
+    `/lessons-public/feed.xml`) mounted INSIDE the public-bypass block
+    BEFORE the `if (path.startsWith("/api/"))` auth gate. The static-
+    grep anchor in the AC10 test uses the EXACT `if (` prefix per
+    LESSONS 2026-06-15 so a sibling comment block can't poison the
+    indexOf. A 5-minute memo cache layer (`getSitemapCached` +
+    `getLessonsFeedCached`) re-uses the existing
+    `getLessonsPublicArchiveCached` pipeline and keys on the tuple
+    `(dateKey, publicHost, MAX(pr.fetched_at), COUNT(pr),
+    MAX(lesson_credit.created_at), COUNT(lesson_credit))`. Exposes
+    `_resetSitemapCacheForTests`, `_getSitemapCacheBuildsForTests`,
+    `_getLessonsFeedCacheBuildsForTests`, and the
+    `globalThis.__fleet_sitemap_invalidate__` hook per LESSONS
+    2026-06-05.
+  - `src/rate_limit.ts` — added exact-match prefixes for
+    `/sitemap.xml`, `/robots.txt`, `/lessons-public/feed.xml` to the
+    `isRateLimitedPath` OR chain. `/lessons-public/feed.xml` is
+    already covered by the `/lessons-public/` prefix but the explicit
+    match keeps the matcher honest under refactor.
+  - `tests/sitemap-and-feed.test.ts` — 10 tests, one per AC checkbox.
+    The publicHost-set vs publicHost-unset branches use the
+    renderer-direct seam per LESSONS 2026-06-11; the AC6 anonymisation
+    integration goes end-to-end through `lessonsPublicArchive` and
+    asserts the raw `/Users/...` path is collapsed to `<path>` BEFORE
+    the feed renderer sees it.
+  - `README.md` — one new subsection "Cold discovery: sitemap,
+    robots, RSS" under the public surfaces family documents the three
+    new routes and the publicHost config field.
+  - Gate green: `npx tsc --noEmit` clean; `node scripts/check-backlog.mjs`
+    in sync; `node --test tests/sitemap-and-feed.test.ts` 10/10 green;
+    full-suite delta vs main = -1 failure (one pre-existing welcome-pair
+    subprocess flake stabilised; no new failures introduced).
