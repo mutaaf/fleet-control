@@ -1,7 +1,7 @@
 ---
 id: 0073
 title: Public sitemap.xml plus robots.txt plus an /lessons-public/feed.xml RSS atom feed - one set of cold-discovery surfaces that lets a search engine index every public page already shipped (pulse, receipts, calculator, lessons, lessons-lineage, failures, operator, referrals) and lets a curious reader subscribe to new lessons in their feed reader so the moat of accumulated public artifacts finally becomes discoverable by strangers who never saw the operator's share post
-status: in-progress
+status: shipped
 priority: P1
 area: portal
 created: 2026-06-23
