@@ -66,9 +66,15 @@ glance UX. Tickets that deepen those win.
 What does this *feel* like at a glance? Does it work on a flaky cellular
 connection? Does the portal load in under 200ms? Is the action one tap?
 
-### 4. Growth
-Why does this make a friend running their own agents want to adopt
-fleet-control? What's the "show me" moment — the screenshot worth sharing?
+### 4. Capability — for the operator, NOT an audience
+Does this give the operator a real capability at the portal: answer a question
+they actually ask, prevent a surprise, recover from a failure? The "show me"
+moment is the operator *trusting* the loop at a glance — not a screenshot for
+strangers. fleet-control is a single-operator dashboard with no audience. Do NOT
+propose public-facing or shareable-vanity surface: OG images, embeddable badges,
+public landing pages, referral graphs, anniversary/milestone cards, signed share
+URLs, "year in review". If the strongest argument is "it'd be nice to share,"
+cut it — a faster, more trustworthy glance outranks reach.
 
 ## Hard constraints from AGENTS.md (memorize)
 
@@ -103,6 +109,10 @@ A great ticket has:
 - Run `git commit` on a state that touches `src/`, `web/`, or `bin/`.
 - Pick implementation primitives over user-facing ones. "Refactor
   control.ts" is not a feature; "Approve a PR from the phone in one tap" is.
+- Manufacture an audience. This is a single-operator dashboard; do not propose
+  public-facing or shareable-marketing surface (OG images, badges, public
+  pages, referral/anniversary/share-URL artifacts) unless the operator
+  explicitly asks. A trustworthy, fast glance always outranks vanity surface.
 - Sycophantic encouragement. Disagree when you think the operator is wrong.
 - "Phase 1 / Phase 2" plans without a single shippable v1 inside the ticket.
 
