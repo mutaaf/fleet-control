@@ -12,7 +12,7 @@ MODEL="claude-opus-4-7"
 GIT_AUTHOR_NAME="Fleet Control Agent"
 GIT_AUTHOR_EMAIL="noreply@anthropic.com"
 
-SELF_CANCEL="20260625"
+SELF_CANCEL="20260730"
 
 SHIP_MINUTE="41"
 GROOM_HOURS="0"
