@@ -19,6 +19,10 @@ proposes new ones, `review` grades them.
 
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
+| 0079 | Referral arrival welcome overlay auto-suggests operator.referredBy so the referral graph actually captures who introduced whom | P1 | groomed | portal |
+| 0078 | On-this-day nostalgia card rotates a daily fleet memory so the operator has a reason to open the portal every morning | P1 | groomed | portal |
+| 0077 | Signed share inventory and one-tap revoke page so the operator trusts every token they mint | P2 | groomed | control |
+| 0076 | Share URL view analytics so the operator sees whether the artifacts they paste are actually being opened | P1 | groomed | observability |
 | 0072 | Fleet anniversary milestone card and signed share URL - a single home-page card surfaces "<N> year(s) ago today you ran your first agent" on the install-date anniversary plus 100-PR / 500-PR / 1000-PR thresholds with a one-tap share button minting a /share/anniversary/<token> page that frames the operator's accumulated history as a milestone moment only the local SQLite can author | P1 | shipped | portal |
 | 0073 | Public sitemap.xml plus robots.txt plus an /lessons-public/feed.xml RSS atom feed - one set of cold-discovery surfaces that lets a search engine index every public page already shipped (pulse, receipts, calculator, lessons, lessons-lineage, failures, operator, referrals) and lets a curious reader subscribe to new lessons in their feed reader so the moat of accumulated public artifacts finally becomes discoverable by strangers who never saw the operator's share post | P1 | shipped | portal |
 | 0074 | First-week new-operator coach card on the portal home - one day-tailored micro-tip per day for the first 7 days after install (set publicHost / try fleetctl share / pair your phone / open one PR autonomously / read your first cross-fleet lesson / pick a daily glance time / export your first portfolio) so the new operator who installed yesterday crosses every activation cliff before the friction sets in and the daily-check-in rhythm becomes a habit before day 7 | P1 | shipped | portal |
