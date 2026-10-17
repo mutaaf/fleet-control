@@ -1,0 +1,36 @@
+# review-gate — make the fleet reviewer's verdict a merge requirement (ticket 0070).
+# Install: copy to .github/workflows/review-gate.yml, copy
+# templates/scripts/review-gate.sh to scripts/review-gate.sh, then add the
+# `review-gate` context to main's required status checks. See README § Review gate.
+name: review-gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}   # run the gate from main, never the PR's copy
+      - name: reviewer signed off on this head commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          REVIEWER: ${{ vars.FLEET_REVIEWER || github.repository_owner }}
+        run: bash scripts/review-gate.sh
