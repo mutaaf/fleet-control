@@ -26,6 +26,7 @@ portal that watches them. Wiring details for the loop are below.
   or what to "fix":
   - `typecheck`
   - `validate`
+  - `review-gate` — the fleet reviewer's `FLEET-VERDICT` on the head commit (agent-fleet ticket 0070)
 - **Agent branch prefixes**:
   - `feat/` — feature work (ship agent)
   - `chore/gtm-` — backlog refresh (groom agent)
